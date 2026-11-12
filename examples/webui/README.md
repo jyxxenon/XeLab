@@ -35,11 +35,23 @@ Run from the repository root:
 ```sh
 node --test examples/webui/test_api.mjs
 python3 -m unittest discover -s examples/webui -p 'test_server.py' -v
-python3 examples/webui/test_browser.py
-python3 examples/webui/test_bridge.py
-python3 examples/webui/test_overview.py
+python3 -m unittest discover -s examples/webui -p 'test_http2.py' -v
+python3 -m unittest discover -s examples/webui -p 'test_browser.py' -v
+python3 -m unittest discover -s examples/webui -p 'test_shell.py' -v
+python3 -m unittest discover -s examples/webui -p 'test_bridge.py' -v
+python3 -m unittest discover -s examples/webui -p 'test_overview.py' -v
+python3 -m unittest discover -s examples/webui -p 'test_shell_visual.py' -v
 ```
 
-The browser suites require Python Playwright and `/usr/bin/chromium`. They execute the actual desktop and independent cross-origin frames in Chromium with explicit core response fixtures. On 2026-11-04, 16 Node API/OAuth tests, 9 real loopback mTLS/static tests, 11 desktop browser tests and 8 isolated-bridge browser tests passed without skips. They cover window controls/mobile access, actual desktop window/widget bridge calls, fixed UUID/deployment/key binding, original-result read-proof denial, source/nonce/sequence/parameter attacks, deduplication/conflicts/limits, frame reload/revocation/account change, visibility changes without unproven automatic refresh, bounded shared-reference expansion, deployment patch serialization, 401 rejection without credential refresh or business retry, and unknown-outcome editor locking after preflight credential rotation. OAuth coverage includes trusted PKCE navigation, code/verifier exchange and wrong-state rejection. A native-browser fetch receiver error was found and fixed by these tests; Node mocks alone did not expose it.
+`examples/webui/package.json` groups the browser suites as `npm --prefix examples/webui run test:browser`.
+
+The browser suites require Python Playwright plus a Chromium binary. `test_http2.py` pins the browser major version and fails with `pinned_chromium_151_required` on any other build, so point every suite at the same pinned binary, for example a Playwright-managed Chrome for Testing:
+
+```sh
+export XELAB_OAUTH_BROWSER_CHROMIUM="$HOME/.cache/ms-playwright/chromium-1234/chrome-linux64/chrome"
+"$XELAB_OAUTH_BROWSER_CHROMIUM" --version   # Google Chrome for Testing 151.0.7922.34
+```
+
+The other suites also read `XELAB_OAUTH_BROWSER_CHROMIUM` and accept any current build; the default `/usr/bin/chromium` is only a fallback. They execute the actual desktop and independent cross-origin frames in Chromium with explicit core response fixtures. On 2026-11-12 with Google Chrome for Testing 151.0.7922.34, 31 Node API/OAuth tests, 14 loopback mTLS/static tests, 7 HTTP/2 browser tests, 26 desktop browser tests, 16 shell interaction tests, 12 isolated-bridge browser tests, 13 read-only overview tests and 12 shell visual contract tests passed without skips (131 total). They cover window controls/mobile access, actual desktop window/widget bridge calls, fixed UUID/deployment/key binding, original-result read-proof denial, source/nonce/sequence/parameter attacks, deduplication/conflicts/limits, frame reload/revocation/account change, visibility changes without unproven automatic refresh, bounded shared-reference expansion, deployment patch serialization, 401 rejection without credential refresh or business retry, unknown-outcome editor locking after preflight credential rotation, shell tokens/blur/motion preferences, window toolbar and scrollbar alignment, and the read-only overview window. OAuth coverage includes trusted PKCE navigation, code/verifier exchange and wrong-state rejection. A native-browser fetch receiver error was found and fixed by these tests; Node mocks alone did not expose it.
 
 The separate packaged Docker component probe described in the deployment guide also passed generated Lifecycle RPC and mTLS static checks. These results do **not** establish actual signed installation through the kernel, real Owner OAuth consent, core-to-OCI management, a real third-party OCI page's end-to-end isolation, resource peak certification or complete M3-D/E acceptance. Those end-to-end tests require the HTTP/OAuth/WebUI core profiles, original-Call proof checks and declaration-bound CSP/callback activation and remain pending. AWS, independent-host recovery and formal RUN-03 are separately deferred or pending and are not covered by this application.
