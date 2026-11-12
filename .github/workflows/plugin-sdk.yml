@@ -1,0 +1,63 @@
+name: Plugin SDK conformance
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/plugin-sdk.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/plugin-sdk/**"
+      - "crates/kernel/src/artifact.rs"
+      - "crates/kernel/src/bin/xelab-echo.rs"
+      - "crates/kernel/build.rs"
+      - "docs/contracts/proto/**"
+      - "examples/echo/**"
+      - "examples/echo-cpp/**"
+      - "sdk/cpp/**"
+      - "tools/acceptance/sdk-conformance.py"
+  push:
+    branches: ["main"]
+    paths:
+      - ".github/workflows/plugin-sdk.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/plugin-sdk/**"
+      - "crates/kernel/src/artifact.rs"
+      - "crates/kernel/src/bin/xelab-echo.rs"
+      - "crates/kernel/build.rs"
+      - "docs/contracts/proto/**"
+      - "examples/echo/**"
+      - "examples/echo-cpp/**"
+      - "sdk/cpp/**"
+      - "tools/acceptance/sdk-conformance.py"
+
+permissions:
+  contents: read
+
+jobs:
+  rpc:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Install C++ and sandbox dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y cmake libgrpc++-dev libprotobuf-dev protobuf-compiler-grpc \
+            libssl-dev nlohmann-json3-dev bubblewrap
+      - name: Build both reference plugins and the shared RPC client
+        run: |
+          cargo build -p xelab-kernel --bin xelab-echo --locked
+          cmake -S sdk/cpp -B "$RUNNER_TEMP/xelab-cpp" -DCMAKE_BUILD_TYPE=Release
+          cmake --build "$RUNNER_TEMP/xelab-cpp" --parallel 2
+      - name: Compare the contracts and run shared loopback mTLS conformance
+        run: |
+          cargo test -p xelab-kernel --lib --locked artifact::tests::generated_reference_profiles_match_manifest_and_raw_contracts -- --exact
+          python3 tools/acceptance/sdk-conformance.py --rust target/debug/xelab-echo \
+            --cpp "$RUNNER_TEMP/xelab-cpp/xelab-echo-cpp" --client "$RUNNER_TEMP/xelab-cpp/xelab-sdk-conformance"
