@@ -295,17 +295,35 @@ pub(super) async fn exercise() {
     let fixture = &f;
     let stat_id = skills["data.object.stat"];
     let concurrent = futures_util::future::join_all((0..12).map(|index| async move {
-        skill(
-            fixture,
-            stat_id,
-            json!({"key":key}),
-            &format!("object-concurrent-stat-{index}"),
-        )
-        .await
+        fixture
+            .api(
+                "invokeSkill",
+                Some(stat_id),
+                json!({"input":{"key":key},"timeout_ms":15000}),
+                &format!("object-concurrent-stat-{index}"),
+                None,
+                None,
+            )
+            .await
     }))
     .await;
-    for result in concurrent {
-        assert_eq!(result["output"]["object"], *object);
+    if concurrent.iter().any(|(status, _)| *status != 200) {
+        let results: Vec<_> = concurrent
+            .iter()
+            .enumerate()
+            .filter(|(_, (status, _))| *status != 200)
+            .map(|(index, (status, body))| (index, *status, &body["error"]))
+            .collect();
+        let ledger: Vec<_> = c.query(
+            "SELECT idempotency_key,state,error->>'code' FROM calls WHERE idempotency_key LIKE 'object-concurrent-stat-%' ORDER BY idempotency_key",
+            &[],
+        ).await.unwrap().into_iter()
+            .map(|row| (row.get::<_,String>(0),row.get::<_,String>(1),row.get::<_,Option<String>>(2)))
+            .collect();
+        panic!("Concurrent object reads failed: responses {results:?}; Call ledger {ledger:?}");
+    }
+    for (_, result) in concurrent {
+        assert_eq!(result["call"]["output"]["object"], *object);
     }
     let listed = skill(&f, skills["data.object.list"], json!({}), "object-list").await;
     assert_eq!(listed["output"]["items"], json!([object]));
