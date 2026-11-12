@@ -2,7 +2,7 @@
 use super::*;
 
 mod task_cancel;
-pub(super) use task_cancel::cancel_hold_task;
+pub(super) use task_cancel::cancel_and_restart_hold_tasks;
 
 async fn register(
     router: &Router,

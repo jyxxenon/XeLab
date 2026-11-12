@@ -3,6 +3,9 @@ use super::*;
 use chrono::{DateTime, Utc};
 use tokio_postgres::Row;
 
+#[path = "host_task_startup_tests.rs"]
+mod startup;
+
 #[path = "host_task_cancel_tests.rs"]
 mod cancellation;
 

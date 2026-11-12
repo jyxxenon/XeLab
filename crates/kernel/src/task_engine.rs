@@ -754,7 +754,8 @@ pub async fn expire(tx: &Transaction<'_>) -> Result<bool> {
 }
 
 /// Close old attempts after positive runtime stop or on the isolated restore
-/// target. The caller holds the offline and exclusive authorization fences.
+/// target. The caller holds the startup leader and Call lock, or the offline
+/// and exclusive authorization fences.
 pub(crate) async fn reconcile_stopped(tx: &Transaction<'_>) -> Result<()> {
     let query = format!("{ACTIVE_ATTEMPTS} ORDER BY t.id,s.id,a.id LIMIT 64 FOR UPDATE OF t,s,a");
     let mut previous_task = None;
@@ -788,6 +789,7 @@ async fn settle_inactive_attempt(
     let task = row.get("id");
     let step = row.get("step_id");
     let attempt = row.get("attempt_id");
+    let task_state: &str = row.get("state");
     let call: Option<Uuid> = row.get("broker_call_id");
     if row.get::<_, String>("attempt_state") == "running" || call.is_some() {
         set_attempt(tx, attempt, "unknown", now).await?;
@@ -803,16 +805,19 @@ async fn settle_inactive_attempt(
             reason
         };
         if !matches!(
-            row.get::<_, String>("state").as_str(),
-            "succeeded" | "failed" | "canceled"
+            task_state,
+            "succeeded" | "failed" | "cancel_requested" | "canceled"
         ) {
             set_task(tx, task, "unknown", None, Some(reason.detail())).await?;
         }
         step_event(tx, task, step, attempt, "unknown").await?;
     } else {
-        let spec = step_spec(row, &row.get::<_, String>("step_key"))?;
         set_attempt(tx, attempt, "expired", now).await?;
-        let task_state: String = row.get("state");
+        if matches!(task_state, "cancel_requested" | "canceled") {
+            set_step(tx, step, "canceled", None, now).await?;
+            return step_event(tx, task, step, attempt, "canceled").await;
+        }
+        let spec = step_spec(row, row.get("step_key"))?;
         if task_state == "running"
             && row.get::<_, DateTime<Utc>>("deadline_at") > now
             && row.get::<_, i32>("attempt_count") < maximum_attempts(&spec)

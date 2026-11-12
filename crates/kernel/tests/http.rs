@@ -1272,13 +1272,14 @@ async fn signed_http_and_static_gateway_use_real_oci_and_shared_broker() {
     drop(body);
     wait_active(&db, 0).await;
     wait_ready(&db, &mixed_deployment).await;
-    skill_profiles::cancel_hold_task(
+    skill_profiles::cancel_and_restart_hold_tasks(
         &router,
         &app,
         &token,
         &mixed,
         &mixed_installed,
         &mixed_deployment,
+        &mut worker,
     )
     .await;
     enabled(
@@ -1299,5 +1300,5 @@ async fn signed_http_and_static_gateway_use_real_oci_and_shared_broker() {
     app.shutdown.store(true, Ordering::SeqCst);
     worker.abort();
     let _ = worker.await;
-    println!("HTTP-OCI: signed HTTP-only readiness, fixed GET/PUT/PATCH/DELETE Skill, JSON/streaming Skill, direct HTTP, static origin, SSE, original-authority revocation, restart, Task cancellation and mixed physical slots passed");
+    println!("HTTP-OCI: signed HTTP-only readiness, fixed GET/PUT/PATCH/DELETE Skill, JSON/streaming Skill, direct HTTP, static origin, SSE, original-authority revocation, controller component restart, Task cancellation and mixed physical slots passed");
 }

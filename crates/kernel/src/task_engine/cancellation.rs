@@ -200,8 +200,8 @@ pub(crate) async fn finish_cancellations(tx: &Transaction<'_>) -> Result<u64> {
     finish_ready(tx, None).await
 }
 
-/// Offline callers hold exclusive authorization and have released physical
-/// reservations after global stop or on the isolated restore target.
+/// Startup or offline recovery has released physical reservations after
+/// global stop or on the isolated restore target.
 pub(crate) async fn finish_stopped_cancellations(tx: &Transaction<'_>) -> Result<()> {
     while finish_ready(tx, None).await? > 0 {}
     Ok(())

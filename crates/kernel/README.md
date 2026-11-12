@@ -19,6 +19,7 @@
 | 任务提交与查询 | `createTask/getTask/listTasks/listTaskSteps`；在一个事务中固定 Workflow 版本、deadline、执行权限上限、授权来源和需要固定的提供者，初始化步骤状态 | 服务身份执行需单独审批。HTTP 与真实 PostgreSQL 回归见 `crates/kernel/tests/workflows.rs` |
 | 同步 TaskEngine | 控制器以 PostgreSQL 租约领取能力契约型或固定 HTTP 同步 Skill，经 Broker 准入、计费及调用，原子记录 Attempt 与 Call；结果提交检查 fence 并推进下游与 outbox | Task 步骤采用单次调用；任务级 HostService 附属授权、Blob 大结果与长任务 TaskWorker 待实现 |
 | Task 期限对账 | 控制器定期回收过期租约，并独立于同步调用处理已到整体期限、无活动或待核实步骤的 Task | Task 记录 `DEADLINE_EXCEEDED`，保留既有步骤输出、Attempt 和 Call |
+| Task 启动恢复 | 控制器确认旧工作负载停止后，在恢复准入前结算活动 Attempt 和关联 Call | 已开始或关联 Call 的步骤保留为 `unknown`；仍在期限和次数预算内的未开始步骤可重新领取 |
 | UNKNOWN 核实 | `resolveUnknownStep` 在当前授权与步骤 ETag 下核对已成功结算的关联 Call，或核实尚未越过持久化派发屏障的已释放 Call | 记录操作者和证据，推进步骤 fence。旧账本缺少标记、可能已经发送的 Call 继续按未知结果处理 |
 | Task 显式重试 | `retryTask` 复核原授权、依赖、整体期限与次数上限，对已证明未派发的失败步骤重新排队 | 保留原 Attempt 和业务幂等键，下一次领取推进 fence |
 | Task 取消 | `cancelTask` 停止领取与准入，记录取消意图，沿关联 Call 账本处理仍在途的调用 | 等待 Controller 确认物理停止并释放预留，再将 Task 置为 `canceled`。保留已确认结果与仍未知的步骤 |
