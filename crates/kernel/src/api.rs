@@ -621,8 +621,9 @@ fn dispatch<'a>(
             )
             .await?;
             if let Some(row)=tx.query_opt("SELECT fingerprint,safe_response,response_status,sensitive,resource_id FROM idempotency_records WHERE subject_id=$1 AND credential_id=$2 AND method=$3 AND path=$4 AND key=$5 AND expires_at>now()",&[&ctx.subject,&ctx.credential,&method,&path,&key]).await?{
-            if name == "resolveUnknownStep" {
-                // A stale resolver grant must not reveal whether a previously
+            let task_recovery = matches!(name, "resolveUnknownStep" | "cancelTask");
+            if task_recovery {
+                // A stale Task grant must not reveal whether a previously
                 // submitted idempotency key or fingerprint exists.
                 authorize_operation(&tx, &app.auth, &ctx, name, &params, &body).await?;
             }
@@ -636,7 +637,7 @@ fn dispatch<'a>(
             if let Some(value) = response {
                 if name == "trustPublisher" && row.get::<_,i32>("response_status") == 201 {
                     auth::authorize(&tx, &ctx, "publisher.trust", &Resource::new("publisher", "new", Some(ctx.subject))).await?;
-                } else if name != "resolveUnknownStep" {
+                } else if !task_recovery {
                     authorize_operation(&tx, &app.auth, &ctx, name, &params, &body).await?;
                 }
                 if matches!(name, "upgradeDeployment" | "rollbackDeployment") {
@@ -708,12 +709,9 @@ fn dispatch<'a>(
         }
         "cancelCall" => {
             let call = path_id(&params, "call_id")?;
-            // This is cancellation intent, not proof that an already dispatched
-            // physical operation was undone. The controller fences unknown work.
-            let error = Error::new("CANCELED", "Call cancellation was requested; physical outcome remains unknown", StatusCode::CONFLICT).detail();
-            tx.execute("UPDATE calls SET state='unknown',error=$2 WHERE id=$1 AND state IN ('accepted','running')", &[&call,&error]).await?;
-            tx.execute("UPDATE rpc_delegations SET status='revoked' WHERE call_id=$1 AND EXISTS(SELECT 1 FROM calls WHERE id=$1 AND state='unknown')", &[&call]).await?;
-            tx.execute("UPDATE execution_delegations SET status='revoked' WHERE id IN(SELECT delegation_id FROM calls WHERE id=$1 AND state='unknown')", &[&call]).await?;
+            db::call_lock(&tx).await?;
+            authorize_operation(&tx, &app.auth, &ctx, name, &params, &body).await?;
+            crate::broker::request_cancellation(&tx, &[call]).await?;
             (Value::Null, 204)
         }
         "getNode" => (admission::status(&tx).await?, 200),

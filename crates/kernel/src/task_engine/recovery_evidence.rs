@@ -21,7 +21,7 @@ pub(super) struct RecordedAttempt<'a> {
 }
 
 fn conflict() -> Error {
-    Error::conflict("Linked Broker Call does not prove the submitted Task result")
+    Error::conflict("Linked Broker Call does not prove a successful Task result")
 }
 
 fn invalid_proof(error: Error) -> Error {
@@ -36,7 +36,6 @@ fn invalid_proof(error: Error) -> Error {
 pub(super) async fn verified_output(
     tx: &Transaction<'_>,
     attempt: RecordedAttempt<'_>,
-    submitted: &Value,
 ) -> Result<Value> {
     let frozen = frozen_step(&attempt)?;
     let rows = tx.query(
@@ -128,7 +127,7 @@ pub(super) async fn verified_output(
         .as_object_mut()
         .and_then(|result| result.remove("output"))
         .ok_or_else(conflict)?;
-    if &output != submitted || serde_json::to_vec(&output)?.len() > maximum {
+    if serde_json::to_vec(&output)?.len() > maximum {
         return Err(conflict());
     }
     reject_jsonb_nul(&output).map_err(invalid_proof)?;

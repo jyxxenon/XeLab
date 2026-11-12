@@ -1153,6 +1153,38 @@ pub(crate) async fn reserve_business(
     Ok((accounts, charged))
 }
 
+/// Record cancellation under the call ledger lock. Uncertain physical work
+/// retains its reservation until the Controller confirms the process stopped.
+pub(crate) async fn request_cancellation(
+    tx: &tokio_postgres::Transaction<'_>,
+    calls: &[Uuid],
+) -> Result<()> {
+    let error = Error::new(
+        "CANCELED",
+        "Call cancellation was requested; physical outcome remains unknown",
+        axum::http::StatusCode::CONFLICT,
+    )
+    .detail();
+    tx.execute(
+        "UPDATE calls SET state='unknown',error=$2 WHERE id=ANY($1) AND state IN ('accepted','running')",
+        &[&calls, &error],
+    )
+    .await?;
+    tx.execute(
+        "UPDATE rpc_delegations SET status='revoked' WHERE status='active'
+         AND call_id IN (SELECT id FROM calls WHERE id=ANY($1) AND state='unknown')",
+        &[&calls],
+    )
+    .await?;
+    tx.execute(
+        "UPDATE execution_delegations SET status='revoked' WHERE status='active'
+         AND id IN (SELECT delegation_id FROM calls WHERE id=ANY($1) AND state='unknown')",
+        &[&calls],
+    )
+    .await?;
+    Ok(())
+}
+
 /// A transport failure never proves physical completion. Only confirmed results
 /// release the shared reservation; Controller recovery fences unknown work.
 pub(crate) async fn settle_business(

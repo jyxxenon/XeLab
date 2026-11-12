@@ -121,9 +121,13 @@ pub(crate) async fn resolve_unknown(
             idempotency_key: key,
             call,
         },
-        submitted,
     )
     .await?;
+    if &output != submitted {
+        return Err(Error::conflict(
+            "Submitted output differs from the linked Broker Call",
+        ));
+    }
 
     // Historical evidence grants no execution rights. Time-bound operator
     // permissions are rechecked after waiting for locks and inspecting proof.

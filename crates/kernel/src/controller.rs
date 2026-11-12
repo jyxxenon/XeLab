@@ -264,6 +264,7 @@ async fn tick(app: &App, first: bool, state: &mut ControllerState) -> Result<()>
             &[],
         )
         .await?;
+        crate::task_engine::finish_stopped_cancellations(&tx).await?;
         tx.execute("UPDATE quotas SET concurrent_calls_used=0", &[])
             .await?;
         tx.execute("UPDATE instances SET phase='pending',health='unknown',restart_count=0,revision=revision+1,updated_at=now() WHERE phase<>'stopped'", &[]).await?;

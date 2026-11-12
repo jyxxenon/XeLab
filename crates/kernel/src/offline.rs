@@ -278,6 +278,7 @@ impl Session {
             &[],
         )
         .await?;
+        crate::task_engine::finish_stopped_cancellations(&tx).await?;
         tx.execute("UPDATE node_budget SET reserved_cpu_millis=0,reserved_memory_bytes=0,revision=revision+1,updated_at=now()",&[]).await?;
         tx.execute(
             "UPDATE quotas SET concurrent_calls_used=0,revision=revision+1,updated_at=now()",

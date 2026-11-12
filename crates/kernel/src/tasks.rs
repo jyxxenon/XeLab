@@ -24,12 +24,21 @@ mod targets;
 pub(crate) fn handles(name: &str) -> bool {
     matches!(
         name,
-        "createTask" | "getTask" | "listTasks" | "listTaskSteps" | "resolveUnknownStep"
+        "createTask"
+            | "getTask"
+            | "listTasks"
+            | "listTaskSteps"
+            | "resolveUnknownStep"
+            | "cancelTask"
     )
 }
 
 pub(crate) fn validate_query(name: &str, query: &str) -> Result<()> {
-    if matches!(name, "createTask" | "getTask" | "resolveUnknownStep") && !query.is_empty() {
+    if matches!(
+        name,
+        "createTask" | "getTask" | "resolveUnknownStep" | "cancelTask"
+    ) && !query.is_empty()
+    {
         return Err(Error::invalid("Unexpected task query parameter"));
     }
     Ok(())
@@ -42,6 +51,15 @@ pub(crate) async fn authorize(
     params: &HashMap<String, String>,
     body: &Value,
 ) -> Result<()> {
+    if name == "cancelTask" {
+        let task = path_id(params, "task_id")?;
+        let row = c
+            .query_opt("SELECT owner_id FROM tasks WHERE id=$1", &[&task])
+            .await?
+            .ok_or_else(Error::not_found)?;
+        let resource = Resource::new("task", task, Some(row.get(0)));
+        return authorize_cancellation(c, ctx, &resource).await;
+    }
     if name == "resolveUnknownStep" {
         let resource = step_task_resource(c, path_id(params, "step_id")?)
             .await?
@@ -82,10 +100,27 @@ pub(crate) async fn authorize_resolution(
     ctx: &Context,
     task: &Resource,
 ) -> Result<()> {
+    authorize_visible_action(c, ctx, task, "task.resolve").await
+}
+
+pub(crate) async fn authorize_cancellation(
+    c: &(impl GenericClient + Sync),
+    ctx: &Context,
+    task: &Resource,
+) -> Result<()> {
+    authorize_visible_action(c, ctx, task, "task.cancel").await
+}
+
+async fn authorize_visible_action(
+    c: &(impl GenericClient + Sync),
+    ctx: &Context,
+    task: &Resource,
+    action: &str,
+) -> Result<()> {
     if !crate::policy::allows(c, ctx, "task.read", task).await? {
         return Err(Error::not_found());
     }
-    auth::authorize(c, ctx, "task.resolve", task).await
+    auth::authorize(c, ctx, action, task).await
 }
 
 async fn authorize_create(c: &(impl GenericClient + Sync), ctx: &Context) -> Result<()> {
@@ -111,6 +146,11 @@ pub(crate) async fn execute(
 ) -> Result<(Value, u16)> {
     match name {
         "createTask" => Ok((create(c, ctx, body).await?, 201)),
+        "cancelTask" => Ok((
+            crate::task_engine::cancel_task(c, ctx, path_id(params, "task_id")?, body, headers)
+                .await?,
+            200,
+        )),
         "resolveUnknownStep" => Ok((
             crate::task_engine::resolve_unknown(c, ctx, path_id(params, "step_id")?, body, headers)
                 .await?,

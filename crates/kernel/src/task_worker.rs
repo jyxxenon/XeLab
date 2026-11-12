@@ -3,7 +3,7 @@ use crate::{
     api::App,
     broker,
     error::{Error, Result},
-    task_engine::{self, Lease, Outcome},
+    task_engine::{self, Lease, Outcome, WorkerCall},
 };
 use axum::http::StatusCode;
 use serde_json::Value;
@@ -28,6 +28,12 @@ async fn reconcile(app: &App) {
         if let Err(error) = bounded(reconcile_once(app)).await {
             tracing::warn!(reason_code = error.code, "Task reconciliation failed");
         }
+        if let Err(error) = bounded(reconcile_cancellations_once(app)).await {
+            tracing::warn!(
+                reason_code = error.code,
+                "Task cancellation reconciliation failed"
+            );
+        }
         time::sleep(IDLE_DELAY).await;
     }
 }
@@ -46,6 +52,7 @@ async fn dispatch(app: &App) {
 #[cfg(test)]
 pub(crate) async fn run_once(app: &App) -> Result<bool> {
     bounded(reconcile_once(app)).await?;
+    bounded(reconcile_cancellations_once(app)).await?;
     dispatch_once(app).await
 }
 
@@ -117,6 +124,20 @@ async fn reconcile_once(app: &App) -> Result<()> {
     Ok(())
 }
 
+async fn reconcile_cancellations_once(app: &App) -> Result<()> {
+    if !ready(app) {
+        return Ok(());
+    }
+    let mut connection = app.db.connect_scoped(METADATA_BUDGET).await?;
+    let tx = connection.transaction().await?;
+    task_engine::finish_cancellations(&tx).await?;
+    if !ready(app) {
+        return Ok(());
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 async fn heartbeat(app: &App, lease: &Lease) {
     let mut interval = time::interval_at(Instant::now() + HEARTBEAT, HEARTBEAT);
     interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -156,18 +177,21 @@ async fn finish(app: &App, lease: &Lease, invocation: Result<Value>) -> Result<(
         return Ok(());
     }
     let outcome = match task_engine::broker_call(&tx, lease).await? {
-        Some((call, state, result)) => Some(match durable_output(call, &state, result) {
-            Some(output) => Outcome::Succeeded(output),
-            None => Outcome::Unknown(
-                Error::new(
-                    "OUTCOME_UNKNOWN",
-                    "Task Call has no confirmed result",
-                    StatusCode::CONFLICT,
-                )
-                .with_resource(call),
-            ),
-        }),
-        None => match invocation {
+        WorkerCall::Canceled => return Ok(()),
+        WorkerCall::Linked(call, state, result) => {
+            Some(match durable_output(call, &state, result) {
+                Some(output) => Outcome::Succeeded(output),
+                None => Outcome::Unknown(
+                    Error::new(
+                        "OUTCOME_UNKNOWN",
+                        "Task Call has no confirmed result",
+                        StatusCode::CONFLICT,
+                    )
+                    .with_resource(call),
+                ),
+            })
+        }
+        WorkerCall::Unlinked => match invocation {
             // Transient admission failures leave an undispatched lease for
             // expiry to reconcile under the Task's existing attempt budget.
             Err(error)

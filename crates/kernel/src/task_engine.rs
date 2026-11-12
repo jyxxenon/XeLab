@@ -13,10 +13,12 @@ use tokio_postgres::{Row, Transaction};
 use uuid::Uuid;
 
 mod authority;
+mod cancellation;
 mod input;
 mod recovery;
 mod recovery_evidence;
 
+pub(crate) use cancellation::{cancel_task, finish_cancellations, finish_stopped_cancellations};
 pub(crate) use recovery::{resolve_unknown, validate_resolution_history};
 
 const LEASE: Duration = Duration::seconds(30);
@@ -343,18 +345,29 @@ pub(crate) async fn authorize_broker_call(
 }
 
 /// Inspect durable settlement even if the dispatch future lost its response.
-pub(crate) async fn broker_call(
-    tx: &Transaction<'_>,
-    lease: &Lease,
-) -> Result<Option<(Uuid, String, Option<Value>)>> {
-    let active = load(tx, lease).await?;
+pub(crate) async fn broker_call(tx: &Transaction<'_>, lease: &Lease) -> Result<WorkerCall> {
+    let row = lock_step(tx, lease).await?;
+    if matches!(row.get::<_, &str>("state"), "cancel_requested" | "canceled") {
+        return Ok(WorkerCall::Canceled);
+    }
+    let active = load_attempt(tx, lease, row).await?;
     let Some(call) = active.broker_call_id else {
-        return Ok(None);
+        return Ok(WorkerCall::Unlinked);
     };
     let row = tx
         .query_one("SELECT state,result FROM calls WHERE id=$1", &[&call])
         .await?;
-    Ok(Some((call, row.get("state"), row.get("result"))))
+    Ok(WorkerCall::Linked(
+        call,
+        row.get("state"),
+        row.get("result"),
+    ))
+}
+
+pub(crate) enum WorkerCall {
+    Canceled,
+    Unlinked,
+    Linked(Uuid, String, Option<Value>),
 }
 
 /// A revoked or expired credential can close a lease that never admitted a Call.
@@ -465,12 +478,18 @@ impl Active {
 }
 
 async fn load(tx: &Transaction<'_>, lease: &Lease) -> Result<Active> {
+    load_attempt(tx, lease, lock_step(tx, lease).await?).await
+}
+
+async fn lock_step(tx: &Transaction<'_>, lease: &Lease) -> Result<Row> {
     db::auth_lock(tx, false).await?;
     let query = format!("{STEP_QUERY} WHERE t.id=$1 AND s.id=$2 FOR UPDATE OF t,s");
-    let row = tx
-        .query_opt(&query, &[&lease.task_id, &lease.step_id])
+    tx.query_opt(&query, &[&lease.task_id, &lease.step_id])
         .await?
-        .ok_or_else(Error::not_found)?;
+        .ok_or_else(Error::not_found)
+}
+
+async fn load_attempt(tx: &Transaction<'_>, lease: &Lease, row: Row) -> Result<Active> {
     if row.get::<_, i64>("step_fence") != lease.fence {
         return Err(Error::conflict("Task step fence changed"));
     }
