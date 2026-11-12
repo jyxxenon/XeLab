@@ -22,6 +22,7 @@ fn completed(binding: &Binding, output: Value) -> rpc::InvokeResponse {
         call_id: binding.call.to_string(),
         output_digest: digest(&bytes),
         output_json: bytes,
+        terminal_failure: None,
     }
 }
 

@@ -328,6 +328,7 @@ struct Echo {
     output_bytes: Arc<std::sync::atomic::AtomicUsize>,
     unary_failure: Arc<std::sync::Mutex<Option<tonic::Status>>>,
     unary_gate: Option<Arc<tokio::sync::Semaphore>>,
+    terminal_failure: Arc<std::sync::Mutex<Option<String>>>,
 }
 #[tonic::async_trait]
 impl rpc::capability_service_server::CapabilityService for Echo {
@@ -353,6 +354,17 @@ impl rpc::capability_service_server::CapabilityService for Echo {
         if let Some(failure) = self.unary_failure.lock().unwrap().clone() {
             return Err(failure);
         }
+        if let Some(code) = self.terminal_failure.lock().unwrap().clone() {
+            return Ok(tonic::Response::new(rpc::InvokeResponse {
+                call_id: r.call_id,
+                terminal_failure: Some(rpc::InvokeFailure {
+                    version: r.terminal_failure_version,
+                    contract: r.contract,
+                    code,
+                }),
+                ..Default::default()
+            }));
+        }
         let size = self.output_bytes.load(Ordering::SeqCst);
         let message = if size == 0 {
             "proxied".to_owned()
@@ -364,6 +376,7 @@ impl rpc::capability_service_server::CapabilityService for Echo {
             call_id: r.call_id,
             output_digest: contracts::digest(&bytes),
             output_json: bytes,
+            terminal_failure: None,
         }))
     }
     async fn invoke_stream(
@@ -396,6 +409,7 @@ impl rpc::capability_service_server::CapabilityService for Echo {
                     call_id: call,
                     output_digest: contracts::digest(&completed),
                     output_json: completed,
+                    terminal_failure: None,
                 })),
             }))
             .await
