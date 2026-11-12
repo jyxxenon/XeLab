@@ -1017,7 +1017,7 @@ function renderLauncher() {
     const matching=apps.filter(app=>app.title.toLowerCase().includes(search)||app.id.includes(search))[index];
     entry.append(appIcon(matching.icon),node('span',{},matching.title));
   }
-  for(const[ index,win]of[...windows.values()].entries())if(win.app.title.toLowerCase().includes(search))$('#app-grid').append(button(`↥ ${win.app.title}`,()=>{$('#launcher').close();focus(win);},{'aria-label':`聚焦窗口${index+1} ${win.app.title}`}));
+  for(const[ index,win]of[...windows.values()].entries())if(win.app.title.toLowerCase().includes(search))$('#app-grid').append(button(`↥ ${win.app.title}`,()=>{$('#launcher').close();focus(win);win.element.querySelector('.window-title')?.focus();},{'aria-label':`聚焦窗口${index+1} ${win.app.title}`}));
   if(!oauth.loggedIn)return;
   const found=launcherItems.filter(item=>`${item.spec.title} ${item.spec.id} ${item.plugin_id}`.toLowerCase().includes(search));
   for(const item of found){
