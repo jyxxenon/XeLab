@@ -97,6 +97,24 @@ class ShellVisual(unittest.TestCase):
         }""", references)
         self.assertEqual(missing, [], "every stylesheet and script referenced by index.html must load")
 
+    def test_launcher_manages_keyboard_focus(self):
+        self.open()
+        trigger = self.page.get_by_role("button", name="打开应用启动器", exact=True)
+        trigger.click()
+        self.page.locator("#launcher").wait_for(state="visible")
+        self.assertEqual(self.page.evaluate("document.activeElement.id"), "app-search")
+        self.page.keyboard.press("Escape")
+        self.page.wait_for_function("() => !document.querySelector('#launcher').open")
+        self.assertEqual(
+            self.page.evaluate("document.activeElement.getAttribute('aria-label')"),
+            "打开应用启动器")
+        trigger.press("Enter")
+        self.page.locator("#launcher").wait_for(state="visible")
+        self.assertEqual(self.page.evaluate("document.activeElement.id"), "app-search")
+        self.page.get_by_role("button", name="启动设置", exact=True).click()
+        self.page.locator('.window[data-app="settings"]').wait_for()
+        self.assertIn("window-title", self.page.evaluate("document.activeElement.className"))
+
     def test_desktop_wallpaper_is_served_and_applied(self):
         self.open()
         background = self.style("#desktop")["backgroundImage"]
