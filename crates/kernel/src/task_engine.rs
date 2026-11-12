@@ -1,0 +1,568 @@
+//! Transactional state for synchronous Workflow attempts. The in-process
+//! caller must commit a lease before preparing it for Broker dispatch.
+use crate::{
+    auth::Auth,
+    contracts::{reject_jsonb_nul, unsigned, validate, validate_business},
+    db,
+    error::{Error, Result},
+};
+use chrono::{DateTime, Duration, Utc};
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use tokio_postgres::{Row, Transaction};
+use uuid::Uuid;
+
+mod authority;
+mod input;
+
+const LEASE: Duration = Duration::seconds(30);
+const MAX_STEP_JSON_BYTES: usize = 4 * 1024 * 1024;
+const STEP_QUERY: &str = "SELECT t.*,w.spec,w.owner_id AS workflow_owner_id,
+    s.id AS step_id,s.step_key,s.state AS step_state,s.fence AS step_fence,s.attempt_count,s.provider_deployment_id,
+    e.issuer_credential_id,e.subject_id AS delegation_subject,e.status AS delegation_status,
+    e.expires_at AS delegation_expires_at,e.run_as AS delegation_run_as,e.maximum_rules
+    FROM tasks t JOIN task_steps s ON s.task_id=t.id JOIN workflows w ON w.id=t.workflow_id
+    JOIN execution_delegations e ON e.id=t.delegation_id";
+
+#[derive(Debug, Clone)]
+pub struct Lease {
+    pub task_id: Uuid,
+    pub step_id: Uuid,
+    pub attempt_id: Uuid,
+    pub execution_id: Uuid,
+    pub fence: i64,
+    pub idempotency_key: String,
+}
+
+pub struct Invocation {
+    pub skill_id: Uuid,
+    pub deployment_id: Uuid,
+    pub installation_id: Uuid,
+    pub input: Value,
+    pub deadline: DateTime<Utc>,
+    pub idempotency_key: String,
+}
+
+pub enum Outcome {
+    Succeeded(Value),
+    Failed(Error),
+    Unknown(Error),
+}
+
+pub async fn claim(tx: &Transaction<'_>, auth: &Auth) -> Result<Option<Lease>> {
+    db::auth_lock(tx, false).await?;
+    let query = format!(
+        "{STEP_QUERY}
+        WHERE t.state IN ('queued','running') AND s.state='ready' AND t.deadline_at>clock_timestamp()
+          AND EXISTS (
+              SELECT 1 FROM deployments d JOIN installations n ON n.id=d.installation_id
+              JOIN publishers p ON p.id=n.publisher_id JOIN skills k ON k.installation_id=n.id
+              WHERE d.id=s.provider_deployment_id AND d.archived_at IS NULL AND d.spec->>'enabled'='true'
+                AND n.state='installed' AND p.status='trusted' AND k.enabled AND k.archived_at IS NULL
+                AND t.admission @> jsonb_build_object('version',1,'steps',jsonb_build_array(
+                    jsonb_build_object('step_key',s.step_key,'deployment_id',d.id,'installation_id',n.id,
+                      'binding',jsonb_build_object('kind','skill_capability','skill_id',k.id,
+                                                 'definition_digest',k.definition_digest))))
+          )
+          AND NOT EXISTS (SELECT 1 FROM task_steps active WHERE active.task_id=t.id AND active.state='running')
+        ORDER BY s.created_at,s.id LIMIT 1 FOR UPDATE OF t,s SKIP LOCKED"
+    );
+    let Some(row) = tx.query_opt(&query, &[]).await? else {
+        return Ok(None);
+    };
+    let task_id = row.get("id");
+    let step_id = row.get("step_id");
+    // The selection statement can have taken its snapshot before a sibling
+    // claim committed. Check again while this transaction holds the Task lock.
+    let idle: bool = tx
+        .query_one(
+            "SELECT NOT EXISTS (SELECT 1 FROM task_steps WHERE task_id=$1 AND state='running')",
+            &[&task_id],
+        )
+        .await?
+        .get(0);
+    if !idle {
+        return Ok(None);
+    }
+    let step_key: String = row.get("step_key");
+    let step = step_spec(&row, &step_key)?;
+    let count: i32 = row.get("attempt_count");
+    let number = count
+        .checked_add(1)
+        .filter(|number| *number <= maximum_attempts(&step))
+        .ok_or_else(|| Error::conflict("Task step attempt limit reached"))?;
+    let fence = row
+        .get::<_, i64>("step_fence")
+        .checked_add(1)
+        .ok_or_else(|| Error::conflict("Task step fence limit reached"))?;
+    let attempt_id = Uuid::new_v4();
+    let prepared = match authority::prepare(tx, auth, &row, &step_key, attempt_id).await {
+        Ok(prepared) => prepared,
+        Err(error) if matches!(error.code, "PERMISSION_DENIED" | "INVALID_CREDENTIAL") => {
+            set_task(
+                tx,
+                task_id,
+                "paused_authorization",
+                None,
+                Some(error.detail()),
+            )
+            .await?;
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let now = clock(tx).await?;
+    let end = prepared
+        .deadline
+        .min(now + step_timeout(&step)?)
+        .min(now + LEASE);
+    require_future(end, now)?;
+    let execution_id = Uuid::new_v4();
+    let idempotency_key = format!("task-step:{step_id}");
+    tx.execute(
+        "INSERT INTO attempts(id,step_id,number,execution_id,idempotency_key,fence,lease_expires_at,state,created_at,updated_at)
+         VALUES($1,$2,$3,$4,$5,$6,$7,'leased',$8,$8)",
+        &[&attempt_id, &step_id, &number, &execution_id, &idempotency_key, &fence, &end, &now],
+    ).await?;
+    tx.execute(
+        "UPDATE task_steps SET state='running',attempt_count=$2,fence=$3,revision=revision+1,updated_at=$4 WHERE id=$1",
+        &[&step_id, &number, &fence, &now],
+    ).await?;
+    // Update the parent on every claim so a repeatable-read claimant using an
+    // older snapshot cannot silently retain the preceding Task version.
+    set_task(tx, task_id, "running", None, None).await?;
+    Ok(Some(Lease {
+        task_id,
+        step_id,
+        attempt_id,
+        execution_id,
+        fence,
+        idempotency_key,
+    }))
+}
+
+/// Persist dispatch intent before transferring a validated invocation. Until
+/// the Broker journals an admitted Call, loss after this boundary is unknown.
+pub async fn begin(tx: &Transaction<'_>, auth: &Auth, lease: &Lease) -> Result<Invocation> {
+    let active = load(tx, lease).await?;
+    active.require_running_step()?;
+    if active.state != "leased" {
+        return Err(Error::conflict(
+            "Attempt has already crossed the dispatch boundary",
+        ));
+    }
+    let prepared = active.prepare(tx, auth, lease.attempt_id).await?;
+    let input = step_input(tx, &active, lease.task_id, prepared.maximum_input_bytes).await?;
+    validate_business(&prepared.definition["input_schema"], &input)?;
+    let deadline = active.deadline(&prepared)?;
+    let now = clock(tx).await?;
+    require_future(active.lease_until.min(deadline), now)?;
+    set_live_attempt(tx, lease.attempt_id, "running", now, deadline).await?;
+    Ok(Invocation {
+        skill_id: prepared.skill,
+        deployment_id: prepared.deployment,
+        installation_id: prepared.installation,
+        input,
+        deadline,
+        idempotency_key: lease.idempotency_key.clone(),
+    })
+}
+
+pub async fn renew(tx: &Transaction<'_>, auth: &Auth, lease: &Lease) -> Result<DateTime<Utc>> {
+    let active = load(tx, lease).await?;
+    active.require_running_step()?;
+    let prepared = active.prepare(tx, auth, lease.attempt_id).await?;
+    let now = clock(tx).await?;
+    let deadline = active.deadline(&prepared)?;
+    require_future(active.lease_until.min(deadline), now)?;
+    let until = deadline.min(now + LEASE);
+    let updated = tx
+        .execute(
+            "UPDATE attempts SET lease_expires_at=$2,revision=revision+1,updated_at=$3
+         WHERE id=$1 AND LEAST(lease_expires_at,$4::timestamptz)>clock_timestamp()",
+            &[&lease.attempt_id, &until, &now, &deadline],
+        )
+        .await?;
+    if updated != 1 {
+        return Err(Error::conflict("Task attempt lease or deadline expired"));
+    }
+    Ok(until)
+}
+
+struct Active {
+    row: Row,
+    step: Value,
+    state: String,
+    lease_until: DateTime<Utc>,
+    created_at: DateTime<Utc>,
+}
+
+impl Active {
+    fn require_running_step(&self) -> Result<()> {
+        if self.row.get::<_, String>("state") == "running"
+            && self.row.get::<_, String>("step_state") == "running"
+            && matches!(self.state.as_str(), "leased" | "running")
+        {
+            Ok(())
+        } else {
+            Err(Error::conflict("Task step is no longer active"))
+        }
+    }
+
+    fn deadline(&self, prepared: &authority::Prepared) -> Result<DateTime<Utc>> {
+        Ok(prepared
+            .deadline
+            .min(self.created_at + step_timeout(&self.step)?))
+    }
+
+    async fn prepare(
+        &self,
+        tx: &Transaction<'_>,
+        auth: &Auth,
+        request: Uuid,
+    ) -> Result<authority::Prepared> {
+        authority::prepare(
+            tx,
+            auth,
+            &self.row,
+            self.row.get::<_, String>("step_key").as_str(),
+            request,
+        )
+        .await
+    }
+}
+
+async fn load(tx: &Transaction<'_>, lease: &Lease) -> Result<Active> {
+    db::auth_lock(tx, false).await?;
+    let query = format!("{STEP_QUERY} WHERE t.id=$1 AND s.id=$2 FOR UPDATE OF t,s");
+    let row = tx
+        .query_opt(&query, &[&lease.task_id, &lease.step_id])
+        .await?
+        .ok_or_else(Error::not_found)?;
+    if row.get::<_, i64>("step_fence") != lease.fence {
+        return Err(Error::conflict("Task step fence changed"));
+    }
+    let attempt = tx.query_opt(
+        "SELECT state,lease_expires_at,created_at FROM attempts
+         WHERE id=$1 AND step_id=$2 AND execution_id=$3 AND fence=$4 AND idempotency_key=$5 FOR UPDATE",
+        &[&lease.attempt_id, &lease.step_id, &lease.execution_id, &lease.fence, &lease.idempotency_key],
+    ).await?.ok_or_else(|| Error::conflict("Attempt identity changed"))?;
+    let step = step_spec(&row, &row.get::<_, String>("step_key"))?;
+    Ok(Active {
+        row,
+        step,
+        state: attempt.get("state"),
+        lease_until: attempt.get("lease_expires_at"),
+        created_at: attempt.get("created_at"),
+    })
+}
+
+fn step_spec(row: &Row, key: &str) -> Result<Value> {
+    let spec: Value = row.get("spec");
+    validate("WorkflowSpec", &spec)?;
+    spec["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|step| step["id"] == key)
+        .cloned()
+        .ok_or_else(|| Error::conflict("Task step is missing from its workflow"))
+}
+
+fn maximum_attempts(step: &Value) -> i32 {
+    step["maximum_attempts"].as_i64().unwrap_or(1) as i32
+}
+
+fn step_timeout(step: &Value) -> Result<Duration> {
+    Ok(Duration::milliseconds(unsigned(&step["timeout_ms"])? as i64))
+}
+
+async fn clock(tx: &Transaction<'_>) -> Result<DateTime<Utc>> {
+    Ok(tx.query_one("SELECT clock_timestamp()", &[]).await?.get(0))
+}
+
+fn require_future(until: DateTime<Utc>, now: DateTime<Utc>) -> Result<()> {
+    if until > now {
+        Ok(())
+    } else {
+        Err(Error::conflict("Task attempt lease or deadline expired"))
+    }
+}
+
+async fn step_input(
+    tx: &Transaction<'_>,
+    active: &Active,
+    task: Uuid,
+    maximum: usize,
+) -> Result<Value> {
+    let dependencies = active.step["depends_on"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|id| id.as_str().unwrap())
+        .collect::<Vec<_>>();
+    let complete: i64 = tx.query_one(
+        "SELECT count(*) FROM task_steps WHERE task_id=$1 AND step_key=ANY($2::text[]) AND state='succeeded'",
+        &[&task, &dependencies],
+    ).await?.get(0);
+    // Repeated dependency edges are legal and require one successful step.
+    let unique: std::collections::HashSet<_> = dependencies.into_iter().collect();
+    if complete != unique.len() as i64 {
+        return Err(Error::conflict("Task step dependencies are incomplete"));
+    }
+    let upstream_ids: Vec<_> = active.step["input_mapping"]
+        .as_object()
+        .unwrap()
+        .values()
+        .filter_map(|leaf| leaf["step_output"]["step"].as_str())
+        .collect();
+    let rows = tx.query(
+        "SELECT step_key,output FROM task_steps WHERE task_id=$1 AND step_key=ANY($2::text[]) AND state='succeeded'",
+        &[&task, &upstream_ids],
+    ).await?;
+    let upstream: HashMap<_, _> = rows
+        .into_iter()
+        .filter_map(|row| {
+            let output: Option<Value> = row.get("output");
+            output.map(|value| (row.get("step_key"), value))
+        })
+        .collect();
+    input::materialize(
+        &active.step,
+        &active.row.get("input"),
+        &upstream,
+        maximum.min(MAX_STEP_JSON_BYTES),
+    )
+}
+
+pub async fn complete(
+    tx: &Transaction<'_>,
+    auth: &Auth,
+    lease: &Lease,
+    outcome: Outcome,
+) -> Result<Value> {
+    let active = load(tx, lease).await?;
+    let (state, output, error) = match outcome {
+        Outcome::Succeeded(value) => ("succeeded", Some(value), None),
+        Outcome::Failed(error) => ("failed", None, Some(error.detail())),
+        Outcome::Unknown(error) => ("unknown", None, Some(error.detail())),
+    };
+    let prepared = active.prepare(tx, auth, lease.attempt_id).await?;
+    if active.state == state && active.row.get::<_, String>("step_state") == state {
+        let matches = if let Some(output) = &output {
+            let saved: Option<Value> = tx
+                .query_one(
+                    "SELECT output FROM task_steps WHERE id=$1",
+                    &[&lease.step_id],
+                )
+                .await?
+                .get(0);
+            saved.as_ref() == Some(output)
+        } else {
+            active.row.get::<_, Option<Value>>("error") == error
+        };
+        if !matches {
+            return Err(Error::conflict(
+                "Attempt already has a different terminal result",
+            ));
+        }
+        return crate::api::read_object(tx, "task_steps", lease.step_id, "TaskStep").await;
+    }
+    active.require_running_step()?;
+    if active.state != "running" && state != "failed" {
+        return Err(Error::conflict(
+            "Attempt has not crossed the dispatch boundary",
+        ));
+    }
+    if let Some(output) = &output {
+        reject_jsonb_nul(output)?;
+        if serde_json::to_vec(output)?.len()
+            > prepared.maximum_output_bytes.min(MAX_STEP_JSON_BYTES)
+        {
+            return Err(Error::invalid("Task step output exceeds its byte limit"));
+        }
+        validate_business(&prepared.definition["output_schema"], output)?;
+    }
+    let now = clock(tx).await?;
+    let deadline = active.deadline(&prepared)?;
+    require_future(active.lease_until.min(deadline), now)?;
+    set_live_attempt(tx, lease.attempt_id, state, now, deadline).await?;
+    set_step(tx, lease.step_id, state, output, now).await?;
+    if state == "succeeded" {
+        promote_dependents(tx, lease.task_id, &active.row.get("spec"), now).await?;
+    } else {
+        set_task(tx, lease.task_id, state, None, error).await?;
+    }
+    step_event(tx, lease.task_id, lease.step_id, lease.attempt_id, state).await?;
+    crate::api::read_object(tx, "task_steps", lease.step_id, "TaskStep").await
+}
+
+async fn promote_dependents(
+    tx: &Transaction<'_>,
+    task: Uuid,
+    spec: &Value,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    tx.execute(
+        "UPDATE task_steps s SET state='ready',revision=revision+1,updated_at=$3
+         WHERE s.task_id=$1 AND s.state='pending' AND EXISTS (
+             SELECT 1 FROM jsonb_array_elements($2::jsonb->'steps') AS node
+             WHERE node->>'id'=s.step_key AND NOT EXISTS (
+                 SELECT 1 FROM jsonb_array_elements_text(node->'depends_on') AS dependency(key)
+                 WHERE NOT EXISTS (SELECT 1 FROM task_steps d
+                     WHERE d.task_id=$1 AND d.step_key=dependency.key AND d.state='succeeded')
+             )
+         )",
+        &[&task, &spec, &now],
+    )
+    .await?;
+    tx.execute(
+        "UPDATE tasks t SET state='succeeded',error=NULL,revision=revision+1,updated_at=$2,
+                output=(SELECT jsonb_object_agg(step_key,output) FROM task_steps WHERE task_id=t.id)
+         WHERE id=$1 AND NOT EXISTS (SELECT 1 FROM task_steps WHERE task_id=t.id AND state<>'succeeded')",
+        &[&task, &now],
+    ).await?;
+    Ok(())
+}
+
+/// Reconcile one expired attempt. Only work that never crossed `begin` can
+/// return to ready; an admitted dispatch must never be automatically replayed.
+pub async fn expire(tx: &Transaction<'_>) -> Result<bool> {
+    db::auth_lock(tx, false).await?;
+    let Some(row) = tx
+        .query_opt(
+            "SELECT t.id,t.state,t.deadline_at,w.spec,s.id AS step_id,s.step_key,s.attempt_count,
+                a.id AS attempt_id,a.state AS attempt_state,a.lease_expires_at
+         FROM attempts a JOIN task_steps s ON s.id=a.step_id JOIN tasks t ON t.id=s.task_id
+         JOIN workflows w ON w.id=t.workflow_id
+         WHERE a.state IN ('leased','running') AND a.lease_expires_at<=clock_timestamp()
+           AND s.state='running' AND s.fence=a.fence
+         ORDER BY a.lease_expires_at,a.id LIMIT 1 FOR UPDATE OF t,s,a SKIP LOCKED",
+            &[],
+        )
+        .await?
+    else {
+        return Ok(false);
+    };
+    let now = clock(tx).await?;
+    if row.get::<_, DateTime<Utc>>("lease_expires_at") > now {
+        return Ok(false);
+    }
+    let task = row.get("id");
+    let step = row.get("step_id");
+    let attempt = row.get("attempt_id");
+    if row.get::<_, String>("attempt_state") == "running" {
+        set_attempt(tx, attempt, "unknown", now).await?;
+        set_step(tx, step, "unknown", None, now).await?;
+        let reason = Error::new(
+            "OUTCOME_UNKNOWN",
+            "Task dispatch was not conclusively recorded",
+            axum::http::StatusCode::CONFLICT,
+        );
+        if !matches!(
+            row.get::<_, String>("state").as_str(),
+            "succeeded" | "failed" | "canceled"
+        ) {
+            set_task(tx, task, "unknown", None, Some(reason.detail())).await?;
+        }
+        step_event(tx, task, step, attempt, "unknown").await?;
+    } else {
+        let spec = step_spec(&row, &row.get::<_, String>("step_key"))?;
+        set_attempt(tx, attempt, "expired", now).await?;
+        let task_state: String = row.get("state");
+        if task_state == "running"
+            && row.get::<_, DateTime<Utc>>("deadline_at") > now
+            && row.get::<_, i32>("attempt_count") < maximum_attempts(&spec)
+        {
+            set_step(tx, step, "ready", None, now).await?;
+        } else {
+            set_step(tx, step, "failed", None, now).await?;
+            let reason = Error::new(
+                "DEADLINE_EXCEEDED",
+                "Task attempt expired before dispatch",
+                axum::http::StatusCode::GATEWAY_TIMEOUT,
+            );
+            if task_state == "running" {
+                set_task(tx, task, "failed", None, Some(reason.detail())).await?;
+            }
+            step_event(tx, task, step, attempt, "failed").await?;
+        }
+    }
+    Ok(true)
+}
+
+async fn set_attempt(
+    tx: &Transaction<'_>,
+    attempt: Uuid,
+    state: &str,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    tx.execute(
+        "UPDATE attempts SET state=$2,revision=revision+1,updated_at=$3 WHERE id=$1",
+        &[&attempt, &state, &now],
+    )
+    .await?;
+    Ok(())
+}
+
+async fn set_step(
+    tx: &Transaction<'_>,
+    step: Uuid,
+    state: &str,
+    output: Option<Value>,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    tx.execute(
+        "UPDATE task_steps SET state=$2,output=$3,revision=revision+1,updated_at=$4 WHERE id=$1",
+        &[&step, &state, &output, &now],
+    )
+    .await?;
+    Ok(())
+}
+
+async fn set_live_attempt(
+    tx: &Transaction<'_>,
+    attempt: Uuid,
+    state: &str,
+    now: DateTime<Utc>,
+    deadline: DateTime<Utc>,
+) -> Result<()> {
+    let updated = tx
+        .execute(
+            "UPDATE attempts SET state=$2,revision=revision+1,updated_at=$3
+         WHERE id=$1 AND LEAST(lease_expires_at,$4::timestamptz)>clock_timestamp()",
+            &[&attempt, &state, &now, &deadline],
+        )
+        .await?;
+    if updated != 1 {
+        return Err(Error::conflict("Task attempt lease or deadline expired"));
+    }
+    Ok(())
+}
+
+async fn set_task(
+    tx: &Transaction<'_>,
+    task: Uuid,
+    state: &str,
+    output: Option<Value>,
+    error: Option<Value>,
+) -> Result<()> {
+    tx.execute("UPDATE tasks SET state=$2,output=$3,error=$4,revision=revision+1,updated_at=clock_timestamp() WHERE id=$1", &[&task, &state, &output, &error]).await?;
+    Ok(())
+}
+
+async fn step_event(
+    tx: &Transaction<'_>,
+    task: Uuid,
+    step: Uuid,
+    attempt: Uuid,
+    state: &str,
+) -> Result<()> {
+    db::outbox(
+        tx,
+        "task.step.completed",
+        step,
+        &json!({"task_id":task,"step_id":step,"attempt_id":attempt,"state":state}),
+    )
+    .await
+}
