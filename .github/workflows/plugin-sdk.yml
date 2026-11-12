@@ -59,5 +59,10 @@ jobs:
       - name: Compare the contracts and run shared loopback mTLS conformance
         run: |
           cargo test -p xelab-kernel --lib --locked artifact::tests::generated_reference_profiles_match_manifest_and_raw_contracts -- --exact
-          python3 tools/acceptance/sdk-conformance.py --rust target/debug/xelab-echo \
+          sudo unshare --net -- bash -euc '
+            ip link set lo up
+            runner_user=$1
+            shift
+            exec runuser -u "$runner_user" -- python3 "$@"
+          ' -- "$(id -un)" tools/acceptance/sdk-conformance.py --rust target/debug/xelab-echo \
             --cpp "$RUNNER_TEMP/xelab-cpp/xelab-echo-cpp" --client "$RUNNER_TEMP/xelab-cpp/xelab-sdk-conformance"
