@@ -109,6 +109,19 @@ class ShellVisual(unittest.TestCase):
         self.assertIn("svg", status["type"])
         self.assertIn("cover", self.style("#desktop")["backgroundSize"])
 
+    def test_custom_theme_color_scheme_follows_its_desktop_token(self):
+        self.open()
+        settings = self.fixture.app("设置")
+        settings.get_by_label("主题模式", exact=True).select_option("custom")
+        desktop = settings.get_by_label("自定义 desktop", exact=True)
+        for colour, expected in (("#0B1020", "dark"), ("#F5F7FB", "light")):
+            desktop.evaluate(
+                "(input, colour) => { input.value = colour; input.dispatchEvent(new Event('input', {bubbles: true})); }",
+                colour)
+            self.page.wait_for_function(
+                "(expected) => document.documentElement.style.colorScheme === expected",
+                arg=expected)
+
     def test_reduced_transparency_removes_shell_blur(self):
         self.open()
         self.page.evaluate("() => document.documentElement.classList.add('reduced-transparency')")

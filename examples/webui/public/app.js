@@ -165,6 +165,15 @@ oauth.addEventListener('credentialchange',()=>{
 async function login() {
   try { await oauth.startLogin(); } catch (error) { toast(`无法进入可信登录：${error.message}`); }
 }
+const hexLuminance = value => {
+  const match = /^#([a-f0-9]{2})([a-f0-9]{2})([a-f0-9]{2})$/i.exec(value || '');
+  if (!match) return null;
+  const linear = part => {
+    const channel = parseInt(part, 16) / 255;
+    return channel <= 0.03928 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4;
+  };
+  return 0.2126 * linear(match[1]) + 0.7152 * linear(match[2]) + 0.0722 * linear(match[3]);
+};
 function applyTheme() {
   const mode = preview.theme.mode;
   const resolved = mode === 'system' ? (mediaDark.matches ? 'dark' : 'light') : mode;
@@ -177,7 +186,10 @@ function applyTheme() {
   document.documentElement.style.setProperty('--blur', `${Math.max(0, Math.min(32, tokens.blur_px))}px`);
   document.documentElement.style.setProperty('--opacity', String(preview.theme.reduce_transparency ? 1 : Math.max(.6, Math.min(1, tokens.panel_opacity))));
   document.documentElement.style.setProperty('--font', ({system:'system-ui,sans-serif',sans:'Arial,sans-serif',serif:'Georgia,serif',mono:'ui-monospace,monospace'})[tokens.font] || 'system-ui,sans-serif');
-  document.documentElement.style.colorScheme = resolved === 'dark' ? 'dark' : 'light';
+  const customDark = resolved === 'custom'
+    ? (hexLuminance(tokens.desktop) ?? hexLuminance(tokens.surface) ?? 1) < 0.4
+    : false;
+  document.documentElement.style.colorScheme = resolved === 'dark' || customDark ? 'dark' : 'light';
   document.documentElement.dataset.theme = mode;
   document.documentElement.classList.toggle('reduced-motion', preview.theme.reduce_motion || mediaMotion.matches);
   document.documentElement.classList.toggle('reduced-transparency', preview.theme.reduce_transparency);

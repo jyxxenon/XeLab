@@ -1,4 +1,4 @@
-//! Real kernel integration for the separately signed zero-queue build.
+//! Real kernel integration for the signed release image.
 use super::*;
 use ed25519_dalek::{pkcs8::EncodePublicKey, SigningKey};
 use std::{collections::BTreeMap, path::Path, sync::atomic::Ordering};
@@ -155,12 +155,17 @@ pub(super) async fn exercise() {
     let (installation, manifest, digest) = schema_bootstrap::register_artifact(
         &f,
         publisher,
-        Path::new("examples/object-storage/generated/kernel/xelab/plugin.json"),
+        Path::new("examples/object-storage/generated/xelab/plugin.json"),
         "XELAB_TEST_OBJECT_STORAGE_IMAGE",
         "1",
     )
     .await;
-    assert_eq!(manifest["concurrency"]["max_queue_requests"], 0);
+    assert_eq!(
+        manifest["concurrency"],
+        json!({
+            "max_active_requests":4,"max_queue_requests":32,"queue_timeout_ms":5000
+        })
+    );
 
     f.app.runtime.prepare_host_service_network().await.unwrap();
     f.app.ready.store(false, Ordering::SeqCst);
@@ -287,6 +292,21 @@ pub(super) async fn exercise() {
     let object = &put["output"]["object"];
     assert_eq!(object["revision"], 1);
     assert_eq!(object["digest"], source["digest"]);
+    let fixture = &f;
+    let stat_id = skills["data.object.stat"];
+    let concurrent = futures_util::future::join_all((0..12).map(|index| async move {
+        skill(
+            fixture,
+            stat_id,
+            json!({"key":key}),
+            &format!("object-concurrent-stat-{index}"),
+        )
+        .await
+    }))
+    .await;
+    for result in concurrent {
+        assert_eq!(result["output"]["object"], *object);
+    }
     let listed = skill(&f, skills["data.object.list"], json!({}), "object-list").await;
     assert_eq!(listed["output"]["items"], json!([object]));
     let usage = skill(
