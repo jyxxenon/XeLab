@@ -183,8 +183,8 @@ async fn signed_cpp_echo_runs_as_an_oci_plugin() {
     .await;
     assert_eq!(status, 200, "{record}");
     assert_eq!(record["image_digest"], digest);
-    assert_eq!(record["manifest_digest"], contracts::digest(&raw));
-    assert_eq!(record["plugin_id"], manifest["plugin_id"]);
+    assert_eq!(record["manifest"], manifest);
+    assert_eq!(record["state"], "installed");
     println!("Verified signature bound to the imported image manifest: {image}");
 
     let (status, queued) = api(
