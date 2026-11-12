@@ -334,9 +334,12 @@ class OverviewWindow(unittest.TestCase):
     def test_expired_session_fails_closed(self):
         self.overview_status[NODE_PATH] = (401, "INVALID_CREDENTIAL")
         self.open()
-        self.app("总览")
-        self.page.locator(".window[data-app=overview]").wait_for(state="detached")
+        self.page.get_by_role("button", name="打开总览", exact=True).click()
+        # The 401 tears the private views down immediately; waiting for the
+        # window to appear first would race that teardown.
         expect(self.page.locator("#welcome")).to_be_visible()
+        self.assertGreaterEqual(self.count(NODE_PATH), 1)
+        self.assertEqual(self.page.locator(".window[data-app=overview]").count(), 0)
         self.assertEqual(self.page.locator(".overview-section").count(), 0)
 
     def test_launcher_search_and_layout_restore(self):
