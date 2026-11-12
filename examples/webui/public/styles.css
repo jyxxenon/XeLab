@@ -665,3 +665,5 @@ button:disabled{box-shadow:none}
   .window-toolbar-actions{width:100%;margin-left:0;justify-content:flex-start}
   .window-toolbar-actions button{flex:0 1 auto}
 }
+
+.list-page-error:not(:empty){margin-top:12px}
