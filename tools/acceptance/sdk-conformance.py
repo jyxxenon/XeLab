@@ -3,8 +3,8 @@
 
 import argparse
 import json
+import os
 from pathlib import Path
-import socket
 import subprocess
 import sys
 import tempfile
@@ -72,32 +72,33 @@ def generate_artifacts(root):
     return artifacts
 
 
-def sandbox(identity, client, library_dir):
-    command = ["bwrap", "--clearenv", "--unshare-user", "--unshare-pid", "--die-with-parent",
-               "--ro-bind", "/usr", "/usr", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp",
-               "--chdir", "/"]
-    # Some CI hosts provision the loopback-only network outside the user namespace.
-    if {name for _, name in socket.if_nameindex()} != {"lo"}:
-        command.append("--unshare-net")
+def bubblewrap(mounts, environment, command):
+    invocation = ["bwrap", "--clearenv", "--unshare-user", "--unshare-net", "--unshare-pid",
+                  "--die-with-parent", "--ro-bind", "/usr", "/usr", "--dev", "/dev",
+                  "--proc", "/proc", "--tmpfs", "/tmp", "--chdir", "/"]
     for name in ("/bin", "/lib", "/lib64"):
         path = Path(name)
         if path.is_symlink():
-            command.extend(("--symlink", path.readlink(), path))
+            invocation.extend(("--symlink", path.readlink(), path))
         elif path.is_dir():
-            command.extend(("--ro-bind", path, path))
-    command.extend(("--ro-bind", identity, "/identity", "--ro-bind", client, "/test/client"))
-    if library_dir:
-        command.extend(("--ro-bind", library_dir, "/test/lib", "--setenv", "LD_LIBRARY_PATH", "/test/lib"))
-    for key, value in {
-        "XELAB_GENERATION": "1",
-        "XELAB_INSTANCE_ID": INSTANCE,
-        "XELAB_DEPLOYMENT_ID": DEPLOYMENT,
-        "XELAB_TLS_CERT_PATH": "/identity/tls.crt",
-        "XELAB_TLS_KEY_PATH": "/identity/tls.key",
-        "XELAB_TLS_CA_PATH": "/identity/ca.crt",
-    }.items():
-        command.extend(("--setenv", key, value))
-    return command
+            invocation.extend(("--ro-bind", path, path))
+    for source, target in mounts:
+        invocation.extend(("--ro-bind", source, target))
+    for key, value in environment.items():
+        invocation.extend(("--setenv", key, value))
+    return [*invocation, "--", *command]
+
+
+def docker(image, mounts, environment, command):
+    invocation = ["docker", "run", "--rm", "--pull", "never", "--network", "none", "--read-only",
+                  "--user", f"{os.getuid()}:{os.getgid()}", "--cap-drop", "ALL",
+                  "--security-opt", "no-new-privileges", "--tmpfs", "/tmp:rw,nosuid,nodev,mode=1777"]
+    for source, target in mounts:
+        invocation.extend(("--mount", f"type=bind,source={source},target={target},readonly"))
+    for key, value in environment.items():
+        invocation.extend(("--env", f"{key}={value}"))
+    return [*invocation, "--entrypoint", "/usr/bin/timeout", image,
+            "--kill-after=2s", "25s", *command]
 
 
 def main():
@@ -106,20 +107,35 @@ def main():
     parser.add_argument("--cpp", required=True, type=Path)
     parser.add_argument("--client", required=True, type=Path)
     parser.add_argument("--library-dir", type=Path, help="Shared libraries for an SDK built in a local prefix")
+    parser.add_argument("--container-image", help="Local SDK runtime image to run with Docker network isolation")
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="xelab-sdk-") as directory:
         root = Path(directory)
         identity = generate_identities(root)
         artifacts = generate_artifacts(root)
-        command = sandbox(identity, args.client.resolve(strict=True),
-                          args.library_dir.resolve(strict=True) if args.library_dir else None)
+        mounts = [(identity, "/identity"), (args.client.resolve(strict=True), "/test/client")]
+        environment = {
+            "XELAB_GENERATION": "1",
+            "XELAB_INSTANCE_ID": INSTANCE,
+            "XELAB_DEPLOYMENT_ID": DEPLOYMENT,
+            "XELAB_TLS_CERT_PATH": "/identity/tls.crt",
+            "XELAB_TLS_KEY_PATH": "/identity/tls.key",
+            "XELAB_TLS_CA_PATH": "/identity/ca.crt",
+        }
+        if args.library_dir:
+            mounts.append((args.library_dir.resolve(strict=True), "/test/lib"))
+            environment["LD_LIBRARY_PATH"] = "/test/lib"
+
+        def run(command, extra_mounts=()):
+            all_mounts = [*mounts, *extra_mounts]
+            invocation = (docker(args.container_image, all_mounts, environment, command)
+                          if args.container_image else bubblewrap(all_mounts, environment, command))
+            subprocess.run(invocation, check=True, timeout=30)
+
         for name, executable in (("rust", args.rust), ("cpp", args.cpp)):
-            subprocess.run([*command, "--ro-bind", artifacts[name] / "xelab", "/xelab",
-                            "--ro-bind", executable.resolve(strict=True), "/test/echo",
-                            "--", "/bin/sh", "-c",
-                            "/test/echo & child=$!\ntrap 'kill \"$child\" 2>/dev/null || true' EXIT\n/test/client"],
-                           check=True, timeout=30)
-        subprocess.run([*command, "--", "/test/client", "host"], check=True, timeout=30)
+            run(("/bin/sh", "-c", "/test/echo & child=$!\ntrap 'kill \"$child\" 2>/dev/null || true' EXIT\n/test/client"),
+                ((artifacts[name] / "xelab", "/xelab"), (executable.resolve(strict=True), "/test/echo")))
+        run(("/test/client", "host"))
 
 
 if __name__ == "__main__":

@@ -29,7 +29,7 @@ python3 tools/acceptance/sdk-conformance.py \
   --client target/cpp-sdk/xelab-sdk-conformance
 ```
 
-同一个生成的 RPC 客户端在隔离回环网络中驱动两个参考二进制。脚本核对两端的原始契约，使用临时 CA 测试内核身份、生命周期、输入校验、期限、取消、流终帧和错误。C++ HostService 客户端另有 mTLS、委托拒绝及父调用取消传播的回环测试。运行需要 Linux 用户命名空间，运行时只使用测试身份和打包目录。签名 OCI 安装及内核授权另走实际部署验收。
+同一个生成的 RPC 客户端在隔离回环网络中驱动两个参考二进制。脚本核对两端的原始契约，使用临时 CA 测试内核身份、生命周期、输入校验、期限、取消、流终帧和错误。C++ HostService 客户端另有 mTLS、委托拒绝及父调用取消传播的回环测试。本地使用 Linux 用户命名空间，CI 使用仅有回环接口的 Docker 容器。签名 OCI 安装及内核授权另走实际部署验收。
 
 ## 生成制品并提交
 

@@ -9,9 +9,11 @@ COPY examples/echo-cpp/main.cc examples/echo-cpp/main.cc
 RUN cmake -S sdk/cpp -B /build -DBUILD_TESTING=OFF -DCMAKE_BUILD_TYPE=Release && \
     cmake --build /build --target xelab-echo-cpp --parallel 2
 
-FROM ubuntu:24.04
+FROM ubuntu:24.04 AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgrpc++1.51t64 libprotobuf32t64 libssl3t64 && rm -rf /var/lib/apt/lists/*
+
+FROM runtime
 ARG ARTIFACT_DIR=examples/echo-cpp/generated
 COPY --from=builder /build/xelab-echo-cpp /usr/local/bin/xelab-echo-cpp
 COPY ${ARTIFACT_DIR}/xelab /xelab
