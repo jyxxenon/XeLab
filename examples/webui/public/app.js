@@ -794,6 +794,7 @@ async function overviewPage(win, {operation, title, renderItem, emptyMessage}) {
   const list = node('div', {class:'list'});
   for (const item of rows(result.data)) list.append(renderItem(item));
   if (!list.childElementCount) list.append(state('empty', '暂无可见项目', emptyMessage));
+  const pageError = node('div', {class:'overview-page-error'});
   const hint = node('p', {class:'overview-page-hint muted'}, result.data.next_cursor ? '仅显示当前已取到的项目；还有更多可加载。' : '');
   const more = button('加载下一页', async () => {
     more.disabled = true;
@@ -801,17 +802,18 @@ async function overviewPage(win, {operation, title, renderItem, emptyMessage}) {
       const next = await request(operation, {query:{limit:50, cursor:more.dataset.cursor}, signal:win.controller.signal});
       if (!more.isConnected) return;
       for (const item of rows(next.data)) list.append(renderItem(item));
+      pageError.replaceChildren();
       more.dataset.cursor = next.data.next_cursor || '';
       more.hidden = !next.data.next_cursor;
       hint.textContent = next.data.next_cursor ? '仅显示当前已取到的项目；还有更多可加载。' : '已加载全部可见项目。';
     } catch (error) {
       if (!more.isConnected) return;
-      list.append(overviewFailure(error));
+      pageError.replaceChildren(overviewFailure(error));
       hint.textContent = '下一页读取失败；已加载内容保持不变。';
     } finally { if (more.isConnected) more.disabled = false; }
   }, {'aria-label':`加载下一页${title}`, hidden:!result.data.next_cursor});
   more.dataset.cursor = result.data.next_cursor || '';
-  return node('div', {}, list, more, hint);
+  return node('div', {}, list, pageError, more, hint);
 }
 function overviewSection(win, {key, title, source, load}) {
   const headingId = `overview-${key}-${win.id}`;
