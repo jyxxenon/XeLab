@@ -9,8 +9,11 @@ DataMigration 或 RUN-06 通过。格式初始化最初追加 Schema 12，当前
 随 [HTTP 集成](m3-http-provenance.md)追加至 Schema 15；已发布迁移 1–14 的内容及摘要保持不变，旧快照需匹配布局的恢复程序。
 
 已登记安装及运行时制品共用内部格式执行校验；公开 `Artifact::inspect` 仍使用
-关闭版本化格式的安装校验。内部格式配置仅允许独占可写部署卷、recreate、
-无代理权限请求和非流式 `none`/`idempotent` 能力；不能用它开放扩展或其他副作用。
+关闭版本化格式的安装校验。内部格式配置要求独占可写部署卷和 recreate，
+副作用限于 `none`/`idempotent`。使用 Blob 代理的制品须经一元 Skill 调用，
+且无路由和依赖。签名权限限于 `blob.read` 和 `blob.create`。初始化各检查点复核
+部署审批。卷格式及提供者就绪发布后，HostService 仍按当前调用委托核对
+来源 Blob 和导出权限。切换到需要 Blob 审批的版本前须停用部署，以便在重新启用前审批。
 
 ## 准入与格式绑定
 

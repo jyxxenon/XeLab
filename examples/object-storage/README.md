@@ -23,4 +23,6 @@ docker run --rm --network none --read-only --tmpfs /tmp:rw,nosuid,nodev,noexec,m
 
 正式入口从当前 XFS 项目卷获取容量，Initialize 需要可写挂载，Plan 和 Verify 需要只读挂载。Verify 检查 SQLite、配额账本和实际内容摘要，并核对原操作对应的计划 ID。现有格式为 `1`，Apply 无格式转换可执行。
 
-专项 CI 构建并签验导入 containerd 的发行镜像。在隔离网络中使用内核及 Blob RPC 夹具验证 mTLS 和 Proto，并在独立 XFS 项目上执行写入、只读验证和容量不足拒绝。公开安装仍受版本化卷、版本化 HostService 权限和队列 profile 限制。真实平台 Skill 安装与调用、核心授权链和生产恢复仍需集成验收。[存储协议](../../docs/preset-plugins/object-storage/storage.md) · [格式监督器](../../docs/implementation/m2-schema-bootstrap.md)
+专项 CI 构建并签验导入 containerd 的发行镜像。在隔离网络中使用内核及 Blob RPC 夹具验证 mTLS 和 Proto，并在独立 XFS 项目上执行写入、只读验证和容量不足拒绝。
+
+内核集成另用 `--disable-queue` 生成签名夹具，以适配当前内核在活动槽用尽时拒绝新调用的行为。夹具通过内部制品登记进入真实 XFS 格式监督器，调用六项签名 Skill，并验证委托 Blob 读写、跨主体隔离和停用后重新启用的数据持久性。公开版本化安装、发布配置的内核等待队列和生产恢复仍待验收。[存储协议](../../docs/preset-plugins/object-storage/storage.md) · [格式监督器](../../docs/implementation/m2-schema-bootstrap.md)

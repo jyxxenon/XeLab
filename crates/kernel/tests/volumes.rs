@@ -34,6 +34,8 @@ use xelab_kernel::{
 mod aws_format_transitions;
 #[path = "support/kernel_process_death.rs"]
 mod kernel_process_death;
+#[path = "support/object_storage_kernel.rs"]
+mod object_storage_kernel;
 #[path = "support/schema_bootstrap.rs"]
 mod schema_bootstrap;
 #[path = "support/schema_same_format.rs"]
@@ -181,6 +183,8 @@ impl Fixture {
                 "operation_id",
                 "account_id",
                 "backup_id",
+                "skill_id",
+                "blob_id",
             ] {
                 path = path.replace(&format!("{{{p}}}"), &id.to_string());
             }
@@ -299,6 +303,12 @@ async fn actual_aws_backed_format_upgrade_unknown_apply_and_incompatible_rollbac
 #[ignore = "requires actual kernel process abort/restart, root and dedicated XFS; tools/test-xfs.sh"]
 async fn actual_kernel_process_death_resumes_initializing_checkpoint() {
     kernel_process_death::exercise().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the signed object-storage fixture and dedicated XFS/containerd runner"]
+async fn actual_object_storage_kernel_round_trip() {
+    object_storage_kernel::exercise().await;
 }
 
 #[tokio::test]

@@ -63,7 +63,10 @@ if [[ $# -ge 3 ]]; then
   mount -o loop,prjquota,nosuid,nodev,noexec "$work/service.img" "$work/service/volumes"
   chmod 700 "$work/service/volumes"
   export XELAB_VOLUME_TEST_ROOT="$work/service"
-  "$volume_binary" --ignored --nocapture --skip actual_kernel_process_death_resumes_initializing_checkpoint --skip actual_aws_backed_format_upgrade_unknown_apply_and_incompatible_rollback
+  "$volume_binary" --ignored --nocapture \
+    --skip actual_kernel_process_death_resumes_initializing_checkpoint \
+    --skip actual_aws_backed_format_upgrade_unknown_apply_and_incompatible_rollback \
+    --skip actual_object_storage_kernel_round_trip
   # Each invocation is a separate process owning its actual host/database lease.
   # Never place the crash case in the original process's retained host lease.
   mkdir -m 700 "$work/kernel-crash" "$work/kernel-crash/volumes"

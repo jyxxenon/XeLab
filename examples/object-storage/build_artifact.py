@@ -11,12 +11,14 @@ SPEC = Path(__file__).resolve().parents[2] / "docs/preset-plugins/object-storage
 FILES = ("input.schema.json", "output.schema.json", "stream.schema.json", "semantics.json")
 
 
-def build(output, publisher, platform):
+def build(output, publisher, platform, *, disable_queue=False):
     manifest = json.loads((SPEC / "manifest.json").read_bytes())
     manifest["publisher_id"] = canonical_uuid(publisher)
     if platform not in manifest["platforms"]:
         raise ValueError("Platform is absent from the object storage manifest")
     manifest["platforms"] = [platform]
+    if disable_queue:
+        manifest["concurrency"]["max_queue_requests"] = 0
     root = output / "xelab"
     root.mkdir(parents=True, exist_ok=True)
     for definition in manifest["skills"]:
@@ -47,8 +49,10 @@ def main():
     parser.add_argument("--publisher-id", required=True)
     parser.add_argument("--platform", choices=("linux/amd64", "linux/arm64"), default="linux/amd64")
     parser.add_argument("--output", type=Path, default=Path("examples/object-storage/generated"))
+    parser.add_argument("--disable-queue", action="store_true",
+                        help="Build a separate fixture for the kernel's current zero-queue profile")
     args = parser.parse_args()
-    build(args.output, args.publisher_id, args.platform)
+    build(args.output, args.publisher_id, args.platform, disable_queue=args.disable_queue)
 
 
 if __name__ == "__main__":
