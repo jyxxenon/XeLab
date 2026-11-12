@@ -193,6 +193,16 @@ impl<'transaction, 'client> CurrentAuthority<'transaction, 'client> {
             .revalidate_current(saved, &self.paths)
             .await
     }
+    pub(crate) async fn restrict_to(
+        mut self,
+        transaction: &tokio_postgres::Transaction<'_>,
+        ctx: &Context,
+        saved: &[crate::policy::Path],
+    ) -> Result<Self> {
+        self.paths = self.revalidate(transaction, ctx, saved).await?;
+        self.rules = crate::policy::rules(&self.paths);
+        Ok(self)
+    }
     pub(crate) fn bind_plugin(
         &mut self,
         transaction: &tokio_postgres::Transaction<'_>,

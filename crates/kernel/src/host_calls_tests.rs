@@ -3,6 +3,9 @@
 use super::*;
 use crate::host_calls::{self, Workload};
 
+#[path = "broker_queue_tests.rs"]
+mod business_queue;
+
 #[tokio::test]
 async fn host_stream_deadline_covers_waiting_and_ready_queued_payloads() {
     use futures_util::StreamExt;
@@ -324,6 +327,7 @@ struct Echo {
     calls: Arc<std::sync::atomic::AtomicUsize>,
     output_bytes: Arc<std::sync::atomic::AtomicUsize>,
     fail_after_dispatch: Arc<std::sync::atomic::AtomicBool>,
+    unary_gate: Option<Arc<tokio::sync::Semaphore>>,
 }
 #[tonic::async_trait]
 impl rpc::capability_service_server::CapabilityService for Echo {
@@ -343,6 +347,9 @@ impl rpc::capability_service_server::CapabilityService for Echo {
             .delegation_token
             .starts_with("host:"));
         self.calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(gate) = &self.unary_gate {
+            gate.acquire().await.unwrap().forget();
+        }
         if self.fail_after_dispatch.load(Ordering::SeqCst) {
             return Err(tonic::Status::unavailable(
                 "Simulated transport failure after dispatch",
@@ -417,6 +424,14 @@ impl rpc::capability_service_server::CapabilityService for Echo {
     }
 }
 async fn echo(f: &Fixture, instance: Uuid) -> (Echo, tokio::task::JoinHandle<()>) {
+    echo_with(f, instance, Echo::default()).await
+}
+
+async fn echo_with(
+    f: &Fixture,
+    instance: Uuid,
+    plugin: Echo,
+) -> (Echo, tokio::task::JoinHandle<()>) {
     let root = f.directory.path();
     let key = KeyPair::from_pem(&fs::read_to_string(root.join("ca.key")).unwrap()).unwrap();
     let ca = CertificateParams::from_ca_cert_pem(&fs::read_to_string(root.join("ca.crt")).unwrap())
@@ -459,7 +474,6 @@ async fn echo(f: &Fixture, instance: Uuid) -> (Echo, tokio::task::JoinHandle<()>
         .unwrap(),
     )
     .unwrap();
-    let plugin = Echo::default();
     let service = rpc::capability_service_server::CapabilityServiceServer::new(plugin.clone());
     let identity = tonic::transport::Identity::from_pem(cert.pem(), leaf.serialize_pem());
     let server = tokio::spawn(async move {
