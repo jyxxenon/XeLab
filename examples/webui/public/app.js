@@ -115,11 +115,11 @@ async function request(operation, options = {}) {
   } catch (error) {
     // ApiClient invalidates only the exact rejected access token. A late 401
     // from an old request must not destroy a newer explicit login.
-    if ((error.status ?? error.http_status) === 401 && !oauth.loggedIn) clearPrivateViews();
+    if ((error?.status ?? error?.http_status) === 401 && !oauth.loggedIn) clearPrivateViews();
     // A logout or credential invalidation may have cleared the private UI
     // while this request was in flight. Do not overwrite the new session's
     // connection state with the outcome of that earlier request.
-    if (epoch === sessionEpoch) $('#connection').textContent = (error.status ?? error.http_status) === 403 ? '当前请求无权限' : '请求未完成';
+    if (epoch === sessionEpoch) $('#connection').textContent = (error?.status ?? error?.http_status) === 403 ? '当前请求无权限' : '请求未完成';
     throw error;
   }
 }
@@ -356,15 +356,26 @@ async function listSection(win, {title,operation,params={},query={},actions=[],r
   const list = node('div',{class:'list'});
   const append = data => { for (const item of rows(data)) list.append(renderItem(item)); };
   append(result.data);
+  const pageError = node('div', {class:'list-page-error'});
   const more = button('加载下一页',async()=> {
     more.disabled = true;
-    try { const next = await request(operation,{params,query:{limit:50,...query,cursor:more.dataset.cursor},signal:win.controller.signal}); append(next.data); more.dataset.cursor=next.data.next_cursor||'';more.hidden=!next.data.next_cursor; }
-    catch(error) { list.append(failure(error)); } finally { more.disabled=false; }
-  });
+    try {
+      const next = await request(operation,{params,query:{limit:50,...query,cursor:more.dataset.cursor},signal:win.controller.signal});
+      if (!more.isConnected) return;
+      append(next.data);
+      pageError.replaceChildren();
+      more.dataset.cursor = next.data.next_cursor || '';
+      more.hidden = !next.data.next_cursor;
+    } catch(error) {
+      if (!more.isConnected) return;
+      pageError.replaceChildren(failure(error));
+    } finally {
+      if (more.isConnected) more.disabled = false;
+    }
+  }, {'aria-label':`加载下一页${title}`, hidden:!result.data.next_cursor});
   more.dataset.cursor = result.data.next_cursor || '';
-  more.hidden = !result.data.next_cursor;
   if (!list.childElementCount) list.append(state('empty','暂无可见项目','当前账户授权范围内没有记录。'));
-  win.content.replaceChildren(toolbar(win,title,...actions),list,more);
+  win.content.replaceChildren(toolbar(win,title,...actions),list,pageError,more);
 }
 
 async function plugins(win) {

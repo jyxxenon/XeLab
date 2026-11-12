@@ -27,6 +27,7 @@ class ShellBrowser(unittest.TestCase):
         self.custom_calls = []
         self.fail_preferences = 0
         self.launcher_pages = None
+        self.key_pages = None
         self.key_denied = False
         self.key_error = None
         self.subject = desktop.ACCOUNT
@@ -78,6 +79,9 @@ class ShellBrowser(unittest.TestCase):
                 self.reply(route, {"error": {"code": code, "message": message}}, status)
             elif self.key_denied:
                 self.reply(route, {"error": {"code": "PERMISSION_DENIED", "message": "component ceiling denied"}}, 403)
+            elif self.key_pages is not None:
+                cursor = parse_qs(url.query).get("cursor", [None])[0]
+                self.reply(route, self.key_pages[cursor])
             else:
                 self.reply(route, {"items": [value], "next_cursor": None} if url.path.endswith("/api-keys") else value)
             return
@@ -510,6 +514,50 @@ class ShellBrowser(unittest.TestCase):
         body = self.page.locator("body").inner_text()
         self.assertNotIn(secret, body)
         self.assertIn("INTERNAL_ERROR", window.inner_text())
+
+    def test_list_section_pagination_retry_preserves_items_and_clears_error(self):
+        key_first = {"id": desktop.DEPLOYMENT, "owner_id": desktop.ACCOUNT, "revision": 1,
+                     "name": "First monitor", "prefix": "xk_first", "status": "active",
+                     "issuer_credential_id": desktop.ACCOUNT, "created_at": desktop.NOW,
+                     "updated_at": desktop.NOW, "last_used_at": None,
+                     "inheritance": {"mode": "all_snapshot"}}
+        key_second = {"id": "second-key-id", "owner_id": desktop.ACCOUNT, "revision": 1,
+                      "name": "Second monitor", "prefix": "xk_second", "status": "active",
+                      "issuer_credential_id": desktop.ACCOUNT, "created_at": desktop.NOW,
+                      "updated_at": desktop.NOW, "last_used_at": None,
+                      "inheritance": {"mode": "all_snapshot"}}
+        self.key_pages = {
+            None: {"items": [key_first], "next_cursor": "cursor-2"},
+            "cursor-2": {"items": [key_second], "next_cursor": None},
+        }
+        self.fixture.open()
+        self.fixture.app("账户与权限").get_by_role("button", name="API Key 元数据", exact=True).click()
+        keys_window = self.page.locator('.window[data-app^="api-keys:"]')
+        keys_window.get_by_role("heading", name="First monitor", exact=True).wait_for()
+        more = keys_window.get_by_role("button", name="加载下一页API Key 元数据", exact=True)
+        self.assertTrue(more.is_visible())
+
+        # 1. Trigger failure on pagination
+        self.key_error = (503, "UNAVAILABLE", "key database unavailable")
+        more.click()
+        keys_window.locator('.state[data-kind="unavailable"]').wait_for()
+        self.assertEqual(keys_window.locator(".card").count(), 1)
+        self.assertTrue(more.is_enabled())
+
+        # 2. Trigger another failure on retry: error state should be replaced, not accumulated
+        self.key_error = (500, "INTERNAL_ERROR", "internal failure")
+        more.click()
+        keys_window.locator('.state[data-kind="error"]').wait_for()
+        self.assertEqual(keys_window.locator(".state[data-kind='error']").count(), 1)
+        self.assertEqual(keys_window.locator(".card").count(), 1)
+
+        # 3. Successful retry: loads second page, clears error state, hides more button
+        self.key_error = None
+        more.click()
+        keys_window.get_by_role("heading", name="Second monitor", exact=True).wait_for()
+        self.assertEqual(keys_window.locator(".card").count(), 2)
+        self.assertEqual(keys_window.locator(".state").count(), 0)
+        self.assertTrue(more.is_hidden())
 
 
 if __name__ == "__main__":
