@@ -181,6 +181,176 @@ async fn postgres_task_http_fixed_skill_executes_json_and_bodyless_operations() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_task_http_idle_authority_checks_frozen_grant_after_deployment_upgrade() {
+    let Some(f) = Component::new().await else {
+        return;
+    };
+    let submitted = submit(&f, 5, json!({}), json!({})).await;
+    let mut c = f.app.db.connect().await.unwrap();
+    let task_query = "SELECT to_jsonb(t) FROM tasks t WHERE t.id=$1";
+    let before: Value = c
+        .query_one(task_query, &[&submitted.task])
+        .await
+        .unwrap()
+        .get(0);
+    let grant_row = c
+        .query_one(
+            "SELECT id,revision FROM grants WHERE subject_id=$1 AND role_id='Owner'
+               AND scope->>'kind'='plugin' AND status='active'",
+            &[&f.owner],
+        )
+        .await
+        .unwrap();
+    let grant: Uuid = grant_row.get(0);
+    let step = &before["admission"]["steps"][0];
+    assert_eq!(step["installation_id"], json!(f.installation));
+    assert_eq!(step["deployment_id"], json!(f.deployment));
+    let target = step["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|target| target["action"] == "plugin.http.invoke")
+        .unwrap();
+    assert!(target["paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|path| { path["sources"].as_array().unwrap().contains(&json!(grant)) }));
+
+    assert_eq!(
+        c.execute(
+            "UPDATE deployments SET phase='reconciling',revision=revision+1 WHERE id=$1",
+            &[&f.deployment],
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    assert!(!crate::task_worker::run_once(&f.app).await.unwrap());
+    assert_eq!(
+        c.query_one(task_query, &[&submitted.task])
+            .await
+            .unwrap()
+            .get::<_, Value>(0),
+        before
+    );
+
+    let openapi: Vec<u8> = c
+        .query_one(
+            "SELECT raw FROM plugin_http_contracts WHERE installation_id=$1",
+            &[&f.installation],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let replacement = Uuid::new_v4();
+    let mut manifest = f.manifest.clone();
+    manifest["version"] = json!("2.0.0");
+    let manifest_digest = digest(&serde_json::to_vec(&manifest).unwrap());
+    let tx = c.transaction().await.unwrap();
+    crate::db::auth_lock(&tx, true).await.unwrap();
+    assert_eq!(tx.execute(
+        "INSERT INTO installations(id,plugin_id,version,publisher_id,image_digest,manifest_digest,manifest,state,created_at,updated_at)
+         SELECT $1,plugin_id,'2.0.0',publisher_id,$2,$3,$4,'installed',now(),now() FROM installations WHERE id=$5",
+        &[&replacement, &digest(b"upgraded HTTP Task metadata fixture"), &manifest_digest, &manifest, &f.installation],
+    ).await.unwrap(), 1);
+    crate::http_contracts::store(&tx, replacement, &manifest, Some(&openapi))
+        .await
+        .unwrap();
+    tx.execute(
+        "UPDATE instances SET phase='stopped',health='unknown',revision=revision+1 WHERE deployment_id=$1",
+        &[&f.deployment],
+    ).await.unwrap();
+    assert_eq!(
+        tx.execute(
+            "UPDATE deployments SET installation_id=$2,phase='disabled',approval='{}',
+           spec=spec || jsonb_build_object('installation_id',$2::uuid,'enabled',false),
+           observed_generation=observed_generation+1,revision=revision+1 WHERE id=$1",
+            &[&f.deployment, &replacement],
+        )
+        .await
+        .unwrap(),
+        1
+    );
+
+    // Keep a second unrestricted Owner so the public revocation is valid.
+    let recovery_owner = Uuid::new_v4();
+    tx.execute(
+        "INSERT INTO accounts(id,kind,status,display_name,independent_owner,password_hash,created_at,updated_at)
+         SELECT $1,'user','active','Other fixture owner',true,password_hash,now(),now() FROM accounts WHERE id=$2",
+        &[&recovery_owner, &f.owner],
+    ).await.unwrap();
+    tx.execute(
+        "INSERT INTO account_closure(ancestor_id,descendant_id,depth) VALUES($1,$1,0)",
+        &[&recovery_owner],
+    )
+    .await
+    .unwrap();
+    tx.execute(
+        "INSERT INTO quotas(account_id,spec,daily_bucket,created_at,updated_at)
+         SELECT $1,spec,current_date,now(),now() FROM quotas WHERE account_id=$2",
+        &[&recovery_owner, &f.owner],
+    )
+    .await
+    .unwrap();
+    tx.execute(
+        "INSERT INTO grants(id,subject_id,issuer_id,role_id,scope,status,created_at,updated_at)
+         SELECT gen_random_uuid(),$1,$1,role_id,scope,'active',now(),now()
+         FROM grants WHERE subject_id=$2 AND role_id='Owner' AND status='active'",
+        &[&recovery_owner, &f.owner],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    assert!(!crate::task_worker::run_once(&f.app).await.unwrap());
+    assert_eq!(
+        c.query_one(task_query, &[&submitted.task])
+            .await
+            .unwrap()
+            .get::<_, Value>(0),
+        before
+    );
+    let revoked = management(
+        &f.router,
+        "revokeGrant",
+        &[("grant_id", grant.to_string())],
+        &f.token,
+        Value::Null,
+        "task-http-revoke-frozen-plugin-grant",
+        Some(grant_row.get("revision")),
+    )
+    .await;
+    assert_eq!(revoked.0, 204, "{}", revoked.1);
+    assert!(!crate::task_worker::run_once(&f.app).await.unwrap());
+    let paused: Value = c
+        .query_one(task_query, &[&submitted.task])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(paused["state"], "paused_authorization");
+    assert_eq!(paused["error"]["code"], "PERMISSION_DENIED");
+    assert_eq!(paused["revision"], before["revision"].as_i64().unwrap() + 1);
+    assert_eq!(paused["admission"], before["admission"]);
+    let row = c
+        .query_one(
+            "SELECT s.state,s.attempt_count,(SELECT count(*) FROM attempts) AS attempts,
+                (SELECT count(*) FROM calls) AS calls,
+                (SELECT count(*) FROM call_credential_charges) AS charges,
+                (SELECT count(*) FROM reservations WHERE kind='call') AS reservations
+         FROM task_steps s WHERE s.task_id=$1",
+            &[&submitted.task],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, String>("state"), "ready");
+    assert_eq!(row.get::<_, i32>("attempt_count"), 0);
+    for column in ["attempts", "calls", "charges", "reservations"] {
+        assert_eq!(row.get::<_, i64>(column), 0, "{column}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn postgres_task_http_approval_withdrawn_after_claim_prevents_admission() {
     let Some(f) = Component::new().await else {
         return;

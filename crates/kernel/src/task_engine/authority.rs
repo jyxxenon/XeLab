@@ -68,15 +68,7 @@ struct Target {
     paths: Vec<Path>,
 }
 
-/// Rebuild authority in the transaction that already holds the auth fence and
-/// locks the Task and step. The returned binding is metadata, never a bearer.
-pub(super) async fn prepare(
-    tx: &Transaction<'_>,
-    auth: &Auth,
-    task: &Row,
-    step_key: &str,
-    request: Uuid,
-) -> Result<Prepared> {
+fn read_admission(task: &Row) -> Result<(Admission, DateTime<Utc>)> {
     let owner: Uuid = task.try_get("owner_id")?;
     if task.try_get::<_, Uuid>("delegation_subject")? != owner
         || task.try_get::<_, String>("delegation_status")? != "active"
@@ -99,14 +91,53 @@ pub(super) async fn prepare(
     if admission.version != 1 {
         return Err(Error::denied());
     }
-    let mut matching_steps = admission
-        .steps
-        .iter()
-        .filter(|step| step.step_key == step_key);
-    let step = matching_steps.next().ok_or_else(Error::denied)?;
-    if matching_steps.next().is_some() {
+    Ok((admission, deadline))
+}
+
+impl Admission {
+    fn step(&self, step_key: &str) -> Result<&StepAdmission> {
+        let mut matching_steps = self.steps.iter().filter(|step| step.step_key == step_key);
+        let step = matching_steps.next().ok_or_else(Error::denied)?;
+        if matching_steps.next().is_some() {
+            return Err(Error::denied());
+        }
+        Ok(step)
+    }
+}
+
+async fn resume_admission(
+    tx: &Transaction<'_>,
+    auth: &Auth,
+    task: &Row,
+    admission: &Admission,
+    request: Uuid,
+) -> Result<Context> {
+    let issuer = task
+        .try_get::<_, Option<Uuid>>("issuer_credential_id")?
+        .ok_or_else(Error::denied)?;
+    let mut ctx = auth.resume(tx, issuer, admission.peer, request).await?;
+    if ctx.subject != task.try_get::<_, Uuid>("owner_id")?
+        || ctx.chain != admission.credential_chain
+    {
         return Err(Error::denied());
     }
+    ctx.browser_origin = admission.browser_origin.clone();
+    crate::oauth_http::validate_source_origins(tx, &[issuer], ctx.browser_origin.as_deref())
+        .await?;
+    Ok(ctx)
+}
+
+/// Rebuild authority in the transaction that already holds the auth fence and
+/// locks the Task and step. The returned binding is metadata, never a bearer.
+pub(super) async fn prepare(
+    tx: &Transaction<'_>,
+    auth: &Auth,
+    task: &Row,
+    step_key: &str,
+    request: Uuid,
+) -> Result<Prepared> {
+    let (admission, deadline) = read_admission(task)?;
+    let step = admission.step(step_key)?;
     let is_http = match step.binding["kind"].as_str() {
         Some("skill_capability") => false,
         Some("skill_http") => true,
@@ -121,16 +152,7 @@ pub(super) async fn prepare(
         return Err(Error::denied());
     }
 
-    let issuer = task
-        .try_get::<_, Option<Uuid>>("issuer_credential_id")?
-        .ok_or_else(Error::denied)?;
-    let mut ctx = auth.resume(tx, issuer, admission.peer, request).await?;
-    if ctx.subject != owner || ctx.chain != admission.credential_chain {
-        return Err(Error::denied());
-    }
-    ctx.browser_origin = admission.browser_origin;
-    crate::oauth_http::validate_source_origins(tx, &[issuer], ctx.browser_origin.as_deref())
-        .await?;
+    let ctx = resume_admission(tx, auth, task, &admission, request).await?;
 
     let workflow: Uuid = task.try_get("workflow_id")?;
     let spec: Value = task.try_get("spec")?;
@@ -246,6 +268,127 @@ pub(super) async fn prepare(
         // the Broker as part of Skill or business authority.
         business_paths: current_paths.into_iter().skip(1).flatten().collect(),
     })
+}
+
+/// Test the original authorization paths without requiring a usable provider.
+/// Only prepare() can authorize a dispatch using the current provider binding.
+pub(super) async fn check_idle(tx: &Transaction<'_>, auth: &Auth, task: &Row) -> Result<()> {
+    let (admission, deadline) = read_admission(task)?;
+    let ctx = resume_admission(tx, auth, task, &admission, Uuid::new_v4()).await?;
+    let maximum: Value = task.try_get("maximum_rules")?;
+    let ceiling = maximum.as_array().ok_or_else(Error::denied)?;
+    let workflow = Resource::new(
+        "workflow",
+        task.try_get::<_, Uuid>("workflow_id")?,
+        Some(task.try_get("workflow_owner_id")?),
+    );
+    let workflow_paths = revalidate_paths(
+        tx,
+        &ctx,
+        "workflow.read",
+        &workflow,
+        &admission.workflow_paths,
+        ceiling,
+    )
+    .await?;
+    if workflow_paths.is_empty() {
+        return Err(Error::denied());
+    }
+    let mut paths = vec![workflow_paths];
+    let task_id: Uuid = task.try_get("id")?;
+    let ready = tx
+        .query(
+            "SELECT step_key,provider_deployment_id FROM task_steps
+             WHERE task_id=$1 AND state='ready' ORDER BY created_at,id LIMIT 65",
+            &[&task_id],
+        )
+        .await?;
+    if ready.len() > 64 {
+        return Err(Error::denied());
+    }
+    for row in ready {
+        let step = admission.step(row.try_get("step_key")?)?;
+        if row.try_get::<_, Option<Uuid>>("provider_deployment_id")? != step.deployment_id {
+            return Err(Error::denied());
+        }
+        let expected: &[&str] = match step.binding["kind"].as_str() {
+            Some("skill_http") => &["skill", "plugin"],
+            Some("skill_capability") => &["skill", "capability"],
+            Some("capability") => &["capability"],
+            _ => return Err(Error::denied()),
+        };
+        if step.targets.len() != expected.len()
+            || !expected.iter().all(|kind| {
+                step.targets
+                    .iter()
+                    .filter(|target| target.resource["kind"] == *kind)
+                    .count()
+                    == 1
+            })
+        {
+            return Err(Error::denied());
+        }
+        for target in &step.targets {
+            // Missing object metadata is a dependency condition. Other saved
+            // authority paths remain checkable even when one target is absent.
+            if let Some(resource) = idle_resource(tx, step, target).await? {
+                let saved = saved_paths(step, &target.action, &resource)?;
+                let live =
+                    revalidate_paths(tx, &ctx, &target.action, &resource, saved, ceiling).await?;
+                if live.is_empty() {
+                    return Err(Error::denied());
+                }
+                paths.push(live);
+            }
+        }
+    }
+    live_deadline(tx, &ctx, &mut paths, deadline).await?;
+    Ok(())
+}
+
+async fn idle_resource(
+    tx: &Transaction<'_>,
+    step: &StepAdmission,
+    target: &Target,
+) -> Result<Option<Resource>> {
+    match target.resource["kind"].as_str() {
+        Some("skill") if target.action == "skill.invoke" => {
+            let skill = id(&step.binding, "skill_id").map_err(|_| Error::denied())?;
+            let row = tx
+                .query_opt("SELECT created_by FROM skills WHERE id=$1", &[&skill])
+                .await?;
+            Ok(row.map(|row| Resource::new("skill", skill, Some(row.get(0)))))
+        }
+        Some("capability") if target.action == "capability.invoke" => {
+            let contract = &step.binding["contract"];
+            let name = string(contract, "name").map_err(|_| Error::denied())?;
+            let version = string(contract, "version").map_err(|_| Error::denied())?;
+            Ok(Some(Resource::new(
+                "capability",
+                format!("{name}@{version}"),
+                None,
+            )))
+        }
+        Some("plugin") => {
+            let deployment = step.deployment_id.ok_or_else(Error::denied)?;
+            let installation = step.installation_id.ok_or_else(Error::denied)?;
+            let row = tx
+                .query_opt(
+                    "SELECT n.plugin_id,d.owner_id FROM deployments d
+                 CROSS JOIN installations n WHERE d.id=$1 AND n.id=$2",
+                    &[&deployment, &installation],
+                )
+                .await?;
+            Ok(row.map(|row| {
+                Resource::new(
+                    "plugin",
+                    row.get::<_, String>("plugin_id"),
+                    Some(row.get("owner_id")),
+                )
+            }))
+        }
+        _ => Err(Error::denied()),
+    }
 }
 
 fn saved_paths<'a>(

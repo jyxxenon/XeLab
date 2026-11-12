@@ -14,12 +14,14 @@ use uuid::Uuid;
 
 mod authority;
 mod cancellation;
+mod idle_authority;
 mod input;
 mod recovery;
 mod recovery_evidence;
 mod retry;
 
 pub(crate) use cancellation::{cancel_task, finish_cancellations, finish_stopped_cancellations};
+pub(crate) use idle_authority::pause_idle_unauthorized;
 pub(crate) use recovery::{resolve_unknown, validate_resolution_history};
 pub(crate) use retry::retry_task;
 
@@ -31,8 +33,8 @@ const STEP_QUERY: &str = "SELECT t.*,w.spec,w.owner_id AS workflow_owner_id,
     e.expires_at AS delegation_expires_at,e.run_as AS delegation_run_as,e.maximum_rules
     FROM tasks t JOIN task_steps s ON s.task_id=t.id JOIN workflows w ON w.id=t.workflow_id
     JOIN execution_delegations e ON e.id=t.delegation_id";
-const IDLE_DEADLINE_DUE: &str = "t.admission IS NOT NULL
-    AND t.state IN ('queued','running','waiting_dependency') AND t.deadline_at<=statement_timestamp()
+const IDLE_TASK: &str = "t.admission IS NOT NULL
+    AND t.state IN ('queued','running','waiting_dependency')
     AND NOT EXISTS (
         SELECT 1 FROM task_steps s WHERE s.task_id=t.id AND (
             s.state IN ('running','unknown') OR EXISTS (
@@ -844,7 +846,7 @@ async fn settle_inactive_attempt(
 pub async fn expire_idle(tx: &Transaction<'_>) -> Result<u64> {
     db::auth_lock(tx, false).await?;
     let select = format!(
-        "SELECT t.id FROM tasks t WHERE {IDLE_DEADLINE_DUE}
+        "SELECT t.id FROM tasks t WHERE {IDLE_TASK} AND t.deadline_at<=statement_timestamp()
          ORDER BY t.deadline_at,t.id LIMIT 16 FOR UPDATE OF t SKIP LOCKED"
     );
     let tasks: Vec<Uuid> = tx
@@ -861,7 +863,7 @@ pub async fn expire_idle(tx: &Transaction<'_>) -> Result<u64> {
     // snapshot. Recheck the Task and its steps under the acquired Task locks.
     let update = format!(
         "UPDATE tasks t SET state='failed',error=$2,revision=revision+1,updated_at=clock_timestamp()
-         WHERE t.id=ANY($1) AND {IDLE_DEADLINE_DUE}"
+         WHERE t.id=ANY($1) AND {IDLE_TASK} AND t.deadline_at<=statement_timestamp()"
     );
     let error = Error::new(
         "DEADLINE_EXCEEDED",

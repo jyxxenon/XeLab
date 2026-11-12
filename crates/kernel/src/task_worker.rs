@@ -18,9 +18,10 @@ use uuid::Uuid;
 const IDLE_DELAY: Duration = Duration::from_secs(1);
 const HEARTBEAT: Duration = Duration::from_secs(10);
 const METADATA_BUDGET: Duration = Duration::from_secs(5);
+const AUTHORITY_CHECKS_PER_TICK: usize = 4;
 
 pub(crate) async fn run(app: Arc<App>) {
-    tokio::join!(reconcile(&app), dispatch(&app));
+    tokio::join!(reconcile(&app), reconcile_authority(&app), dispatch(&app));
 }
 
 async fn reconcile(app: &App) {
@@ -33,6 +34,24 @@ async fn reconcile(app: &App) {
                 reason_code = error.code,
                 "Task cancellation reconciliation failed"
             );
+        }
+        time::sleep(IDLE_DELAY).await;
+    }
+}
+
+async fn reconcile_authority(app: &App) {
+    let mut cursor = None;
+    while !stopping(app) {
+        for _ in 0..AUTHORITY_CHECKS_PER_TICK {
+            if let Err(error) = bounded(reconcile_authority_once(app, &mut cursor)).await {
+                tracing::warn!(
+                    reason_code = error.code,
+                    "Idle Task authorization reconciliation failed"
+                );
+            }
+            if cursor.is_none() || !ready(app) {
+                break;
+            }
         }
         time::sleep(IDLE_DELAY).await;
     }
@@ -53,6 +72,8 @@ async fn dispatch(app: &App) {
 pub(crate) async fn run_once(app: &App) -> Result<bool> {
     bounded(reconcile_once(app)).await?;
     bounded(reconcile_cancellations_once(app)).await?;
+    let mut cursor = None;
+    bounded(reconcile_authority_once(app, &mut cursor)).await?;
     dispatch_once(app).await
 }
 
@@ -135,6 +156,22 @@ async fn reconcile_cancellations_once(app: &App) -> Result<()> {
         return Ok(());
     }
     tx.commit().await?;
+    Ok(())
+}
+
+async fn reconcile_authority_once(app: &App, cursor: &mut Option<Uuid>) -> Result<()> {
+    if !ready(app) {
+        return Ok(());
+    }
+    let mut connection = app.db.connect_scoped(METADATA_BUDGET).await?;
+    let tx = connection.transaction().await?;
+    if !ready(app) {
+        return Ok(());
+    }
+    task_engine::pause_idle_unauthorized(&tx, &app.auth, cursor).await?;
+    if ready(app) {
+        tx.commit().await?;
+    }
     Ok(())
 }
 
