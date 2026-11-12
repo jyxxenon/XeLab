@@ -88,6 +88,39 @@ class ShellVisual(unittest.TestCase):
         self.page.locator("#launcher").wait_for(state="visible")
         self.assertGreaterEqual(self.page.locator("#app-grid .app-icon svg").count(), 8)
         self.assertGreaterEqual(self.page.locator("#launcher svg.app-glyph").count(), 8)
+        launcher_icon = self.style("#app-grid .app-icon")
+        self.assertEqual(launcher_icon["display"], "grid")
+        centered = self.page.evaluate(
+            "() => {"
+            " const box = document.querySelector('#app-grid .app-icon').getBoundingClientRect();"
+            " const svg = document.querySelector('#app-grid .app-icon svg').getBoundingClientRect();"
+            " return Math.abs((svg.left - box.left) - (box.right - svg.right)) <= 1.5"
+            "  && Math.abs((svg.top - box.top) - (box.bottom - svg.bottom)) <= 1.5;"
+            "}"
+        )
+        self.assertTrue(centered, "launcher app-icon svg must be centered inside its 42x42 tile")
+
+    def test_window_toolbars_and_scrollbars_align_with_shell_tokens(self):
+        self.open()
+        window = self.fixture.app("插件中心")
+        window.locator(".window-content > .toolbar").wait_for()
+        header_toolbar = self.style(".window-content > .toolbar")
+        self.assertEqual(header_toolbar["borderBottomStyle"], "solid")
+        self.assertEqual(header_toolbar["borderBottomWidth"], "1px")
+        self.assertEqual(header_toolbar["paddingBottom"], "14px")
+        self.assertEqual(self.style(".window-content .toolbar h2")["fontSize"], "17px")
+        self.assertEqual(self.style(".window-content .toolbar button")["minHeight"], "32px")
+        card_toolbar = self.style(".window-content .card .toolbar")
+        self.assertEqual(card_toolbar["borderTopStyle"], "solid")
+        self.assertEqual(card_toolbar["borderTopWidth"], "1px")
+        self.assertEqual(card_toolbar["paddingTop"], "10px")
+        has_scrollbar_and_active = self.page.evaluate(
+            "() => {"
+            " const texts = [...document.styleSheets].flatMap(s => [...s.cssRules].map(r => r.cssText));"
+            " return texts.some(t => t.includes('::-webkit-scrollbar-thumb')) && texts.some(t => t.includes('.primary:active'));"
+            "}"
+        )
+        self.assertTrue(has_scrollbar_and_active)
 
     def test_window_controls_keep_hit_target_and_reveal_symbols(self):
         self.open()
