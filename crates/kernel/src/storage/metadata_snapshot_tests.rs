@@ -182,7 +182,7 @@ async fn actual_postgres_oauth_copy_round_trip_resets_families_clients_and_brows
     assert!(export_inner(&mut source, &mut Vec::new()).await.is_err());
 }
 
-async fn target(backup: Uuid) -> (Db, Client, Uuid) {
+pub(super) async fn target(backup: Uuid) -> (Db, Client, Uuid) {
     let base = std::env::var("XELAB_TEST_DATABASE_URL").unwrap();
     let admin = Db::new(base.clone()).unwrap().connect().await.unwrap();
     let name = format!("metadata_restore_{}", Uuid::new_v4().simple());
