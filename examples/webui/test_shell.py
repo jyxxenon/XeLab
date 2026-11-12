@@ -747,6 +747,19 @@ class ShellBrowser(unittest.TestCase):
         }""")
         self.assertFalse(any(app.startswith("api-keys:") for app in saved_apps), saved_apps)
 
+    def test_invalid_operation_uuid_shows_local_validation_without_a_core_request(self):
+        self.fixture.open()
+        self.open_launcher()
+        self.page.get_by_role("button", name="启动任务与知识库", exact=True).click()
+        window = self.page.locator('.window[data-app="tasks"]')
+        window.get_by_role("textbox", name="Operation UUID", exact=True).fill("not-a-valid-uuid")
+        window.get_by_role("button", name="查询 Operation", exact=True).click()
+        error = window.locator('.state[data-kind="error"]')
+        error.get_by_role("heading", name="请求失败", exact=True).wait_for()
+        self.assertIn("INVALID_ARGUMENT · 无效的请求参数。", error.inner_text())
+        self.assertFalse(any(call["path"].startswith("/api/platform/v1/operations/")
+                             for call in self.fixture.calls))
+
 
 if __name__ == "__main__":
     unittest.main()
