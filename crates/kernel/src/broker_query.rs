@@ -93,8 +93,9 @@ async fn read(tx: &Transaction<'_>, app: &App, ctx: &Context, call: Uuid) -> Res
             return Err(Error::denied());
         }
     }
+    let state: String = row.get("state");
     if effectful
-        || (row.get::<_, Option<Value>>("result").is_some()
+        || ((row.get::<_, Option<Value>>("result").is_some() || state == "failed")
             && (row.get::<_, Option<Uuid>>("skill_id").is_some()
                 || row.get::<_, Option<Value>>("http_binding").is_some()))
     {
@@ -108,7 +109,7 @@ async fn read(tx: &Transaction<'_>, app: &App, ctx: &Context, call: Uuid) -> Res
         }
     }
     Ok(
-        json!({"call_id":call,"state":row.get::<_,String>("state"),"result":row.get::<_,Option<Value>>("result"),"error":row.get::<_,Option<Value>>("error")}),
+        json!({"call_id":call,"state":state,"result":row.get::<_,Option<Value>>("result"),"error":row.get::<_,Option<Value>>("error")}),
     )
 }
 
@@ -257,7 +258,8 @@ fn decode_bounded(
     use rpc::{query_result_response::Outcome as Wire, ExecutionState};
     match (ExecutionState::try_from(response.state), response.outcome) {
         (Ok(ExecutionState::Succeeded), Some(Wire::Completed(response))) => {
-            if response.call_id != binding.call.to_string()
+            if response.terminal_failure.is_some()
+                || response.call_id != binding.call.to_string()
                 || digest(&response.output_json) != response.output_digest
             {
                 return Err(Error::conflict(

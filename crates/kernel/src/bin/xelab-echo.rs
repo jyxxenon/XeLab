@@ -236,6 +236,7 @@ impl CapabilityService for Echo {
             call_id: r.call_id.clone(),
             output_digest: digest(&output),
             output_json: output,
+            terminal_failure: None,
         };
         if results.len() >= 1024 {
             results.clear();
@@ -394,6 +395,7 @@ impl CapabilityService for Echo {
                         digest(&output)
                     },
                     output_json: output,
+                    terminal_failure: None,
                 };
                 if matches!(
                     fault.as_str(),
@@ -583,6 +585,7 @@ mod tests {
             input_digest: digest(&input_json),
             input_json,
             binding_id: String::new(),
+            terminal_failure_version: 0,
         };
         (echo, request)
     }
