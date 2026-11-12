@@ -3084,7 +3084,18 @@ async fn ordinary_skill_stream_lifecycle(
         )
         .await
         .unwrap();
-    let pool_input = json!({"input":{"message":"shared stream pool","count":64,"delay_ms":1000},"timeout_ms":10000});
+    // The pool stays occupied while streams are admitted serially and while
+    // both excess requests are rejected. Expiry belongs to the separate
+    // deadline tests, since it can fence the provider before this capacity check.
+    let pool_budget_ms = 90_000_u64;
+    assert!(
+        pool_budget_ms
+            <= manifest["skills"][1]["maximum_timeout_ms"]
+                .as_u64()
+                .unwrap(),
+        "the pool fixture cannot exceed the signed Skill maximum"
+    );
+    let pool_input = json!({"input":{"message":"shared stream pool","count":64,"delay_ms":1000},"timeout_ms":pool_budget_ms});
     let old_process = stream_process(app, live_instance).await;
     let mut active_streams = Vec::new();
     let mut active_calls = Vec::new();
@@ -3138,6 +3149,28 @@ async fn ordinary_skill_stream_lifecycle(
     assert_eq!(
         charged.get::<_, i64>(1),
         before_pool.get::<_, i64>(1) + maximum as i64
+    );
+    let pool = c
+        .query_one(
+            "SELECT count(*) AS held,min(c.deadline_at) AS earliest,clock_timestamp() AS checked_at
+             FROM calls c JOIN reservations r ON r.id=c.id AND r.kind='call'
+             WHERE c.id=ANY($1) AND c.provider_instance_id=$2 AND c.state='running'
+               AND r.status='active' AND r.expires_at=c.deadline_at",
+            &[&active_calls, &live_instance],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        pool.get::<_, i64>("held"),
+        maximum as i64,
+        "all admitted streams must still hold slots on the same provider"
+    );
+    let earliest: chrono::DateTime<chrono::Utc> = pool.get("earliest");
+    let checked_at: chrono::DateTime<chrono::Utc> = pool.get("checked_at");
+    let remaining_ms = (earliest - checked_at).num_milliseconds();
+    assert!(
+        remaining_ms > 30_000,
+        "stream pool must retain more than 30s before the first Call deadline; remaining_ms={remaining_ms}"
     );
     let full = stream_skill_request(
         router,
