@@ -1437,6 +1437,24 @@ async fn signed_oci_plugin_runs_through_the_management_api_and_recovers() {
     let summary = frozen.export_metadata(&mut metadata).await.unwrap();
     assert_eq!(summary.bytes, metadata.len() as u64);
     assert!(summary.rows > 0);
+    let history = c
+        .query_one(
+            "SELECT t.state AS task_state,t.output,s.state AS step_state,a.state AS attempt_state,
+                    c.state AS call_state
+             FROM attempts a JOIN task_steps s ON s.id=a.step_id
+             JOIN tasks t ON t.id=s.task_id JOIN calls c ON c.id=a.broker_call_id
+             WHERE c.id=$1",
+            &[&task_call],
+        )
+        .await
+        .unwrap();
+    for state in ["task_state", "step_state", "attempt_state", "call_state"] {
+        assert_eq!(history.get::<_, String>(state), "succeeded", "{state}");
+    }
+    assert_eq!(
+        history.get::<_, Value>("output"),
+        json!({"probe":{"message":"fixed Capability Skill from an OCI Task"}})
+    );
     println!("Offline source: real signed OCI Drain/stop, exclusive leases, image-index verification and consistent metadata export passed (not off-host acceptance)");
     drop(frozen);
     // Exercise the complete capture driver against the CI's real local S3
