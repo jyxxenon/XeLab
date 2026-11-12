@@ -238,3 +238,132 @@ async fn postgres_task_http_approval_withdrawn_after_claim_prevents_admission() 
         assert_eq!(row.get::<_, i64>(column), 0, "{column}");
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_task_http_resolves_bodyless_call_after_approval_withdrawal() {
+    let Some(f) = Component::new().await else {
+        return;
+    };
+    let submitted = submit(&f, 5, json!({}), json!({})).await;
+    let mut c = f.app.db.connect().await.unwrap();
+    let tx = c.transaction().await.unwrap();
+    let lease = crate::task_engine::claim_broker(&tx, &f.app.auth)
+        .await
+        .unwrap()
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(lease.task_id, submitted.task);
+    let invoked = crate::broker::invoke_task(&f.app, &lease).await.unwrap();
+    let result = &invoked["call"];
+    assert_eq!(result.get("output"), Some(&Value::Null));
+    let call = contracts::id(result, "call_id").unwrap();
+
+    // Simulate worker loss between committing the HTTP response and settling
+    // the Task, then remove the provider's authority for further execution.
+    let tx = c.transaction().await.unwrap();
+    crate::db::auth_lock(&tx, true).await.unwrap();
+    assert_eq!(
+        tx.execute(
+            "UPDATE attempts SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE id=$1",
+            &[&lease.attempt_id],
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    assert!(crate::task_engine::expire(&tx).await.unwrap());
+    assert_eq!(
+        tx.execute(
+            "DELETE FROM plugin_http_approvals WHERE deployment_id=$1",
+            &[&f.deployment],
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        tx.execute(
+            "UPDATE deployments SET spec=jsonb_set(spec,'{enabled}','false') WHERE id=$1",
+            &[&f.deployment],
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    tx.commit().await.unwrap();
+
+    let row = c
+        .query_one(
+            "SELECT t.state AS task_state,t.error,s.state AS step_state,s.revision
+         FROM tasks t JOIN task_steps s ON s.task_id=t.id WHERE s.id=$1",
+            &[&lease.step_id],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, String>("task_state"), "unknown");
+    assert_eq!(row.get::<_, Value>("error")["resource_id"], json!(call));
+    assert_eq!(row.get::<_, String>("step_state"), "unknown");
+    let revision: i64 = row.get("revision");
+    let params = [("step_id", lease.step_id.to_string())];
+    let body = json!({"resolution":"confirmed_succeeded","evidence":"Durable HTTP DELETE result"});
+    let missing = management(
+        &f.router,
+        "resolveUnknownStep",
+        &params,
+        &f.token,
+        body.clone(),
+        "task-http-resolve-missing-output",
+        Some(revision),
+    )
+    .await;
+    assert_eq!(missing.0, 400, "{}", missing.1);
+    assert_eq!(missing.1["error"]["code"], "INVALID_ARGUMENT");
+
+    let mut body = body;
+    body["output"] = Value::Null;
+    let resolved = management(
+        &f.router,
+        "resolveUnknownStep",
+        &params,
+        &f.token,
+        body,
+        "task-http-resolve-explicit-null",
+        Some(revision),
+    )
+    .await;
+    assert_eq!(resolved.0, 200, "{}", resolved.1);
+    assert_eq!(resolved.1["state"], "succeeded");
+    assert_eq!(resolved.1["revision"], revision + 1);
+    let task = management(
+        &f.router,
+        "getTask",
+        &[("task_id", submitted.task.to_string())],
+        &f.token,
+        Value::Null,
+        "task-http-read-resolved",
+        None,
+    )
+    .await;
+    assert_eq!(task.0, 200, "{}", task.1);
+    assert_eq!(task.1["state"], "succeeded");
+    assert_eq!(task.1["output"], json!({"http":null}));
+
+    let row = c.query_one(
+        "SELECT a.state AS attempt_state,a.broker_call_id,c.state AS call_state,c.result,
+                q.daily_calls_used,q.concurrent_calls_used,
+                (SELECT count(*) FROM calls) AS calls,
+                (SELECT count(*) FROM call_credential_charges) AS charges,
+                (SELECT count(*) FROM task_step_resolutions WHERE attempt_id=a.id AND call_id=c.id) AS resolutions
+         FROM attempts a JOIN calls c ON c.id=a.broker_call_id JOIN quotas q ON q.account_id=c.owner_id
+         WHERE a.id=$1",
+        &[&lease.attempt_id],
+    ).await.unwrap();
+    assert_eq!(row.get::<_, Uuid>("broker_call_id"), call);
+    assert_eq!(row.get::<_, String>("attempt_state"), "unknown");
+    assert_eq!(row.get::<_, String>("call_state"), "succeeded");
+    assert_eq!(&row.get::<_, Value>("result"), result);
+    for column in ["daily_calls_used", "calls", "charges", "resolutions"] {
+        assert_eq!(row.get::<_, i64>(column), 1, "{column}");
+    }
+    assert_eq!(row.get::<_, i64>("concurrent_calls_used"), 0);
+}

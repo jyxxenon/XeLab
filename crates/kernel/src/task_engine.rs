@@ -14,6 +14,10 @@ use uuid::Uuid;
 
 mod authority;
 mod input;
+mod recovery;
+mod recovery_evidence;
+
+pub(crate) use recovery::{resolve_unknown, validate_resolution_history};
 
 const LEASE: Duration = Duration::seconds(30);
 pub(crate) const MAX_STEP_JSON_BYTES: usize = 4 * 1024 * 1024;

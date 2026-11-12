@@ -3,6 +3,9 @@ use super::*;
 use chrono::{DateTime, Utc};
 use tokio_postgres::Row;
 
+#[path = "host_task_resolution_tests.rs"]
+mod resolution;
+
 struct TaskFixture {
     host: Fixture,
     workflow: Uuid,
@@ -14,6 +17,14 @@ struct TaskFixture {
 
 impl TaskFixture {
     async fn new(side_effect: &str, use_blob: bool) -> Option<Self> {
+        Self::with_capability(side_effect, use_blob, false).await
+    }
+
+    async fn with_capability(
+        side_effect: &str,
+        use_blob: bool,
+        supports_stream: bool,
+    ) -> Option<Self> {
         let host = Fixture::new().await?;
         let (deployment, instance) = host.workload().await;
         let c = host.app.db.connect().await.unwrap();
@@ -41,6 +52,10 @@ impl TaskFixture {
                 baseline["capabilities"][0]["input_schema"].clone();
         }
         manifest["capabilities"][0]["side_effect"] = json!(side_effect);
+        if supports_stream {
+            manifest["capabilities"][0]["stream_item_schema"] =
+                manifest["capabilities"][0]["output_schema"].clone();
+        }
         crate::artifact::validate_profile(&manifest).unwrap();
         c.execute(
             "UPDATE installations SET manifest=$2 WHERE id=$1",

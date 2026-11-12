@@ -77,7 +77,7 @@ pub(crate) async fn validate(c: &(impl GenericClient + Sync)) -> Result<()> {
             &[&after],
         ).await?;
         if rows.is_empty() {
-            return Ok(());
+            return crate::task_engine::validate_resolution_history(c).await;
         }
         for row in rows {
             after = Some(row.get("id"));
