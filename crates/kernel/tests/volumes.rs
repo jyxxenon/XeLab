@@ -168,6 +168,18 @@ impl Fixture {
         revision: Option<i64>,
         query: Option<&str>,
     ) -> (u16, Value) {
+        self.api_as((op, id), body, key, revision, query, &self.token)
+            .await
+    }
+    async fn api_as(
+        &self,
+        (op, id): (&str, Option<Uuid>),
+        body: Value,
+        key: &str,
+        revision: Option<i64>,
+        query: Option<&str>,
+        token: &str,
+    ) -> (u16, Value) {
         let (mut path, method) = contracts::openapi()["paths"]
             .as_object()
             .unwrap()
@@ -186,6 +198,7 @@ impl Fixture {
                 "skill_id",
                 "call_id",
                 "blob_id",
+                "credential_id",
             ] {
                 path = path.replace(&format!("{{{p}}}"), &id.to_string());
             }
@@ -201,7 +214,7 @@ impl Fixture {
             )
             .method(method.as_str())
             .uri(path)
-            .header("authorization", format!("Bearer {}", self.token))
+            .header("authorization", format!("Bearer {token}"))
             .header("idempotency-key", key);
         if let Some(rev) = revision {
             req = req.header("if-match", format!("\"rev-{rev}\""));

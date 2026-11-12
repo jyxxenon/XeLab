@@ -2,7 +2,7 @@
 use super::*;
 use ed25519_dalek::{pkcs8::EncodePublicKey, SigningKey};
 use std::{collections::BTreeMap, path::Path, sync::atomic::Ordering};
-use xelab_kernel::{broker, controller, host, schema_jobs};
+use xelab_kernel::{controller, host, schema_jobs};
 
 async fn blob(f: &Fixture, id: Option<Uuid>, data: &[u8]) -> (u16, Vec<u8>) {
     let request = Request::builder()
@@ -37,13 +37,23 @@ async fn blob(f: &Fixture, id: Option<Uuid>, data: &[u8]) -> (u16, Vec<u8>) {
 }
 
 async fn invoke_skill(f: &Fixture, id: Uuid, input: Value, key: &str) -> (u16, Value) {
-    f.api(
-        "invokeSkill",
-        Some(id),
+    invoke_skill_as(f, &f.token, id, input, key).await
+}
+
+async fn invoke_skill_as(
+    f: &Fixture,
+    token: &str,
+    id: Uuid,
+    input: Value,
+    key: &str,
+) -> (u16, Value) {
+    f.api_as(
+        ("invokeSkill", Some(id)),
         json!({"input":input,"timeout_ms":15000}),
         key,
         None,
         None,
+        token,
     )
     .await
 }
@@ -149,32 +159,104 @@ async fn other_subject(f: &Fixture, list: Uuid, put: Uuid, input: &Value) {
         .await;
     assert_eq!(login.0, 200);
     let token = login.1["access_token"].as_str().unwrap();
-    let peer = "127.0.0.1".parse().unwrap();
-    let listed = broker::invoke_skill(
-        &f.app,
-        token,
-        peer,
-        Uuid::new_v4(),
-        list,
-        &json!({"input":{},"timeout_ms":15000}),
-        "child-list",
-    )
-    .await
-    .unwrap();
-    assert_eq!(listed["call"]["output"]["items"], json!([]));
-    let denied = broker::invoke_skill(
-        &f.app,
-        token,
-        peer,
-        Uuid::new_v4(),
-        put,
-        &json!({"input":input,"timeout_ms":15000}),
-        "child-foreign-source",
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(denied.code, "PERMISSION_DENIED");
-    assert!(denied.resource_id.is_none(), "denial must precede dispatch");
+    let listed = invoke_skill_as(f, token, list, json!({}), "child-list").await;
+    assert_eq!(listed.0, 200, "{}", listed.1);
+    assert_eq!(listed.1["call"]["output"]["items"], json!([]));
+    let denied = invoke_skill_as(f, token, put, input.clone(), "child-foreign-source").await;
+    assert_eq!(denied.0, 403, "{}", denied.1);
+    assert_eq!(denied.1["error"]["code"], "PERMISSION_DENIED");
+    assert!(
+        denied.1["error"]["resource_id"].is_null(),
+        "denial must precede dispatch"
+    );
+}
+
+async fn api_key_authority(
+    f: &Fixture,
+    c: &tokio_postgres::Client,
+    list: Uuid,
+    put: Uuid,
+    input: &Value,
+    object: &Value,
+) {
+    let list_rules = vec![
+        json!({"action":"skill.invoke","resource":{"kind":"skill","match":"ids","ids":[list]}}),
+        json!({"action":"capability.invoke","resource":{"kind":"capability","match":"ids","ids":["data.object.list@1.0.0"]}}),
+    ];
+    let mut issuer_rules = list_rules.clone();
+    issuer_rules.push(json!({
+        "action":"credential.api-key.create",
+        "resource":{"kind":"account","match":"ids","ids":[f.owner]}
+    }));
+    let expiry = chrono::Utc::now() + chrono::Duration::hours(1);
+    let issuer = f
+        .api(
+            "createApiKey",
+            Some(f.owner),
+            json!({"name":"Object list key issuer","inheritance":{"mode":"selected","rules":issuer_rules},
+                   "conditions":{"expires_at":expiry}}),
+            "object-issue-list-issuer",
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(issuer.0, 201, "{}", issuer.1["error"]);
+    let issuer_secret = issuer.1["secret"].as_str().unwrap();
+    let credential = f
+        .api_as(
+            ("createApiKey", Some(f.owner)),
+            json!({"name":"Object list only","inheritance":{"mode":"selected","rules":list_rules},
+                   "conditions":{"expires_at":expiry}}),
+            "object-issue-list-key",
+            None,
+            None,
+            issuer_secret,
+        )
+        .await;
+    assert_eq!(credential.0, 201, "{}", credential.1["error"]);
+    let secret = credential.1["secret"].as_str().unwrap();
+
+    let listed = invoke_skill_as(f, secret, list, json!({}), "object-key-list").await;
+    assert_eq!(listed.0, 200, "{}", listed.1);
+    assert_eq!(listed.1["call"]["output"]["items"], json!([object]));
+    let call = contracts::id(&listed.1["call"], "call_id").unwrap();
+    let replay = invoke_skill_as(f, secret, list, json!({}), "object-key-list").await;
+    assert_eq!(replay.0, 200, "{}", replay.1);
+    assert_eq!(contracts::id(&replay.1["call"], "call_id").unwrap(), call);
+
+    let denied = invoke_skill_as(f, secret, put, input.clone(), "object-key-put-denied").await;
+    assert_eq!(denied.0, 403, "{}", denied.1);
+    assert_eq!(denied.1["error"]["code"], "PERMISSION_DENIED");
+    assert!(denied.1["error"]["resource_id"].is_null());
+
+    let revoked = f
+        .api(
+            "revokeApiKey",
+            Some(contracts::id(&issuer.1["credential"], "id").unwrap()),
+            Value::Null,
+            "object-revoke-list-issuer",
+            issuer.1["credential"]["revision"].as_i64(),
+            None,
+        )
+        .await;
+    assert_eq!(revoked.0, 204, "{}", revoked.1);
+    for key in ["object-key-list", "object-key-list-after-revoke"] {
+        let rejected = invoke_skill_as(f, secret, list, json!({}), key).await;
+        assert_eq!(rejected.0, 401, "{key}: {}", rejected.1);
+        assert_eq!(rejected.1["error"]["code"], "INVALID_CREDENTIAL");
+        assert!(rejected.1["error"]["resource_id"].is_null());
+    }
+    let records = c
+        .query(
+            "SELECT id,state FROM calls WHERE idempotency_key IN
+               ('object-key-list','object-key-put-denied','object-key-list-after-revoke')",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].get::<_, Uuid>("id"), call);
+    assert_eq!(records[0].get::<_, String>("state"), "succeeded");
 }
 
 async fn disable(f: &Fixture, deployment: Uuid, key: &str) {
@@ -415,6 +497,15 @@ pub(super) async fn exercise() {
         skills["data.object.list"],
         skills["data.object.put"],
         &input,
+    )
+    .await;
+    api_key_authority(
+        &f,
+        &c,
+        skills["data.object.list"],
+        skills["data.object.put"],
+        &input,
+        object,
     )
     .await;
 
