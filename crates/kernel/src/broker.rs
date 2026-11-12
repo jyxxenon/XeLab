@@ -100,6 +100,9 @@ impl<'a> CallSource<'a> {
 
 pub(crate) async fn invoke_task(app: &App, lease: &Lease) -> Result<Value> {
     crate::skill_streams::ensure_active(app)?;
+    if lease.is_http() {
+        return http::execute_task(app, lease).await;
+    }
     let until = tokio::time::Instant::now() + Duration::from_secs(300);
     let key = lease.execution_id.to_string();
     tokio::time::timeout_at(
@@ -122,6 +125,27 @@ pub(crate) async fn invoke_task(app: &App, lease: &Lease) -> Result<Value> {
             axum::http::StatusCode::GATEWAY_TIMEOUT,
         ))
     })
+}
+
+fn task_call_path(lease: &Lease) -> String {
+    format!("/internal/task-attempts/{}/skill", lease.attempt_id)
+}
+
+fn check_task_manifest(manifest: &Value) -> Result<()> {
+    if manifest["requested_rules"].as_array().is_some_and(|rules| {
+        rules.iter().any(|rule| {
+            rule["required"] == true
+                && crate::host_blobs::proxy_action(
+                    rule["rule"]["action"].as_str().unwrap_or(""),
+                    rule["rule"]["resource"]["kind"].as_str().unwrap_or(""),
+                )
+        })
+    }) {
+        return Err(Error::invalid(
+            "Task Skill requires HostService authority beyond its frozen targets",
+        ));
+    }
+    Ok(())
 }
 
 pub async fn invoke(
@@ -494,7 +518,7 @@ fn invoke_inner<'a>(
                 .is_some_and(|token| token.starts_with("host:"));
         let fingerprint = digest(&serde_json::to_vec(original)?);
         let path = if let CallSource::Task(lease) = origin {
-            format!("/internal/task-attempts/{}/skill", lease.attempt_id)
+            task_call_path(lease)
         } else {
             skill_id.map_or_else(
                 || "/api/platform/v1/calls".to_owned(),
@@ -558,20 +582,8 @@ fn invoke_inner<'a>(
         let instance: Uuid = row.get("id");
         let generation: i64 = row.get("generation");
         let manifest: Value = row.get("manifest");
-        if task
-            && manifest["requested_rules"].as_array().is_some_and(|rules| {
-                rules.iter().any(|rule| {
-                    rule["required"] == true
-                        && crate::host_blobs::proxy_action(
-                            rule["rule"]["action"].as_str().unwrap_or(""),
-                            rule["rule"]["resource"]["kind"].as_str().unwrap_or(""),
-                        )
-                })
-            })
-        {
-            return Err(Error::invalid(
-                "Task Skill requires HostService authority beyond its frozen targets",
-            ));
+        if task {
+            check_task_manifest(&manifest)?;
         }
         protected |= manifest["dependencies"]
             .as_array()
@@ -937,34 +949,6 @@ async fn race_live_call<T>(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn check_live_call(
-    app: &App,
-    token: &str,
-    peer: IpAddr,
-    request_id: Uuid,
-    call: Uuid,
-    instance: Uuid,
-    generation: i64,
-    deadline: chrono::DateTime<chrono::Utc>,
-    browser_origin: Option<&str>,
-) -> Result<()> {
-    check_live_call_for_source(
-        app,
-        CallSource::Token {
-            token,
-            peer,
-            browser_origin,
-        },
-        request_id,
-        call,
-        instance,
-        generation,
-        deadline,
-    )
-    .await
-}
-
 async fn check_live_call_for_source(
     app: &App,
     origin: CallSource<'_>,
@@ -984,10 +968,10 @@ async fn check_live_call_for_source(
         )
         .await?;
     let check = connection.transaction().await?;
-    let task = matches!(origin, CallSource::Task(_));
-    if task {
+    if matches!(origin, CallSource::Task(_)) {
         db::call_lock(&check).await?;
     }
+    let capability_task = matches!(origin, CallSource::Task(lease) if !lease.is_http());
     let current = origin
         .authenticate(&check, app, request_id, Some(call))
         .await?;
@@ -1027,7 +1011,7 @@ async fn check_live_call_for_source(
                           (n.manifest->'health'->>'timeout_ms')::bigint)
                ))
          )",
-        &[&instance, &generation, &task, &call],
+        &[&instance, &generation, &capability_task, &call],
     ).await?.get(0);
     if !live {
         return Err(Error::unavailable("Fixed Skill deployment is unavailable"));

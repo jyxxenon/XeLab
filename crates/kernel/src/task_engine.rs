@@ -16,7 +16,7 @@ mod authority;
 mod input;
 
 const LEASE: Duration = Duration::seconds(30);
-const MAX_STEP_JSON_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_STEP_JSON_BYTES: usize = 4 * 1024 * 1024;
 const STEP_QUERY: &str = "SELECT t.*,w.spec,w.owner_id AS workflow_owner_id,
     s.id AS step_id,s.step_key,s.state AS step_state,s.fence AS step_fence,s.attempt_count,s.provider_deployment_id,
     e.issuer_credential_id,e.subject_id AS delegation_subject,e.status AS delegation_status,
@@ -32,6 +32,13 @@ pub struct Lease {
     pub execution_id: Uuid,
     pub fence: i64,
     pub idempotency_key: String,
+    http: bool,
+}
+
+impl Lease {
+    pub(crate) fn is_http(&self) -> bool {
+        self.http
+    }
 }
 
 pub struct Invocation {
@@ -71,30 +78,49 @@ async fn claim_with_readiness(
               JOIN publishers p ON p.id=n.publisher_id JOIN skills k ON k.installation_id=n.id
               WHERE d.id=s.provider_deployment_id AND d.archived_at IS NULL AND d.spec->>'enabled'='true'
                 AND n.state='installed' AND p.status='trusted' AND k.enabled AND k.archived_at IS NULL
+                AND k.definition->'target'->>'kind' IN ('capability','http')
+                AND (k.definition->'target'->>'kind'='capability'
+                     OR k.definition->>'stream_item_schema' IS NULL)
                 AND t.admission @> jsonb_build_object('version',1,'steps',jsonb_build_array(
                     jsonb_build_object('step_key',s.step_key,'deployment_id',d.id,'installation_id',n.id,
-                      'binding',jsonb_build_object('kind','skill_capability','skill_id',k.id,
+                      'binding',jsonb_build_object('kind','skill_' || (k.definition->'target'->>'kind'),'skill_id',k.id,
                                                  'definition_digest',k.definition_digest))))
+                AND (NOT $1::boolean OR EXISTS (
+                    SELECT 1 FROM instances i WHERE i.deployment_id=d.id AND i.phase='ready'
+                      AND (
+                        (k.definition->'target'->>'kind'='http' AND d.phase='ready'
+                         AND i.health='alive' AND i.generation=d.observed_generation
+                         AND d.approval ? 'rules'
+                         AND i.last_heartbeat_at>clock_timestamp()-interval '1 millisecond' *
+                             ((n.manifest->'health'->>'interval_ms')::bigint *
+                              (n.manifest->'health'->>'failure_threshold')::bigint +
+                              (n.manifest->'health'->>'timeout_ms')::bigint))
+                        OR (k.definition->'target'->>'kind'='capability' AND EXISTS (
+                            SELECT 1 FROM provider_records p WHERE p.instance_id=i.id
+                              AND p.availability='ready' AND p.observed_generation=i.generation
+                              AND p.observed_at>clock_timestamp()-interval '1 millisecond' *
+                                  ((n.manifest->'health'->>'interval_ms')::bigint *
+                                   (n.manifest->'health'->>'failure_threshold')::bigint +
+                                   (n.manifest->'health'->>'timeout_ms')::bigint)
+                              AND t.admission @> jsonb_build_object('steps',jsonb_build_array(
+                                jsonb_build_object('step_key',s.step_key,'installation_id',n.id,'binding',
+                                  jsonb_build_object('contract',jsonb_build_object('name',p.name,'version',p.version)))))
+                        ))
+                      )
+                ))
           )
-          AND (NOT $1::boolean OR (
-              NOT EXISTS (
-                  SELECT 1 FROM task_steps other WHERE other.task_id=t.id
-                    AND NOT t.admission @> jsonb_build_object('steps',jsonb_build_array(
-                      jsonb_build_object('step_key',other.step_key,'binding',
-                                        jsonb_build_object('kind','skill_capability'))))
-              )
-              AND EXISTS (
-                  SELECT 1 FROM provider_records p JOIN instances i ON i.id=p.instance_id
-                  JOIN deployments d ON d.id=i.deployment_id JOIN installations n ON n.id=d.installation_id
-                  WHERE d.id=s.provider_deployment_id AND d.archived_at IS NULL AND d.spec->>'enabled'='true'
-                    AND i.phase='ready' AND p.availability='ready' AND p.observed_generation=i.generation
-                    AND p.observed_at>clock_timestamp()-interval '1 millisecond' *
-                        ((n.manifest->'health'->>'interval_ms')::bigint *
-                         (n.manifest->'health'->>'failure_threshold')::bigint +
-                         (n.manifest->'health'->>'timeout_ms')::bigint)
-                    AND t.admission @> jsonb_build_object('steps',jsonb_build_array(
-                      jsonb_build_object('step_key',s.step_key,'installation_id',n.id,'binding',
-                        jsonb_build_object('contract',jsonb_build_object('name',p.name,'version',p.version)))))
+          AND (NOT $1::boolean OR NOT EXISTS (
+              SELECT 1 FROM task_steps other WHERE other.task_id=t.id AND NOT EXISTS (
+                  SELECT 1 FROM skills k
+                  WHERE other.provider_deployment_id IS NOT NULL
+                    AND k.definition->'target'->>'kind' IN ('capability','http')
+                    AND (k.definition->'target'->>'kind'='capability'
+                         OR k.definition->>'stream_item_schema' IS NULL)
+                    AND t.admission @> jsonb_build_object('steps',jsonb_build_array(jsonb_build_object(
+                      'step_key',other.step_key,'deployment_id',other.provider_deployment_id,
+                      'installation_id',k.installation_id,'binding',jsonb_build_object(
+                        'kind','skill_' || (k.definition->'target'->>'kind'),'skill_id',k.id,
+                        'definition_digest',k.definition_digest))))
               )
           ))
           AND NOT EXISTS (SELECT 1 FROM task_steps active WHERE active.task_id=t.id AND active.state='running')
@@ -171,6 +197,7 @@ async fn claim_with_readiness(
         execution_id,
         fence,
         idempotency_key,
+        http: prepared.is_http,
     }))
 }
 
@@ -206,8 +233,8 @@ async fn prepare_begin(
             "Attempt has already crossed the dispatch boundary",
         ));
     }
-    let prepared = active.prepare(tx, auth, lease.attempt_id).await?;
-    let input = step_input(tx, &active, lease.task_id, prepared.maximum_input_bytes).await?;
+    let prepared = active.prepare(tx, auth, lease).await?;
+    let input = step_input(tx, &active, lease.task_id, &prepared).await?;
     validate_business(&prepared.definition["input_schema"], &input)?;
     let deadline = active.deadline(&prepared)?;
     let now = clock(tx).await?;
@@ -239,18 +266,34 @@ pub(crate) async fn record_broker_call(
     let updated = tx.execute(
         "UPDATE attempts a SET broker_call_id=c.id,revision=a.revision+1,updated_at=clock_timestamp()
          FROM calls c JOIN instances i ON i.id=c.provider_instance_id
-         JOIN task_steps s ON s.provider_deployment_id=i.deployment_id
+         JOIN deployments d ON d.id=i.deployment_id JOIN installations n ON n.id=d.installation_id
+         JOIN task_steps s ON s.provider_deployment_id=d.id
          JOIN tasks t ON t.id=s.task_id JOIN execution_delegations e ON e.id=t.delegation_id
          WHERE a.id=$1 AND c.id=$2 AND s.id=a.step_id AND a.state='running'
            AND a.broker_call_id IS NULL AND c.state='running'
            AND LEAST(a.lease_expires_at,c.deadline_at,t.deadline_at,e.expires_at)>clock_timestamp()
            AND c.owner_id=t.owner_id AND c.credential_id=e.issuer_credential_id
            AND c.delegation_id<>t.delegation_id AND c.idempotency_key=a.idempotency_key
-           AND t.admission @> jsonb_build_object('version',1,'steps',jsonb_build_array(
-               jsonb_build_object('step_key',s.step_key,'deployment_id',i.deployment_id,'binding',
-                 jsonb_build_object('kind','skill_capability','skill_id',c.skill_id,
-                                    'definition_digest',c.skill_definition_digest,'contract',c.contract))))",
-        &[&lease.attempt_id, &call],
+           AND (CASE WHEN $3::boolean THEN
+               c.http_binding @> jsonb_build_object('installation_id',n.id,'deployment_id',d.id,'generation',i.generation)
+               AND t.admission @> jsonb_build_object('version',1,'steps',jsonb_build_array(jsonb_build_object(
+                   'step_key',s.step_key,'deployment_id',d.id,'installation_id',n.id,
+                   'binding',jsonb_build_object('kind','skill_http','skill_id',c.skill_id,
+                       'definition_digest',c.skill_definition_digest,
+                       'operation_id',c.http_binding->'operation_id',
+                       'http_contract_digest',c.http_binding->'http_contract_digest',
+                       'method',c.http_binding->'method','path',c.http_binding->'path'),
+                   'targets',jsonb_build_array(jsonb_build_object('action',c.http_binding->'required_action',
+                       'owner_id',d.owner_id,'resource',jsonb_build_object('kind','plugin','match','ids',
+                                                                        'ids',jsonb_build_array(n.plugin_id)))))))
+             ELSE
+               c.http_binding IS NULL
+               AND t.admission @> jsonb_build_object('version',1,'steps',jsonb_build_array(jsonb_build_object(
+                   'step_key',s.step_key,'deployment_id',d.id,'installation_id',n.id,
+                   'binding',jsonb_build_object('kind','skill_capability','skill_id',c.skill_id,
+                       'definition_digest',c.skill_definition_digest,'contract',c.contract))))
+             END)",
+        &[&lease.attempt_id, &call, &lease.is_http()],
     ).await?;
     if updated != 1 {
         return Err(Error::conflict(
@@ -274,7 +317,7 @@ pub(crate) async fn authorize_broker_call(
             "Broker Call is not linked to this Task attempt",
         ));
     }
-    let prepared = active.prepare(tx, auth, lease.attempt_id).await?;
+    let prepared = active.prepare(tx, auth, lease).await?;
     let deadline = active.deadline(&prepared)?;
     let context = prepared.into_broker_context(tx).await?;
     require_future(active.lease_until.min(deadline), clock(tx).await?)?;
@@ -337,7 +380,7 @@ pub(crate) async fn pause_undispatched(
 pub async fn renew(tx: &Transaction<'_>, auth: &Auth, lease: &Lease) -> Result<DateTime<Utc>> {
     let active = load(tx, lease).await?;
     active.require_running_step()?;
-    let prepared = active.prepare(tx, auth, lease.attempt_id).await?;
+    let prepared = active.prepare(tx, auth, lease).await?;
     let now = clock(tx).await?;
     let deadline = active.deadline(&prepared)?;
     require_future(active.lease_until.min(deadline), now)?;
@@ -386,16 +429,20 @@ impl Active {
         &self,
         tx: &Transaction<'_>,
         auth: &Auth,
-        request: Uuid,
+        lease: &Lease,
     ) -> Result<authority::Prepared> {
-        authority::prepare(
+        let prepared = authority::prepare(
             tx,
             auth,
             &self.row,
             self.row.get::<_, String>("step_key").as_str(),
-            request,
+            lease.attempt_id,
         )
-        .await
+        .await?;
+        if prepared.is_http != lease.is_http() {
+            return Err(Error::denied());
+        }
+        Ok(prepared)
     }
 }
 
@@ -461,7 +508,7 @@ async fn step_input(
     tx: &Transaction<'_>,
     active: &Active,
     task: Uuid,
-    maximum: usize,
+    prepared: &authority::Prepared,
 ) -> Result<Value> {
     let dependencies = active.step["depends_on"]
         .as_array()
@@ -477,6 +524,17 @@ async fn step_input(
     let unique: std::collections::HashSet<_> = dependencies.into_iter().collect();
     if complete != unique.len() as i64 {
         return Err(Error::conflict("Task step dependencies are incomplete"));
+    }
+    if prepared.http_bodyless {
+        if active.step["input_mapping"]
+            .as_object()
+            .is_none_or(|mapping| !mapping.is_empty())
+        {
+            return Err(Error::invalid(
+                "Bodyless HTTP Skill requires an empty Workflow input mapping",
+            ));
+        }
+        return Ok(Value::Null);
     }
     let upstream_ids: Vec<_> = active.step["input_mapping"]
         .as_object()
@@ -499,7 +557,7 @@ async fn step_input(
         &active.step,
         &active.row.get("input"),
         &upstream,
-        maximum.min(MAX_STEP_JSON_BYTES),
+        prepared.maximum_input_bytes.min(MAX_STEP_JSON_BYTES),
     )
 }
 
@@ -515,7 +573,7 @@ pub async fn complete(
         Outcome::Failed(error) => ("failed", None, Some(error.detail())),
         Outcome::Unknown(error) => ("unknown", None, Some(error.detail())),
     };
-    let prepared = active.prepare(tx, auth, lease.attempt_id).await?;
+    let prepared = active.prepare(tx, auth, lease).await?;
     if let Some(call) = active.broker_call_id {
         let row = tx
             .query_one("SELECT state,result FROM calls WHERE id=$1", &[&call])

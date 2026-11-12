@@ -19,6 +19,8 @@ pub(super) struct Prepared {
     pub(super) deployment: Uuid,
     pub(super) installation: Uuid,
     pub(super) definition: Value,
+    pub(super) is_http: bool,
+    pub(super) http_bodyless: bool,
     pub(super) maximum_input_bytes: usize,
     pub(super) maximum_output_bytes: usize,
     pub(super) deadline: DateTime<Utc>,
@@ -105,15 +107,14 @@ pub(super) async fn prepare(
     if matching_steps.next().is_some() {
         return Err(Error::denied());
     }
-    if step.binding["kind"] != "skill_capability" {
-        return Err(Error::unavailable(
-            "Task step requires a synchronous capability Skill",
-        ));
-    }
+    let is_http = match step.binding["kind"].as_str() {
+        Some("skill_capability") => false,
+        Some("skill_http") => true,
+        _ => return Err(Error::unavailable("Task step requires a synchronous Skill")),
+    };
     let skill_id = id(&step.binding, "skill_id").map_err(|_| Error::denied())?;
     let definition_digest =
         string(&step.binding, "definition_digest").map_err(|_| Error::denied())?;
-    let contract = &step.binding["contract"];
     let deployment = step.deployment_id.ok_or_else(Error::denied)?;
     let installation = step.installation_id.ok_or_else(Error::denied)?;
     if task.try_get::<_, Option<Uuid>>("provider_deployment_id")? != Some(deployment) {
@@ -145,15 +146,57 @@ pub(super) async fn prepare(
 
     // The Skill resolver checks the live Skill and signed installation candidate.
     let skill = crate::skills::resolve_for_invoke(tx, &ctx, skill_id).await?;
-    if skill.installation_id != installation
-        || skill.definition_digest != definition_digest
-        || skill.definition["target"]["kind"] != "capability"
-        || skill.definition["target"]["contract"] != *contract
-    {
+    if skill.installation_id != installation || skill.definition_digest != definition_digest {
         return Err(Error::denied());
     }
-    let (maximum_input_bytes, maximum_output_bytes) =
-        check_provider(tx, deployment, installation, contract).await?;
+    let (
+        business_action,
+        business_resource,
+        maximum_input_bytes,
+        maximum_output_bytes,
+        http_bodyless,
+    ) = if is_http {
+        let (action, resource, input_bytes, bodyless) = check_http_provider(
+            tx,
+            deployment,
+            installation,
+            &step.binding,
+            &skill.definition,
+        )
+        .await?;
+        (
+            action,
+            resource,
+            input_bytes,
+            crate::plugin_http::MAXIMUM_RESPONSE_BYTES,
+            bodyless,
+        )
+    } else {
+        let contract = &step.binding["contract"];
+        if skill.definition["target"]["kind"] != "capability"
+            || skill.definition["target"]["contract"] != *contract
+        {
+            return Err(Error::denied());
+        }
+        let (input_bytes, output_bytes) =
+            check_provider(tx, deployment, installation, contract).await?;
+        let resource = Resource::new(
+            "capability",
+            format!(
+                "{}@{}",
+                string(contract, "name")?,
+                string(contract, "version")?
+            ),
+            None,
+        );
+        (
+            "capability.invoke".to_owned(),
+            resource,
+            input_bytes,
+            output_bytes,
+            false,
+        )
+    };
 
     let workflow_resource = Resource::new(
         "workflow",
@@ -161,15 +204,6 @@ pub(super) async fn prepare(
         Some(task.try_get("workflow_owner_id")?),
     );
     let skill_resource = Resource::new("skill", skill_id, Some(skill.owner));
-    let capability_resource = Resource::new(
-        "capability",
-        format!(
-            "{}@{}",
-            string(contract, "name")?,
-            string(contract, "version")?
-        ),
-        None,
-    );
     if step.targets.len() != 2 {
         return Err(Error::denied());
     }
@@ -185,9 +219,9 @@ pub(super) async fn prepare(
             saved_paths(step, "skill.invoke", &skill_resource)?,
         ),
         (
-            "capability.invoke",
-            &capability_resource,
-            saved_paths(step, "capability.invoke", &capability_resource)?,
+            business_action.as_str(),
+            &business_resource,
+            saved_paths(step, &business_action, &business_resource)?,
         ),
     ];
     let maximum: Value = task.try_get("maximum_rules")?;
@@ -202,12 +236,14 @@ pub(super) async fn prepare(
         deployment,
         installation,
         definition: skill.definition,
+        is_http,
+        http_bodyless,
         maximum_input_bytes,
         maximum_output_bytes,
         deadline,
         context: ctx,
         // Workflow visibility is required above, but it is not delegated to
-        // the Broker as part of Skill or capability authority.
+        // the Broker as part of Skill or business authority.
         business_paths: current_paths.into_iter().skip(1).flatten().collect(),
     })
 }
@@ -251,6 +287,52 @@ async fn revalidate_paths(
         .with_resource_owner(resource)
         .revalidate(saved, ctx.credential)
         .await
+}
+
+async fn check_http_provider(
+    tx: &Transaction<'_>,
+    deployment: Uuid,
+    installation: Uuid,
+    binding: &Value,
+    definition: &Value,
+) -> Result<(String, Resource, usize, bool)> {
+    let row = tx
+        .query_opt(
+            "SELECT owner_id FROM deployments
+             WHERE id=$1 AND installation_id=$2 AND archived_at IS NULL AND spec->>'enabled'='true'
+             FOR SHARE",
+            &[&deployment, &installation],
+        )
+        .await?
+        .ok_or_else(|| Error::unavailable("Task HTTP Skill deployment is no longer available"))?;
+    let registry = crate::http_contracts::load(tx, installation).await?;
+    let operation = registry.bind_skill(definition)?;
+    if operation.id != binding["operation_id"]
+        || operation.contract_digest != binding["http_contract_digest"]
+        || operation.method.as_str() != binding["method"]
+        || operation.path != binding["path"]
+    {
+        return Err(Error::denied());
+    }
+    if !definition["stream_item_schema"].is_null()
+        || operation
+            .responses
+            .values()
+            .any(|response| response.media_type.as_deref() == Some("text/event-stream"))
+    {
+        return Err(Error::unavailable("Task HTTP Skill must be synchronous"));
+    }
+    let resource = Resource::new(
+        "plugin",
+        string(&definition["target"], "plugin_id")?,
+        Some(row.get("owner_id")),
+    );
+    Ok((
+        operation.route.action.clone(),
+        resource,
+        operation.route.maximum_body_bytes,
+        operation.input.is_none(),
+    ))
 }
 
 async fn check_provider(

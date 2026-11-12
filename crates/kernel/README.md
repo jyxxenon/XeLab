@@ -13,11 +13,11 @@
 | 依赖 | `resolveDependencies`、普通插件/能力完整解析、精确契约/安装/配置/代次与特性固定、并发强环/16层图检查、可选降级和升级计划日志 | HostService 已提供固定能力和 Skill 的发现/解析/调用；task 执行依赖 TaskEngine，微/扩展宿主仍未交付 |
 | 控制器 | 安装/批准/启用/健康/排空停止、有界对账与重启、完全停用排空后的配置更新、部署重建与同格式卷切换、内部初始化/格式迁移监督器 | 多副本、滚动升级、运行中动态配置；完整格式升级/不兼容回退仍待正式备份验收 |
 | 执行 | containerd/runc 真容器、cgroups v2 CPU/内存/PID、只读根目录、受限 tmpfs、无 Linux capabilities、隔离网络、工作负载 mTLS | 外网/代理、尚未实现的 HostService 方法、GPU、微插件/MPR、Extension Plugin；组件预算不代替生产 RUN-03 |
-| 调用 | 固定契约/安装/部署、双层授权、共享实例并发、树配额/源链计费、幂等/unknown 账本、有界 SSE 缓冲与取消围栏；普通无版本数据格式 capability 四类副作用的单次/声明流和原实例 QueryResult | #46 精确真实 OCI 副作用/QueryResult 门禁已通过；事务锁准入等待及有界 SSE 缓冲不是业务等待队列或持久 TaskEngine；Task 执行、Batch、Schedule 待实现 |
+| 调用 | 固定契约/安装/部署、双层授权、共享实例并发、树配额/源链计费、幂等/unknown 账本、有界 SSE 缓冲与取消围栏；普通无版本数据格式 capability 四类副作用的单次/声明流和原实例 QueryResult | #46 精确真实 OCI 副作用/QueryResult 门禁已通过；持久 Task 由控制器从数据库领取；Batch、Schedule 待实现 |
 | 事件 | 持久化发布/outbox、24h 去重、独立游标、30s 租约、旧租约 fencing、退避重投/死信、保留和容量上限、SSE/HostService、原生快照及恢复授权重置 | 当前源代码与专项证据见 [M4 事件](../../docs/implementation/m4-events.md)和[#54](https://github.com/jyxxe/XeLab/issues/54)；正式 daemon/独立宿主及 AWS 仍由 #50 跟踪 |
 | 工作流定义 | `createWorkflow/getWorkflow/listWorkflows/archiveWorkflow`；同一所有者和名称下递增不可变版本，校验 DAG、输入映射和签名目标，按当前权限分页，使用 ETag 归档 | 归档阻止同一版本的新任务，历史任务继续可读 |
 | 任务提交与查询 | `createTask/getTask/listTasks/listTaskSteps`；在一个事务中固定 Workflow 版本、deadline、执行权限上限、授权来源和需要固定的提供者，初始化步骤状态 | 服务身份执行需单独审批。HTTP 与真实 PostgreSQL 回归见 `crates/kernel/tests/workflows.rs` |
-| 同步 TaskEngine | 控制器以 PostgreSQL 租约领取能力契约型同步 Skill，经 Broker 准入、计费及调用，原子记录 Attempt 与 Call；结果提交检查 fence 并推进下游与 outbox | HTTP Skill、任务级 HostService 附属授权、Blob 大结果、长任务 TaskWorker 与 UNKNOWN 核实待实现 |
+| 同步 TaskEngine | 控制器以 PostgreSQL 租约领取能力契约型或固定 HTTP 同步 Skill，经 Broker 准入、计费及调用，原子记录 Attempt 与 Call；结果提交检查 fence 并推进下游与 outbox | Task 步骤采用单次调用；任务级 HostService 附属授权、Blob 大结果、长任务 TaskWorker 与 UNKNOWN 核实待实现 |
 | HTTP | #43 已合并签名原始 OpenAPI、精确操作/动作/Schema、共享 Broker 账本、直接 HTTP SSE、隔离来源静态 GET/HEAD 与物理槽；#47 扩展固定 HTTP Skill 的六方法、成功状态和 SSE | #47 精确 HTTP Skill 六方法/流真实 OCI 门禁已通过；不是任意 URL/路径模板/查询参数代理，未声明协议拒绝 |
 | 独立 WebUI/消息桥 | #45 实现 UID 65532 OCI 桌面、公开管理 API/OAuth 客户端、window/widget、固定 alias 的 skill.call、同部署 window.open、通道撤权/登出/升级失效及独立 UI 参考插件 | 组件与打包探针通过不能替代真实核心 OCI/Owner OAuth/iframe 全链；#45 精确完整/专项门禁均通过，未来 batch 方法明确不可用 |
 | 持久卷 | 独立 XFS 硬配额、预留/扩容/回收、实际计数、单写者 fence、OCI 挂载、新私有卷恢复、同格式克隆/回退、内部格式证明 | 多副本应用行为、公开格式安装/迁移、正式独立宿主恢复验收 |
