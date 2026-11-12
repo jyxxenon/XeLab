@@ -67,7 +67,8 @@ async fn scoped_token(f: &TaskFixture, owner: Uuid, action: &str) -> String {
 #[tokio::test]
 async fn postgres_task_resolution_accepts_only_durable_output_and_replays_once() {
     // Unary Tasks also support capability definitions that offer streaming.
-    let Some(f) = TaskFixture::with_capability("none", false, true).await else {
+    let Some(f) = TaskFixture::with_capability("none", false, CapabilityFixture::DualMode).await
+    else {
         return;
     };
     let (plugin, server) = echo(&f.host, f.instance).await;
