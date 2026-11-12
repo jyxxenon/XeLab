@@ -194,6 +194,7 @@ async fn install(
     raw_path: &str,
     image_var: &str,
     key: &str,
+    config: Value,
 ) -> (Value, Value, String) {
     let raw = fs::read(raw_path).unwrap();
     let manifest: Value = serde_json::from_slice(&raw).unwrap();
@@ -204,7 +205,7 @@ async fn install(
     let installed=api(router,"installPlugin",&[],Some(token),json!({"publisher_id":manifest["publisher_id"],"image":image,"signature":STANDARD.encode(signing.sign(envelope.as_bytes()).to_bytes())}),&format!("{key}-install"),None).await;
     assert_eq!(installed.0, 202, "{}", installed.1);
     let installed = operation(router, installed.1["id"].as_str().unwrap(), token).await;
-    let created=api(router,"createDeployment",&[],Some(token),json!({"installation_id":installed["installation_id"],"display_name":key,"enabled":false,"limits":{"cpu_millis":500,"memory_bytes":134217728,"ephemeral_bytes":1048576,"pids":64},"config":{},"volume_ids":[]}),&format!("{key}-deploy"),None).await;
+    let created=api(router,"createDeployment",&[],Some(token),json!({"installation_id":installed["installation_id"],"display_name":key,"enabled":false,"limits":{"cpu_millis":500,"memory_bytes":134217728,"ephemeral_bytes":1048576,"pids":64},"config":config,"volume_ids":[]}),&format!("{key}-deploy"),None).await;
     assert_eq!(created.0, 202, "{}", created.1);
     let deployment = operation(router, created.1["id"].as_str().unwrap(), token).await["id"]
         .as_str()
@@ -514,6 +515,7 @@ async fn signed_http_and_static_gateway_use_real_oci_and_shared_broker() {
         "examples/http/generated/xelab/plugin.json",
         "XELAB_TEST_HTTP_IMAGE",
         "http-only",
+        json!({}),
     )
     .await;
     assert!(manifest["capabilities"].as_array().unwrap().is_empty());
@@ -1064,6 +1066,7 @@ async fn signed_http_and_static_gateway_use_real_oci_and_shared_broker() {
         "examples/http/generated-mixed/xelab/plugin.json",
         "XELAB_TEST_HTTP_MIXED_IMAGE",
         "http-rpc-mixed",
+        json!({"test_hold_receipt":true}),
     )
     .await;
     let mixed_host = plugin_host(&mixed_deployment);
