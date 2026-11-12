@@ -557,6 +557,13 @@ class ArtifactTests(unittest.TestCase):
                 checks.append(f"{name} {hashlib.sha256((package / name).read_bytes()).hexdigest()}\n")
             self.assertEqual(cap["contract"]["schema_digest"], "sha256:" + hashlib.sha256("".join(checks).encode()).hexdigest())
             self.assertEqual(manifest["skills"][0]["version"], "2.0.0")
+            raw = (root / "xelab/http/openapi.json").read_bytes()
+            operation = json.loads(raw)["paths"][HOLD_PATH]["post"]
+            hold = manifest["skills"][-1]
+            self.assertEqual(hold["target"]["http_operation_id"], operation["operationId"])
+            self.assertEqual(hold["target"]["http_contract_digest"], "sha256:" + hashlib.sha256(raw).hexdigest())
+            self.assertEqual(hold["input_schema"], operation["requestBody"]["content"]["application/json"]["schema"])
+            self.assertEqual(hold["output_schema"], operation["responses"]["200"]["content"]["application/json"]["schema"])
 
 
 if __name__ == "__main__":

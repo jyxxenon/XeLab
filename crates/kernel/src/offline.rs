@@ -272,11 +272,13 @@ impl Session {
             &[&error],
         )
         .await?;
+        crate::task_engine::reconcile_stopped(&tx).await?;
         tx.execute(
             "UPDATE reservations SET status='released' WHERE status<>'released'",
             &[],
         )
         .await?;
+        crate::task_engine::finish_stopped_cancellations(&tx).await?;
         tx.execute("UPDATE node_budget SET reserved_cpu_millis=0,reserved_memory_bytes=0,revision=revision+1,updated_at=now()",&[]).await?;
         tx.execute(
             "UPDATE quotas SET concurrent_calls_used=0,revision=revision+1,updated_at=now()",
@@ -464,9 +466,8 @@ async fn source_preflight(c: &(impl GenericClient + Sync)) -> Result<()> {
     crate::ui::validate_snapshot(c).await?;
     crate::webui::validate_snapshot(c).await?;
     crate::events::snapshot::validate_snapshot(c).await?;
+    crate::tasks::snapshot::validate(c).await?;
     for name in [
-        "workflows",
-        "tasks",
         "schedules",
         "micro_plugins",
         "extension_plugins",
@@ -609,8 +610,11 @@ mod tests {
             .unwrap()
             .get(0);
         let workflow = Uuid::new_v4();
-        c.execute("INSERT INTO workflows(id,owner_id,name,version,spec,status,created_at,updated_at) VALUES($1,$2,'unsupported source',1,'{}','active',now(),now())",&[&workflow,&owner]).await.unwrap();
-        assert!(source_preflight(&c).await.is_err());
+        c.execute("INSERT INTO workflows(id,owner_id,name,version,spec,status,created_at,updated_at) VALUES($1,$2,'invalid source workflow',1,'{}','active',now(),now())",&[&workflow,&owner]).await.unwrap();
+        assert_eq!(
+            source_preflight(&c).await.unwrap_err().code,
+            "STATE_CONFLICT"
+        );
         c.execute("DELETE FROM workflows WHERE id=$1", &[&workflow])
             .await
             .unwrap();
