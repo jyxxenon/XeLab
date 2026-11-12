@@ -12,7 +12,8 @@ COPY docs/preset-plugins/object-storage/storage.sql /opt/plugin/storage.sql
 COPY --chmod=0555 examples/object-storage/plugin /usr/local/bin/plugin
 ARG ARTIFACT_DIR=examples/object-storage/generated
 COPY ${ARTIFACT_DIR}/xelab /xelab
-RUN mkdir -p -m 0755 /data/objects
+# The format supervisor mounts its private scratch only during migration RPCs.
+RUN mkdir -p -m 0755 /data/objects /xelab-migration
 ENV PYTHONDONTWRITEBYTECODE=1
 USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/plugin"]
