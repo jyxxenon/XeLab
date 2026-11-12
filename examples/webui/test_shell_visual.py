@@ -64,6 +64,20 @@ class ShellVisual(unittest.TestCase):
                 "854px", "desktop fills the viewport below the menu bar in " + mode,
             )
 
+    def test_shell_stylesheet_is_a_separate_linked_layer(self):
+        self.open()
+        sheets = self.page.evaluate(
+            "() => [...document.styleSheets].map(sheet => (sheet.href || '').split('/').pop())")
+        self.assertEqual(sheets[:2], ["styles.css", "shell.css"])
+        status = self.page.evaluate("""async () => {
+          const response = await fetch('/ui/org.xelab.webui/shell.css');
+          return {status: response.status, type: response.headers.get('content-type') || ''};
+        }""")
+        self.assertEqual(status["status"], 200)
+        self.assertIn("css", status["type"])
+        # The shell layer still wins the cascade after the split.
+        self.assertEqual(self.style("#dock")["borderRadius"], "20px")
+
     def test_desktop_wallpaper_is_served_and_applied(self):
         self.open()
         background = self.style("#desktop")["backgroundImage"]
