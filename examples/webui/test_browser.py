@@ -84,10 +84,10 @@ class DesktopBrowser(unittest.TestCase):
             if file == "runtime-config.js":
                 route.fulfill(status=200, content_type="text/javascript", body="export const runtimeConfig=" + json.dumps({"core_origin": CORE, "client_id": "browser-component", "max_open_windows": 16}) + ";")
                 return
-            if file not in {"index.html", "app.js", "styles.css", "api.js", "oauth.js", "bridge.js"}:
+            if file not in {"index.html", "app.js", "styles.css", "api.js", "oauth.js", "bridge.js", "wallpaper.svg"}:
                 route.fulfill(status=404, body="not found")
                 return
-            types = {".html": "text/html", ".css": "text/css", ".js": "text/javascript"}
+            types = {".html": "text/html", ".css": "text/css", ".js": "text/javascript", ".svg": "image/svg+xml"}
             route.fulfill(status=200, content_type=types[pathlib.Path(file).suffix], body=(PUBLIC / file).read_bytes())
             return
         if f"{url.scheme}://{url.netloc}" == PLUGIN:

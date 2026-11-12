@@ -64,6 +64,18 @@ class ShellVisual(unittest.TestCase):
                 "854px", "desktop fills the viewport below the menu bar in " + mode,
             )
 
+    def test_desktop_wallpaper_is_served_and_applied(self):
+        self.open()
+        background = self.style("#desktop")["backgroundImage"]
+        self.assertIn("wallpaper.svg", background)
+        status = self.page.evaluate("""async () => {
+          const response = await fetch('/ui/org.xelab.webui/wallpaper.svg');
+          return {status: response.status, type: response.headers.get('content-type') || ''};
+        }""")
+        self.assertEqual(status["status"], 200)
+        self.assertIn("svg", status["type"])
+        self.assertIn("cover", self.style("#desktop")["backgroundSize"])
+
     def test_reduced_transparency_removes_shell_blur(self):
         self.open()
         self.page.evaluate("() => document.documentElement.classList.add('reduced-transparency')")
