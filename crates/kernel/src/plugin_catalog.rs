@@ -1,8 +1,8 @@
-//! Public plugin catalog reads. Each page uses the existing current policy and
+//! Public catalog reads. Each page uses the existing current policy and
 //! actual object owner. Cursors convey position only, and encrypt positions so
 //! they cannot disclose identifiers belonging to invisible objects.
 use crate::{
-    api::read_object,
+    api::{object_value, read_object},
     auth::{self, Auth, Context, Resource},
     contracts::{digest, strict_json, strict_urlencoded, validate},
     error::{Error, Result},
@@ -15,7 +15,7 @@ use ring::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
-use tokio_postgres::GenericClient;
+use tokio_postgres::{types::ToSql, GenericClient};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
@@ -37,6 +37,9 @@ fn collection(name: &str) -> Result<Collection> {
         "listInstallations" => ("installations", "Installation", "plugin.read", "plugin", "SELECT t.id,t.created_at,t.plugin_id AS resource_id,NULL::uuid AS owner_id,t.plugin_id,NULL::uuid AS deployment_id FROM installations t"),
         "listDeployments" => ("deployments", "Deployment", "plugin.read", "deployment", "SELECT t.id,t.created_at,t.id::text AS resource_id,t.owner_id,NULL::text AS plugin_id,t.id AS deployment_id FROM deployments t WHERE t.archived_at IS NULL"),
         "listInstances" => ("instances", "Instance", "plugin.read", "instance", "SELECT t.id,t.created_at,t.id::text AS resource_id,d.owner_id,NULL::text AS plugin_id,t.deployment_id FROM instances t JOIN deployments d ON d.id=t.deployment_id WHERE d.archived_at IS NULL"),
+        "listWorkflows" => ("workflows", "Workflow", "workflow.read", "workflow", "SELECT t.id,t.created_at,t.id::text AS resource_id,t.owner_id,NULL::text AS plugin_id,NULL::uuid AS deployment_id FROM workflows t"),
+        "listTasks" => ("tasks", "Task", "task.read", "task", "SELECT t.id,t.created_at,t.id::text AS resource_id,t.owner_id,NULL::text AS plugin_id,NULL::uuid AS deployment_id,t.state FROM tasks t"),
+        "listTaskSteps" => ("task_steps", "TaskStep", "task.read", "task", "SELECT s.id,s.created_at,t.id::text AS resource_id,t.owner_id,NULL::text AS plugin_id,NULL::uuid AS deployment_id,s.task_id FROM task_steps s JOIN tasks t ON t.id=s.task_id"),
         _ => return Err(Error::invalid("Unknown plugin catalog operation")),
     };
     Ok(Collection {
@@ -255,6 +258,40 @@ pub(crate) async fn execute(
     name: &str,
     query: &str,
 ) -> Result<(Value, u16)> {
+    list(c, auth, ctx, name, query, None).await
+}
+
+pub(crate) async fn list_task_steps(
+    c: &(impl GenericClient + Sync),
+    auth: &Auth,
+    ctx: &Context,
+    task: Uuid,
+    query: &str,
+) -> Result<(Value, u16)> {
+    list(c, auth, ctx, "listTaskSteps", query, Some(task)).await
+}
+
+pub(crate) async fn read_task(
+    c: &(impl GenericClient + Sync),
+    task: Uuid,
+    state: Option<&str>,
+) -> Result<Option<Value>> {
+    // Keep the internal admission proof outside even the SQL payload.
+    let row = c.query_opt(
+        "SELECT to_jsonb(t) FROM (SELECT id,revision,created_at,updated_at,owner_id,workflow_id,delegation_id,state,input,output,deadline_at,error FROM tasks WHERE id=$1 AND ($2::text IS NULL OR state COLLATE \"C\"=$2)) t",
+        &[&task, &state],
+    ).await?;
+    row.map(|row| object_value(&row.get(0), "Task")).transpose()
+}
+
+async fn list(
+    c: &(impl GenericClient + Sync),
+    auth: &Auth,
+    ctx: &Context,
+    name: &str,
+    query: &str,
+    task: Option<Uuid>,
+) -> Result<(Value, u16)> {
     let selected = collection(name)?;
     if !policy::registered(c, selected.action, selected.kind).await? {
         return Err(Error::denied());
@@ -294,6 +331,18 @@ pub(crate) async fn execute(
     } else {
         None
     };
+    let state = if name == "listTasks" {
+        args.remove("state")
+            .map(|value| value.as_str().unwrap().to_owned())
+    } else {
+        None
+    };
+    if state
+        .as_ref()
+        .is_some_and(|state| !(1..=80).contains(&state.chars().count()) || state.contains('\0'))
+    {
+        return Err(Error::invalid("Invalid task state filter"));
+    }
     let supplied_cursor = args.remove("cursor");
     if !args.is_empty() {
         return Err(Error::invalid("Unsupported plugin catalog filter"));
@@ -308,7 +357,13 @@ pub(crate) async fn execute(
         })
         .collect();
     let proof = authority_binding(c, ctx, &paths).await?;
-    let binding = json!({"subject":ctx.subject,"credential":ctx.credential,"chain":digest(&serde_jcs::to_vec(&ctx.chain)?),"origin":ctx.browser_origin,"peer":ctx.peer,"operation":name,"limit":limit,"plugin_id":plugin,"deployment_id":deployment,"authority":proof});
+    let mut binding = json!({"subject":ctx.subject,"credential":ctx.credential,"chain":digest(&serde_jcs::to_vec(&ctx.chain)?),"origin":ctx.browser_origin,"peer":ctx.peer,"operation":name,"limit":limit,"plugin_id":plugin,"deployment_id":deployment,"authority":proof});
+    if name == "listTasks" {
+        binding["state"] = json!(state);
+    }
+    if let Some(task) = task {
+        binding["task_id"] = json!(task);
+    }
     let now = Utc::now();
     let mut cursor = if let Some(value) = supplied_cursor {
         decode(auth, value.as_str().unwrap())?
@@ -338,27 +393,37 @@ pub(crate) async fn execute(
     // SQL preselection contains only the same currently allowed selector set.
     // It avoids count/existence leaks from scanning unrelated private rows.
     // Every selected object is checked again by the existing rule predicate.
-    let sql = format!("WITH catalog AS ({}) SELECT * FROM catalog WHERE created_at<=$1 AND (created_at,id::text)>($2,$3) AND ($4 OR resource_id=ANY($5::text[]) OR owner_id=ANY($6::uuid[])) AND ($7::text IS NULL OR plugin_id=$7) AND ($8::uuid IS NULL OR deployment_id=$8) ORDER BY created_at,id LIMIT 201",selected.source);
-    let rows = c
-        .query(
-            &sql,
-            &[
-                &cursor.watermark,
-                &cursor.last_time,
-                &cursor.last_id,
-                &visible.all,
-                &ids,
-                &owners,
-                &plugin,
-                &deployment,
-            ],
-        )
-        .await?;
+    let mut params: Vec<&(dyn ToSql + Sync)> = vec![
+        &cursor.watermark,
+        &cursor.last_time,
+        &cursor.last_id,
+        &visible.all,
+        &ids,
+        &owners,
+        &plugin,
+        &deployment,
+    ];
+    let task_filter = match name {
+        "listTasks" => {
+            params.push(&state);
+            "AND ($9::text IS NULL OR state COLLATE \"C\"=$9)"
+        }
+        "listTaskSteps" => {
+            if task.is_none() {
+                return Err(Error::not_found());
+            }
+            params.push(&task);
+            "AND task_id=$9"
+        }
+        _ => "",
+    };
+    let sql = format!("WITH catalog AS ({}) SELECT * FROM catalog WHERE created_at<=$1 AND (created_at,id::text)>($2,$3) AND ($4 OR resource_id=ANY($5::text[]) OR owner_id=ANY($6::uuid[])) AND ($7::text IS NULL OR plugin_id=$7) AND ($8::uuid IS NULL OR deployment_id=$8) {task_filter} ORDER BY created_at,id LIMIT 201",selected.source);
+    let rows = c.query(&sql, &params).await?;
     let rules = policy::rules(&paths);
     let mut items = Vec::new();
     let mut bytes = 4096;
     let mut more = false;
-    for row in rows {
+    for (index, row) in rows.into_iter().enumerate() {
         let id: Uuid = row.get("id");
         let resource = Resource::new(
             selected.kind,
@@ -370,11 +435,22 @@ pub(crate) async fn execute(
                 "Catalog authority changed; restart pagination",
             ));
         }
-        if items.len() == limit {
+        if items.len() == limit || index == 200 {
             more = true;
             break;
         }
-        let value = read_object(c, selected.table, id, selected.model).await?;
+        let value = if name == "listTasks" {
+            // A task may change state after the ID scan in a READ COMMITTED
+            // transaction. Recheck against the same snapshot as the payload.
+            let Some(value) = read_task(c, id, state.as_deref()).await? else {
+                cursor.last_time = row.get("created_at");
+                cursor.last_id = id.to_string();
+                continue;
+            };
+            value
+        } else {
+            read_object(c, selected.table, id, selected.model).await?
+        };
         let size = serde_json::to_vec(&value)?.len();
         if bytes + size > MAX_PAGE_BYTES {
             if items.is_empty() {

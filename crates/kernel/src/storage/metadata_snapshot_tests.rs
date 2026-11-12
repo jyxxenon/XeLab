@@ -775,3 +775,186 @@ async fn actual_postgres_raw_effect_proof_and_query_lease_copy_preserves_history
         "Metadata COPY is not physical recovery readiness"
     );
 }
+
+#[tokio::test]
+async fn actual_postgres_m5_admission_snapshot_round_trip_resets_execution_authority() {
+    // Workflow/task/schedule/micro/extension/batch admission metadata created
+    // through the public APIs are ordinary snapshot data. They must survive
+    // export and restore; executing authority must not.
+    let Some(f) = Fixture::new().await else {
+        return;
+    };
+    let mut source = f.app.db.connect().await.unwrap();
+    let owner: Uuid = source
+        .query_one("SELECT created_by FROM backups WHERE id=$1", &[&f.backup])
+        .await
+        .unwrap()
+        .get(0);
+    let delegation = Uuid::new_v4();
+    let workflow = Uuid::new_v4();
+    let task = Uuid::new_v4();
+    let step = Uuid::new_v4();
+    let attempt = Uuid::new_v4();
+    let schedule = Uuid::new_v4();
+    let micro = Uuid::new_v4();
+    let extension = Uuid::new_v4();
+    let installation = Uuid::new_v4();
+    let skill = Uuid::new_v4();
+    let batch = Uuid::new_v4();
+    source
+        .execute("INSERT INTO execution_delegations(id,subject_id,maximum_rules,run_as,expires_at,status,created_at) VALUES($1,$2,'[]','user',now()+interval '1 hour','active',now())",&[&delegation,&owner])
+        .await
+        .unwrap();
+    source
+        .execute("INSERT INTO workflows(id,owner_id,name,version,spec,status,created_at,updated_at) VALUES($1,$2,'snapshot source',1,'{}','active',now(),now())",&[&workflow,&owner])
+        .await
+        .unwrap();
+    source
+        .execute("INSERT INTO tasks(id,owner_id,workflow_id,delegation_id,input,deadline_at,state,admission,created_at,updated_at) VALUES($1,$2,$3,$4,'{}',now()+interval '1 hour','running','{\"version\":1}'::jsonb,now(),now())",&[&task,&owner,&workflow,&delegation])
+        .await
+        .unwrap();
+    source
+        .execute("INSERT INTO task_steps(id,task_id,step_key,state,attempt_count,fence,created_at,updated_at) VALUES($1,$2,'root','running',1,1,now(),now())",&[&step,&task])
+        .await
+        .unwrap();
+    source
+        .execute("INSERT INTO attempts(id,step_id,number,execution_id,idempotency_key,fence,lease_expires_at,state,created_at,updated_at) VALUES($1,$2,1,$3,'snapshot-attempt-key',1,now()+interval '30 seconds','running',now(),now())",&[&attempt,&step,&Uuid::new_v4()])
+        .await
+        .unwrap();
+    source
+        .execute("INSERT INTO schedules(id,owner_id,spec,delegation_id,next_fire_at,created_at,updated_at) VALUES($1,$2,'{}',$3,now()+interval '1 day',now(),now())",&[&schedule,&owner,&delegation])
+        .await
+        .unwrap();
+    source
+        .execute("INSERT INTO schedule_fires(schedule_id,scheduled_at,task_id,outcome) VALUES($1,now(),$2,'created')",&[&schedule,&task])
+        .await
+        .unwrap();
+    source
+        .execute("INSERT INTO micro_plugins(id,owner_id,name,display_name,status,created_at,updated_at) VALUES($1,$2,'snapshot-micro','snapshot micro','active',now(),now())",&[&micro,&owner])
+        .await
+        .unwrap();
+    source
+        .execute("INSERT INTO extension_plugins(id,owner_id,name,display_name,status,created_at,updated_at) VALUES($1,$2,'snapshot-extension','snapshot extension','active',now(),now())",&[&extension,&owner])
+        .await
+        .unwrap();
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(include_str!("../../tests/fixtures/secret-manifest.json")).unwrap();
+    let publisher: Uuid = source
+        .query_one("SELECT id FROM publishers ORDER BY id LIMIT 1", &[])
+        .await
+        .unwrap()
+        .get(0);
+    manifest["publisher_id"] = serde_json::json!(publisher);
+    let cap = manifest["capabilities"][0].clone();
+    let definition = serde_json::json!({"name":"org.xelab.echo-python.echo","version":"1.0.0","description":"Echo a bounded message","input_schema":cap["input_schema"],"output_schema":cap["output_schema"],"stream_item_schema":cap["stream_item_schema"],"target":{"kind":"capability","plugin_id":manifest["plugin_id"],"contract":cap["contract"]},"mapping":"identity","maximum_timeout_ms":30000,"input_blobs":false,"tags":[]});
+    manifest["skills"] = serde_json::json!([definition]);
+    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+    let hash = crate::contracts::digest(&manifest_bytes);
+    let plugin_id = manifest["plugin_id"].as_str().unwrap().to_owned();
+    let plugin_version = manifest["version"].as_str().unwrap().to_owned();
+    source
+        .execute("INSERT INTO installations(id,plugin_id,version,publisher_id,image_digest,manifest_digest,manifest,state,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$5,$6,'installed',now(),now())", &[&installation,&plugin_id,&plugin_version,&publisher,&hash,&manifest])
+        .await
+        .unwrap();
+    let contract = &cap["contract"];
+    let contract_name = contract["name"].as_str().unwrap().to_owned();
+    let contract_version = contract["version"].as_str().unwrap().to_owned();
+    let contract_digest = contract["schema_digest"].as_str().unwrap().to_owned();
+    source
+        .execute(
+            "INSERT INTO capability_contracts(name,version,schema_digest,spec) VALUES($1,$2,$3,$4)",
+            &[&contract_name, &contract_version, &contract_digest, &cap],
+        )
+        .await
+        .unwrap();
+    let definition_hash = crate::skills::definition_digest(&definition).unwrap();
+    let definition_name = definition["name"].as_str().unwrap().to_owned();
+    source
+        .execute("INSERT INTO skills(id,name,version,installation_id,created_by,definition,definition_digest,enabled,created_at,updated_at) VALUES($1,$2,'1.0.0',$3,$4,$5,$6,true,now(),now())", &[&skill,&definition_name,&installation,&owner,&definition,&definition_hash])
+        .await
+        .unwrap();
+    source
+        .execute("INSERT INTO skill_batches(id,owner_id,subject_id,delegation_id,skill_id,installation_id,definition_digest,state,request_spec,counts,total_items,max_parallel,failure_policy,run_as,deadline_at,created_at,updated_at) VALUES($1,$2,$2,$3,$4,$5,'sha256:'||repeat('4',64),'queued','{}','{\"queued\":1}'::jsonb,1,1,'stop','user',now()+interval '1 hour',now(),now())",&[&batch,&owner,&delegation,&skill,&installation])
+        .await
+        .unwrap();
+    source
+        .execute("INSERT INTO skill_batch_items(batch_id,item_id,item_index,input,input_digest,input_bytes,idempotency_key,state) VALUES($1,'1',0,'{}','sha256:'||repeat('5',64),2,'snapshot-item-key','queued')",&[&batch])
+        .await
+        .unwrap();
+    let mut bytes = Vec::new();
+    let summary = export_inner(&mut source, &mut bytes).await.unwrap();
+    let (db, mut destination, recovery) = target(f.backup).await;
+    assert!(db.check().await.is_err());
+    let restored = import_inner(
+        &mut destination,
+        &mut bytes.as_slice(),
+        &summary,
+        recovery,
+        owner,
+        PASSWORD,
+    )
+    .await
+    .unwrap();
+    assert_eq!(restored, summary);
+    let row = destination
+        .query_one(
+            "SELECT name,status FROM workflows WHERE id=$1",
+            &[&workflow],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, String>(0), "snapshot source");
+    assert_eq!(row.get::<_, String>(1), "active");
+    let row = destination
+        .query_one(
+            "SELECT t.state,t.admission->>'version',s.state,a.state FROM tasks t JOIN task_steps s ON s.task_id=t.id JOIN attempts a ON a.step_id=s.id WHERE t.id=$1",
+            &[&task],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, String>(0), "running");
+    assert_eq!(row.get::<_, String>(1), "1");
+    assert_eq!(row.get::<_, String>(2), "running");
+    assert_eq!(row.get::<_, String>(3), "running");
+    // Admission authority is revoked by the restore; the rows survive as data.
+    assert_eq!(
+        destination
+            .query_one(
+                "SELECT status FROM execution_delegations WHERE id=$1",
+                &[&delegation]
+            )
+            .await
+            .unwrap()
+            .get::<_, String>(0),
+        "revoked"
+    );
+    assert_eq!(
+        destination
+            .query_one(
+                "SELECT outcome FROM schedule_fires WHERE schedule_id=$1",
+                &[&schedule]
+            )
+            .await
+            .unwrap()
+            .get::<_, String>(0),
+        "created"
+    );
+    for table in ["micro_plugins", "extension_plugins", "skill_batches"] {
+        assert!(destination
+            .query_one(&format!("SELECT EXISTS(SELECT 1 FROM {table})"), &[])
+            .await
+            .unwrap()
+            .get::<_, bool>(0));
+    }
+    assert_eq!(
+        destination
+            .query_one(
+                "SELECT count(*) FROM skill_batch_items WHERE batch_id=$1 AND state='queued'",
+                &[&batch]
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        1
+    );
+}

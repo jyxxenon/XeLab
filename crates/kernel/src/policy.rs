@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use std::{
     collections::{BTreeSet, HashSet},
     net::IpAddr,
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
 use tokio_postgres::GenericClient;
 use uuid::Uuid;
@@ -341,6 +341,18 @@ impl<'a, C: GenericClient + Sync> Policy<'a, C> {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
+        let valid = self.live_grant_issuer_chains(&sources).await?;
+        Ok(paths
+            .into_iter()
+            .filter(|p| p.sources.iter().all(|id| valid.contains_key(id)))
+            .collect())
+    }
+
+    /// Return the validated credential chain for each live original grant issuer.
+    pub(crate) async fn live_grant_issuer_chains(
+        &self,
+        sources: &[Uuid],
+    ) -> Result<std::collections::HashMap<Uuid, Arc<[Uuid]>>> {
         let rows = self
             .c
             .query(
@@ -351,33 +363,30 @@ impl<'a, C: GenericClient + Sync> Policy<'a, C> {
         if rows.len() != sources.len() {
             return Err(Error::denied());
         }
-        let mut valid = HashSet::new();
-        let mut issuers: std::collections::HashMap<(Option<Uuid>, Uuid), bool> = Default::default();
+        let mut valid = std::collections::HashMap::new();
+        let mut issuers: std::collections::HashMap<_, Option<Arc<[Uuid]>>> = Default::default();
         for row in rows {
             let issuer: Option<Uuid> = row.get("issuer_credential_id");
             let owner: Uuid = row.get("issuer_id");
-            let allowed = if let Some(valid) = issuers.get(&(issuer, owner)) {
-                *valid
+            let chain = if let Some(chain) = issuers.get(&(issuer, owner)) {
+                chain.clone()
             } else {
-                let valid =
+                let chain =
                     match crate::auth::validate_sources(self.c, issuer, Some(owner), self.peer)
                         .await
                     {
-                        Ok(_) => true,
-                        Err(e) if e.code == "INVALID_CREDENTIAL" => false,
+                        Ok(credentials) => Some(Arc::from(credentials)),
+                        Err(e) if e.code == "INVALID_CREDENTIAL" => None,
                         Err(e) => return Err(e),
                     };
-                issuers.insert((issuer, owner), valid);
-                valid
+                issuers.insert((issuer, owner), chain.clone());
+                chain
             };
-            if allowed {
-                valid.insert(row.get::<_, Uuid>("id"));
+            if let Some(chain) = chain {
+                valid.insert(row.get::<_, Uuid>("id"), chain);
             }
         }
-        Ok(paths
-            .into_iter()
-            .filter(|p| p.sources.iter().all(|id| valid.contains(id)))
-            .collect())
+        Ok(valid)
     }
 
     async fn grant(&mut self, grant: Uuid, depth: usize) -> Result<Vec<Path>> {

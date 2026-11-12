@@ -64,6 +64,51 @@ class ShellVisual(unittest.TestCase):
                 "854px", "desktop fills the viewport below the menu bar in " + mode,
             )
 
+    def test_shell_stylesheets_are_linked_in_order(self):
+        self.open()
+        sheets = self.page.evaluate(
+            "() => [...document.styleSheets].map(sheet => (sheet.href || '').split('/').pop())")
+        self.assertEqual(sheets[:4], ["styles.css", "desktop.css", "components.css", "motion.css"])
+        for name in ("desktop.css", "components.css", "motion.css"):
+            status = self.page.evaluate("""async (name) => {
+              const response = await fetch('/ui/org.xelab.webui/' + name);
+              return {status: response.status, type: response.headers.get('content-type') || ''};
+            }""", name)
+            self.assertEqual(status["status"], 200, name)
+            self.assertIn("css", status["type"], name)
+        # The split must not change the cascade: shell and component rules still resolve.
+        self.assertEqual(self.style("#dock")["borderRadius"], "20px")
+        self.fixture.app("系统状态")
+        self.assertEqual(self.style(".window")["borderRadius"], "14px")
+
+    def test_index_referenced_assets_all_resolve(self):
+        self.open()
+        references = self.page.evaluate(
+            "() => [...document.querySelectorAll('link[rel=stylesheet], script[src]')]"
+            "  .map(element => element.getAttribute('href') || element.getAttribute('src'))")
+        self.assertGreaterEqual(len(references), 5)
+        missing = self.page.evaluate("""async (references) => {
+          const failed = [];
+          for (const reference of references) {
+            const response = await fetch(reference);
+            if (!response.ok) failed.push(reference + ':' + response.status);
+          }
+          return failed;
+        }""", references)
+        self.assertEqual(missing, [], "every stylesheet and script referenced by index.html must load")
+
+    def test_desktop_wallpaper_is_served_and_applied(self):
+        self.open()
+        background = self.style("#desktop")["backgroundImage"]
+        self.assertIn("wallpaper.svg", background)
+        status = self.page.evaluate("""async () => {
+          const response = await fetch('/ui/org.xelab.webui/wallpaper.svg');
+          return {status: response.status, type: response.headers.get('content-type') || ''};
+        }""")
+        self.assertEqual(status["status"], 200)
+        self.assertIn("svg", status["type"])
+        self.assertIn("cover", self.style("#desktop")["backgroundSize"])
+
     def test_reduced_transparency_removes_shell_blur(self):
         self.open()
         self.page.evaluate("() => document.documentElement.classList.add('reduced-transparency')")

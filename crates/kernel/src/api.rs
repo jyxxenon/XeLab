@@ -406,6 +406,8 @@ fn dispatch<'a>(
         }
         let (op, params) = operation(&method, path).ok_or_else(Error::not_found)?;
         let name = op["operationId"].as_str().unwrap();
+        crate::workflows::validate_query(name, uri.query().unwrap_or(""))?;
+        crate::tasks::validate_query(name, uri.query().unwrap_or(""))?;
         if name == "getLiveness" {
             return Ok((
                 json!({"status":"ok","spec_version":crate::SPEC_VERSION}),
@@ -676,6 +678,10 @@ fn dispatch<'a>(
         crate::deployments::execute(&tx,app,&ctx,name,&params,&body,&headers,uri.query().unwrap_or("")).await?
     } else if crate::skills::handles(name) {
         crate::skills::execute(&tx,&app.auth,&ctx,name,&params,&body,&headers,uri.query().unwrap_or("")).await?
+    } else if crate::workflows::handles(name) {
+        crate::workflows::execute(&tx,&app.auth,&ctx,name,&params,&body,&headers,uri.query().unwrap_or("")).await?
+    } else if crate::tasks::handles(name) {
+        crate::tasks::execute(&tx,&app.auth,&ctx,name,&params,&body,uri.query().unwrap_or("")).await?
     } else if crate::volumes::handles(name) {
         crate::volumes::execute(&tx,app,&ctx,name,&params,&body,&headers,uri.query().unwrap_or("" )).await?
     } else if crate::backups::handles(name) {
@@ -1046,6 +1052,12 @@ async fn authorize_operation(
     }
     if crate::skills::handles(name) {
         return crate::skills::authorize(c, ctx, name, params, body).await;
+    }
+    if crate::workflows::handles(name) {
+        return crate::workflows::authorize(c, ctx, name, params).await;
+    }
+    if crate::tasks::handles(name) {
+        return crate::tasks::authorize(c, ctx, name, params, body).await;
     }
     if secrets::handles(name) {
         return secrets::authorize(c, ctx, name, params, body).await;

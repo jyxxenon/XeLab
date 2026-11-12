@@ -112,9 +112,10 @@ class OverviewWindow(unittest.TestCase):
                    "access-control-expose-headers": "etag,x-request-id",
                    "etag": '"rev-1"', "x-request-id": ACCOUNT}
         if url.path in self.overview_status:
-            status, code = self.overview_status[url.path]
+            status, code, *detail = self.overview_status[url.path]
+            message = detail[0] if detail else "fixture overview failure"
             route.fulfill(status=status, headers=headers, content_type="application/json",
-                          body=json.dumps({"error": {"code": code, "message": "fixture overview failure", "retryable": False}}))
+                          body=json.dumps({"error": {"code": code, "message": message, "retryable": False}}))
             return
         if url.path == NODE_PATH:
             data = self.node_fixture
@@ -207,6 +208,38 @@ class OverviewWindow(unittest.TestCase):
         self.assertEqual(self.count(DEPLOYMENTS_PATH), 1)
         self.assertEqual(self.count(INSTANCES_PATH), 1)
         self.assertIn("当前不可用", self.section(window, "instances").inner_text())
+
+    def test_error_body_details_are_not_rendered(self):
+        secret = "TOKEN=do-not-render-7f3c9a"
+        self.overview_status[NODE_PATH] = (503, "NOT_READY", secret)
+        self.overview_status[INSTANCES_PATH] = (500, "INTERNAL_ERROR", secret)
+        self.open()
+        window = self.app("总览")
+        expect(self.section(window, "node").locator(".state[data-kind=unavailable]")).to_be_visible()
+        expect(self.section(window, "instances").locator(".state[data-kind=error]")).to_be_visible()
+        self.section(window, "deployments").locator(".card").wait_for()
+        text = window.inner_text()
+        self.assertNotIn(secret, text)
+        self.assertNotIn("fixture overview failure", text)
+        self.assertIn("NOT_READY", self.section(window, "node").inner_text())
+        self.assertIn("INTERNAL_ERROR", self.section(window, "instances").inner_text())
+
+    def test_pagination_error_body_details_are_not_rendered(self):
+        secret = "CURSOR=do-not-render-a81b2c"
+        self.deployment_pages = [{"items": [deployment_item()]},
+                                 {"items": [deployment_item(identifier=DEPLOYMENT_2, name="second page")]}]
+        self.open()
+        window = self.open_overview()
+        deployments = self.section(window, "deployments")
+        self.overview_status[DEPLOYMENTS_PATH] = (503, "NOT_READY", secret)
+        deployments.get_by_role("button", name="加载下一页部署").click()
+        expect(deployments.locator(".state[data-kind=unavailable]")).to_be_visible()
+        self.assertEqual(deployments.locator(".card").count(), 1)
+        text = deployments.inner_text()
+        self.assertNotIn(secret, text)
+        self.assertNotIn("fixture overview failure", text)
+        self.assertIn("NOT_READY", text)
+        self.assertIn("下一页读取失败；已加载内容保持不变。", deployments.locator(".overview-page-hint").inner_text())
 
     def test_empty_lists_have_their_own_state(self):
         self.deployment_pages = [{"items": []}]

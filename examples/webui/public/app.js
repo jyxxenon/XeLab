@@ -81,12 +81,21 @@ function state(kind, title, message = '') {
   return node('div', {class:'state', 'data-kind':kind, role:kind === 'loading' ? 'status' : 'note'}, node('h3', {}, title), node('p', {}, message));
 }
 function failure(error) {
-  if (error?.name === 'AbortError') return state('unavailable', '等待已停止', '关闭或刷新视图不会回滚已经接受的操作。请使用原请求键核实结果。');
-  const status = error.status ?? error.http_status;
+  // Core error bodies may contain request data or upstream diagnostics.
+  // Standard window failure states keep only a stable machine code and a
+  // fixed explanation for server errors, while displaying safe local validation messages.
+  const status = error?.status ?? error?.http_status;
+  const code = typeof error?.code === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(error.code) ? error.code : null;
+  if (error?.name === 'AbortError' || error?.code === 'CANCELED') {
+    return state('unavailable', '等待已停止', '关闭或刷新视图不会回滚已经接受的操作。请使用原请求键核实结果。');
+  }
   if (status === 401) return state('denied', '登录已失效', '请重新进入内核可信登录页面。');
-  if (status === 403) return state('denied', '无权限', `${error.code || 'PERMISSION_DENIED'} · 当前授权来源不允许此操作。`);
-  if ([404, 501, 503].includes(status)) return state('unavailable', '当前不可用', `${error.code || 'UNAVAILABLE'} · ${error.message || '接口、资源或依赖尚不可用。'}`);
-  return state('error', '请求失败', `${error.code || 'NETWORK_ERROR'} · ${error.message || '连接中断；副作用结果可能未知，请保留原请求键。'}`);
+  if (status === 403) return state('denied', '无权限', `${code || 'PERMISSION_DENIED'} · 当前授权来源不允许此操作。`);
+  if ([404, 501, 503].includes(status)) return state('unavailable', '当前不可用', `${code || 'UNAVAILABLE'} · 接口、资源或依赖尚不可用。`);
+  const isServer = status >= 500 || (error?.name === 'ApiError' && (status === 0 || status >= 500));
+  const fallback = '连接中断；副作用结果可能未知，请保留原请求键。';
+  const message = (!isServer && typeof error?.message === 'string' && error.message) ? error.message : fallback;
+  return state('error', '请求失败', `${code || 'NETWORK_ERROR'} · ${message}`);
 }
 function raw(value) { return node('pre', {class:'result'}, JSON.stringify(value, null, 2)); }
 function rows(value) { return Array.isArray(value?.items) ? value.items : Array.isArray(value) ? value : []; }
@@ -106,11 +115,11 @@ async function request(operation, options = {}) {
   } catch (error) {
     // ApiClient invalidates only the exact rejected access token. A late 401
     // from an old request must not destroy a newer explicit login.
-    if ((error.status ?? error.http_status) === 401 && !oauth.loggedIn) clearPrivateViews();
+    if ((error?.status ?? error?.http_status) === 401 && !oauth.loggedIn) clearPrivateViews();
     // A logout or credential invalidation may have cleared the private UI
     // while this request was in flight. Do not overwrite the new session's
     // connection state with the outcome of that earlier request.
-    if (epoch === sessionEpoch) $('#connection').textContent = (error.status ?? error.http_status) === 403 ? '当前请求无权限' : '请求未完成';
+    if (epoch === sessionEpoch) $('#connection').textContent = (error?.status ?? error?.http_status) === 403 ? '当前请求无权限' : '请求未完成';
     throw error;
   }
 }
@@ -347,15 +356,26 @@ async function listSection(win, {title,operation,params={},query={},actions=[],r
   const list = node('div',{class:'list'});
   const append = data => { for (const item of rows(data)) list.append(renderItem(item)); };
   append(result.data);
+  const pageError = node('div', {class:'list-page-error'});
   const more = button('加载下一页',async()=> {
     more.disabled = true;
-    try { const next = await request(operation,{params,query:{limit:50,...query,cursor:more.dataset.cursor},signal:win.controller.signal}); append(next.data); more.dataset.cursor=next.data.next_cursor||'';more.hidden=!next.data.next_cursor; }
-    catch(error) { list.append(failure(error)); } finally { more.disabled=false; }
-  });
+    try {
+      const next = await request(operation,{params,query:{limit:50,...query,cursor:more.dataset.cursor},signal:win.controller.signal});
+      if (!more.isConnected) return;
+      append(next.data);
+      pageError.replaceChildren();
+      more.dataset.cursor = next.data.next_cursor || '';
+      more.hidden = !next.data.next_cursor;
+    } catch(error) {
+      if (!more.isConnected) return;
+      pageError.replaceChildren(failure(error));
+    } finally {
+      if (more.isConnected) more.disabled = false;
+    }
+  }, {'aria-label':`加载下一页${title}`, hidden:!result.data.next_cursor});
   more.dataset.cursor = result.data.next_cursor || '';
-  more.hidden = !result.data.next_cursor;
   if (!list.childElementCount) list.append(state('empty','暂无可见项目','当前账户授权范围内没有记录。'));
-  win.content.replaceChildren(toolbar(win,title,...actions),list,more);
+  win.content.replaceChildren(toolbar(win,title,...actions),list,pageError,more);
 }
 
 async function plugins(win) {
@@ -756,6 +776,20 @@ function overviewNode(data) {
     ...(config.length ? [node('h4', {}, '内核与系统预留'), overviewFacts(config)] : []));
 }
 function overviewBadge(value, fallback) { return node('span', {class:'badge'}, typeof value === 'string' && value ? value : fallback); }
+function overviewFailure(error) {
+  // Core error bodies may contain request data or upstream diagnostics. The
+  // overview keeps only a stable machine code and a fixed explanation instead
+  // of echoing the server-provided message into the DOM.
+  const status = error?.status ?? error?.http_status;
+  const code = typeof error?.code === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(error.code) ? error.code : null;
+  if (error?.name === 'AbortError' || error?.code === 'CANCELED') {
+    return state('unavailable', '等待已停止', '刷新或关闭视图不会回滚已经接受的操作。');
+  }
+  if (status === 401) return state('denied', '登录已失效', '请重新进入内核可信登录页面。');
+  if (status === 403) return state('denied', '无权限', `${code || 'PERMISSION_DENIED'} · 当前授权来源不允许此操作。`);
+  if ([404, 501, 503].includes(status)) return state('unavailable', '当前不可用', `${code || 'UNAVAILABLE'} · 接口、资源或依赖尚不可用。`);
+  return state('error', '请求失败', `${code || 'NETWORK_ERROR'} · 连接中断；副作用结果可能未知，请保留原请求键。`);
+}
 function overviewDeployment(item) {
   const spec = item?.spec ?? {};
   const conditions = (Array.isArray(item?.conditions) ? item.conditions : []).filter(value => typeof value === 'string');
@@ -785,14 +819,16 @@ async function overviewPage(win, {operation, title, renderItem, emptyMessage}) {
     more.disabled = true;
     try {
       const next = await request(operation, {query:{limit:50, cursor:more.dataset.cursor}, signal:win.controller.signal});
+      if (!more.isConnected) return;
       for (const item of rows(next.data)) list.append(renderItem(item));
       more.dataset.cursor = next.data.next_cursor || '';
       more.hidden = !next.data.next_cursor;
       hint.textContent = next.data.next_cursor ? '仅显示当前已取到的项目；还有更多可加载。' : '已加载全部可见项目。';
     } catch (error) {
-      list.append(failure(error));
+      if (!more.isConnected) return;
+      list.append(overviewFailure(error));
       hint.textContent = '下一页读取失败；已加载内容保持不变。';
-    } finally { more.disabled = false; }
+    } finally { if (more.isConnected) more.disabled = false; }
   }, {'aria-label':`加载下一页${title}`, hidden:!result.data.next_cursor});
   more.dataset.cursor = result.data.next_cursor || '';
   return node('div', {}, list, more, hint);
@@ -822,7 +858,7 @@ function overviewSection(win, {key, title, source, load}) {
     } catch (error) {
       if (current !== sequence || !section.isConnected) return;
       readAt.textContent = '读取失败';
-      body.replaceChildren(failure(error));
+      body.replaceChildren(overviewFailure(error));
     } finally {
       if (current === sequence && section.isConnected) refresh.disabled = false;
     }

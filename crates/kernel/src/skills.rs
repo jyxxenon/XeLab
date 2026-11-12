@@ -377,7 +377,23 @@ pub(crate) async fn resolve_for_invoke(
     ctx: &Context,
     skill: Uuid,
 ) -> Result<ResolvedSkill> {
-    resolve_for_invoke_inner(c, ctx, skill, None).await
+    resolve_live(c, ctx, skill, "skill.invoke", None).await
+}
+
+pub(crate) async fn resolve_for_workflow(
+    c: &(impl GenericClient + Sync),
+    ctx: &Context,
+    skill: Uuid,
+) -> Result<ResolvedSkill> {
+    resolve_live(c, ctx, skill, "skill.read", None)
+        .await
+        .map_err(|error| {
+            if error.code == "PERMISSION_DENIED" {
+                Error::not_found()
+            } else {
+                error
+            }
+        })
 }
 
 pub(crate) async fn resolve_http_for_invoke(
@@ -387,13 +403,14 @@ pub(crate) async fn resolve_http_for_invoke(
     authority: &auth::CurrentAuthority<'_, '_>,
 ) -> Result<ResolvedSkill> {
     authority.verify(c, ctx)?;
-    resolve_for_invoke_inner(c, ctx, skill, Some(authority)).await
+    resolve_live(c, ctx, skill, "skill.invoke", Some(authority)).await
 }
 
-async fn resolve_for_invoke_inner(
+async fn resolve_live(
     c: &(impl GenericClient + Sync),
     ctx: &Context,
     skill: Uuid,
+    action: &str,
     authority: Option<&auth::CurrentAuthority<'_, '_>>,
 ) -> Result<ResolvedSkill> {
     let row = c
@@ -404,9 +421,9 @@ async fn resolve_for_invoke_inner(
     let resource = Resource::new("skill", skill, Some(owner));
     if let Some(authority) = authority {
         // The concrete transaction was verified by resolve_http_for_invoke.
-        authority.require_context(ctx, "skill.invoke", &resource)?;
+        authority.require_context(ctx, action, &resource)?;
     } else {
-        auth::authorize(c, ctx, "skill.invoke", &resource).await?;
+        auth::authorize(c, ctx, action, &resource).await?;
     }
     if !row.get::<_, bool>("enabled")
         || row.get::<_, Option<DateTime<Utc>>>("archived_at").is_some()
