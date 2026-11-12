@@ -379,6 +379,7 @@ mod tests {
         };
         let variants: &[(&str, &[&str], bool)] = &[
             ("rust-default", &[], false),
+            ("cpp-default", &["--implementation", "cpp"], false),
             ("rust-upgrade", &["--plugin-version", "2.0.0"], false),
             (
                 "rust-failed-upgrade",
