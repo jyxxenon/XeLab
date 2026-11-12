@@ -85,6 +85,13 @@ enum Decision<'tx, 'db> {
     Ready(Box<Candidate<'tx, 'db>>),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Attempt {
+    Initial,
+    Preview,
+    Admit,
+}
+
 impl Request<'_> {
     pub(super) async fn admit(&self) -> Result<Admission> {
         validate(
@@ -130,18 +137,26 @@ impl Request<'_> {
             let mut c = timeout_at(until, self.app.db.connect_scoped(until - now))
                 .await
                 .map_err(|_| expired())??;
-            let preview = std::mem::take(&mut enqueue)
-                || std::mem::take(&mut inspect_queue)
+            let initial = std::mem::take(&mut inspect_queue);
+            let attempt = if std::mem::take(&mut enqueue)
+                || initial
                     && timeout_at(until, self.queue_busy(&*c))
                         .await
                         .map_err(|_| expired())?
-                        .unwrap_or(false);
+                        .unwrap_or(false)
+            {
+                Attempt::Preview
+            } else if initial {
+                Attempt::Initial
+            } else {
+                Attempt::Admit
+            };
             let tx = timeout_at(until, c.transaction())
                 .await
                 .map_err(|_| expired())??;
             let decision = timeout_at(
                 until,
-                self.prepare(&tx, &mut waiting, &path, &fingerprint, input_bytes, preview),
+                self.prepare(&tx, &mut waiting, &path, &fingerprint, input_bytes, attempt),
             )
             .await
             .map_err(|_| expired())??;
@@ -335,7 +350,7 @@ impl Request<'_> {
         path: &str,
         fingerprint: &str,
         input_bytes: usize,
-        preview: bool,
+        attempt: Attempt,
     ) -> Result<Decision<'tx, 'db>> {
         let app = self.app;
         if waiting.is_some() {
@@ -344,9 +359,16 @@ impl Request<'_> {
         let front = waiting
             .as_ref()
             .is_none_or(|waiter| waiter.ticket.is_head());
+        let preview = attempt == Attempt::Preview;
         let can_admit = front && !preview;
         if can_admit {
             db::call_lock(tx).await?;
+            if attempt == Attempt::Initial && self.queue_busy(tx).await.unwrap_or(false) {
+                // Another admission may have filled the last slot while this
+                // request waited for the ledger. Authorize its wait in a new
+                // transaction so active Calls can settle in the meantime.
+                return Ok(Decision::Enqueue);
+            }
         } else {
             // Waiting-only work checks live binding and authority without
             // serializing behind the durable Call ledger.
