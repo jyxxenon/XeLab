@@ -166,7 +166,7 @@ async fn installed_candidate(
     candidate_binding(c, installation, &manifest, definition).await
 }
 
-async fn candidate_binding(
+pub(crate) async fn candidate_binding(
     c: &(impl GenericClient + Sync),
     installation: Uuid,
     manifest: &Value,

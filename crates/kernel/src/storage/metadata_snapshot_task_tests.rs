@@ -202,6 +202,9 @@ async fn record_dispatch(
         .await
         .unwrap();
     if let Some(output) = output {
+        task_engine::mark_broker_dispatch(&tx, lease, call)
+            .await
+            .unwrap();
         let result = json!({"call_id":call,"provider_instance_id":provider.instance,"contract":contract,
             "skill_id":skill.id,"skill_definition_digest":skill.definition_digest,
             "output":output,"completed_at":chrono::Utc::now()});

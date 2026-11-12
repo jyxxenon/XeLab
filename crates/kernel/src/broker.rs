@@ -58,6 +58,11 @@ enum CallSource<'a> {
     Task(&'a Lease),
 }
 
+enum CallCheck<'a> {
+    BeforeDispatch(CallSource<'a>),
+    Observe(CallSource<'a>),
+}
+
 impl<'a> CallSource<'a> {
     fn token(self) -> Option<&'a str> {
         match self {
@@ -756,9 +761,15 @@ fn invoke_inner<'a>(
                 input_json: bytes,
                 binding_id: String::new(),
             });
-            if protected {
+            if protected || matches!(origin, CallSource::Task(_)) {
                 check_live_call_for_source(
-                    app, origin, request_id, call, instance, generation, deadline,
+                    app,
+                    CallCheck::BeforeDispatch(origin),
+                    request_id,
+                    call,
+                    instance,
+                    generation,
+                    deadline,
                 )
                 .await?;
             }
@@ -788,7 +799,13 @@ fn invoke_inner<'a>(
                                 validate_business(&skill.definition["stream_item_schema"], &item)?;
                             }
                             check_live_call_for_source(
-                                app, origin, request_id, call, instance, generation, deadline,
+                                app,
+                                CallCheck::Observe(origin),
+                                request_id,
+                                call,
+                                instance,
+                                generation,
+                                deadline,
                             )
                             .await?;
                             output.emit("item", item).await?;
@@ -855,7 +872,13 @@ fn invoke_inner<'a>(
                 // execution may own a short shared authorization transaction when
                 // a revocation writer queues ahead of this next reader.
                 check_live_call_for_source(
-                    app, origin, request_id, call, instance, generation, deadline,
+                    app,
+                    CallCheck::Observe(origin),
+                    request_id,
+                    call,
+                    instance,
+                    generation,
+                    deadline,
                 )
                 .await?;
             }
@@ -951,7 +974,7 @@ async fn race_live_call<T>(
 
 async fn check_live_call_for_source(
     app: &App,
-    origin: CallSource<'_>,
+    phase: CallCheck<'_>,
     request_id: Uuid,
     call: Uuid,
     instance: Uuid,
@@ -959,6 +982,10 @@ async fn check_live_call_for_source(
     deadline: chrono::DateTime<chrono::Utc>,
 ) -> Result<()> {
     crate::skill_streams::ensure_active(app)?;
+    let (origin, dispatch_task) = match phase {
+        CallCheck::BeforeDispatch(source @ CallSource::Task(lease)) => (source, Some(lease)),
+        CallCheck::BeforeDispatch(source) | CallCheck::Observe(source) => (source, None),
+    };
     let mut connection = app
         .db
         .connect_scoped(
@@ -1025,6 +1052,12 @@ async fn check_live_call_for_source(
         .get(0);
     crate::dependencies::check_call(&check, call).await?;
     crate::dependencies::check_ready(&check, app, deployment).await?;
+    if let Some(lease) = dispatch_task {
+        // A Task may enter its transport only after this irreversible gate
+        // commits. Observation and stream delivery never advance the gate.
+        crate::skill_streams::ensure_active(app)?;
+        task_engine::mark_broker_dispatch(&check, lease, call).await?;
+    }
     check.commit().await?;
     crate::skill_streams::ensure_active(app)?;
     Ok(())
@@ -1151,6 +1184,38 @@ pub(crate) async fn reserve_business(
         });
     }
     Ok((accounts, charged))
+}
+
+/// Record cancellation under the call ledger lock. Uncertain physical work
+/// retains its reservation until the Controller confirms the process stopped.
+pub(crate) async fn request_cancellation(
+    tx: &tokio_postgres::Transaction<'_>,
+    calls: &[Uuid],
+) -> Result<()> {
+    let error = Error::new(
+        "CANCELED",
+        "Call cancellation was requested; physical outcome remains unknown",
+        axum::http::StatusCode::CONFLICT,
+    )
+    .detail();
+    tx.execute(
+        "UPDATE calls SET state='unknown',error=$2 WHERE id=ANY($1) AND state IN ('accepted','running')",
+        &[&calls, &error],
+    )
+    .await?;
+    tx.execute(
+        "UPDATE rpc_delegations SET status='revoked' WHERE status='active'
+         AND call_id IN (SELECT id FROM calls WHERE id=ANY($1) AND state='unknown')",
+        &[&calls],
+    )
+    .await?;
+    tx.execute(
+        "UPDATE execution_delegations SET status='revoked' WHERE status='active'
+         AND id IN (SELECT delegation_id FROM calls WHERE id=ANY($1) AND state='unknown')",
+        &[&calls],
+    )
+    .await?;
+    Ok(())
 }
 
 /// A transport failure never proves physical completion. Only confirmed results

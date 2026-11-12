@@ -155,6 +155,7 @@ pub(crate) async fn reset_rows(
     c.execute("UPDATE operations SET state='failed',error=$1,revision=revision+1,updated_at=now() WHERE state IN ('pending','running','cancel_requested')",&[&unknown]).await?;
     c.execute("UPDATE reservations SET status='released'", &[])
         .await?;
+    crate::task_engine::finish_stopped_cancellations(c).await?;
     c.execute("UPDATE node_budget SET admission_enabled=false,reserved_cpu_millis=0,reserved_memory_bytes=0,revision=revision+1,updated_at=now()",&[]).await?;
     c.execute("UPDATE quotas SET concurrent_calls_used=0,api_keys_used=0,revision=revision+1,updated_at=now()",&[]).await?;
     c.execute("DELETE FROM idempotency_records", &[]).await?;
@@ -232,7 +233,7 @@ pub(crate) async fn ensure_task_authority_reset(c: &(impl GenericClient + Sync))
     let active: bool = c
         .query_one(
             "SELECT EXISTS(SELECT 1 FROM attempts WHERE state IN ('leased','running'))
-               OR EXISTS(SELECT 1 FROM tasks WHERE state IN ('queued','running','waiting_dependency'))
+               OR EXISTS(SELECT 1 FROM tasks WHERE state IN ('queued','running','waiting_dependency','cancel_requested'))
                OR EXISTS(SELECT 1 FROM tasks t JOIN execution_delegations e ON e.id=t.delegation_id
                          WHERE e.status='active')",
             &[],

@@ -71,8 +71,19 @@ def build(root, publisher, platform="linux/amd64", plugin_version="1.0.0", inclu
             "mapping": "identity", "maximum_timeout_ms": 10000, "input_blobs": False, "tags": ["http", method],
         })
     if include_rpc:
+        manifest["config_schema"]["properties"] = {"test_hold_receipt": {"const": True}}
+        hold = contract["paths"]["/plugins/" + PLUGIN_ID + "/hold"]["post"]
+        input_schema = hold["requestBody"]["content"]["application/json"]["schema"]
+        manifest["skills"].append({
+            "name": PLUGIN_ID + ".hold", "version": plugin_version,
+            "description": "Hold a signed HTTP request for the OCI cancellation test",
+            "input_schema": input_schema,
+            "output_schema": hold["responses"]["200"]["content"]["application/json"]["schema"],
+            "stream_item_schema": None,
+            "target": {"kind": "http", "plugin_id": PLUGIN_ID, "http_operation_id": hold["operationId"], "http_contract_digest": digest},
+            "mapping": "identity", "maximum_timeout_ms": 10000, "input_blobs": False, "tags": ["http"],
+        })
         name, version = PLUGIN_ID + ".rpc", "1.0.0"
-        input_schema = contract["paths"]["/plugins/" + PLUGIN_ID + "/hold"]["post"]["requestBody"]["content"]["application/json"]["schema"]
         output_schema = operation["responses"]["200"]["content"]["application/json"]["schema"]
         directory = root / "xelab" / "contracts" / name / version
         directory.mkdir(parents=True, exist_ok=True)

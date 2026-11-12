@@ -14,6 +14,7 @@ import os
 import pathlib
 import socket
 import ssl
+import tempfile
 import threading
 import time
 import uuid
@@ -22,6 +23,7 @@ import uuid
 PLUGIN_ID = "org.xelab.http-echo"
 BUSINESS_PATH = "/plugins/" + PLUGIN_ID + "/echo"
 HOLD_PATH = "/plugins/" + PLUGIN_ID + "/hold"
+HOLD_RECEIPT = pathlib.Path("/tmp/xelab-http-hold-receipt")
 EVENTS_PATH = "/plugins/" + PLUGIN_ID + "/events"
 READ_PATH = "/plugins/" + PLUGIN_ID + "/read"
 CREATED_PATH = "/plugins/" + PLUGIN_ID + "/created"
@@ -64,16 +66,31 @@ class State:
         self.initialized = False
         self.draining = False
         self.active = 0
+        self.hold_receipt = None
         self.slots = threading.BoundedSemaphore(4)
 
     def ready(self):
         with self.lock:
             return self.initialized and not self.draining
 
-    def initialize(self):
+    def initialize(self, hold_receipt=None):
         with self.lock:
             self.initialized = True
             self.draining = False
+            self.hold_receipt = hold_receipt
+
+    def record_hold(self, call_id):
+        with self.lock:
+            receipt = self.hold_receipt
+        if receipt is not None:
+            # Publish a single UUID to the opt-in test's private tmpfs.
+            with tempfile.NamedTemporaryFile(dir=receipt.parent, delete=False) as pending:
+                try:
+                    pending.write(call_id.encode("ascii"))
+                    pending.flush()
+                    os.replace(pending.name, receipt)
+                finally:
+                    pathlib.Path(pending.name).unlink(missing_ok=True)
 
     def drain(self):
         with self.lock:
@@ -288,6 +305,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except (ValueError, UnicodeError, socket.timeout):
                 self.error(400, "INVALID_REQUEST")
                 return
+            if self.path == HOLD_PATH:
+                try:
+                    self.server.state.record_hold(context[0])
+                except OSError:
+                    self.error(503, "UNAVAILABLE")
+                    return
             # Actual business work: parse and return exactly the submitted text.
             # Delegation and subject are never reflected in the response body.
             if self.path == EVENTS_PATH:

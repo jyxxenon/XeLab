@@ -13,7 +13,15 @@ use tokio_postgres::{Row, Transaction};
 use uuid::Uuid;
 
 mod authority;
+mod cancellation;
 mod input;
+mod recovery;
+mod recovery_evidence;
+mod retry;
+
+pub(crate) use cancellation::{cancel_task, finish_cancellations, finish_stopped_cancellations};
+pub(crate) use recovery::{resolve_unknown, validate_resolution_history};
+pub(crate) use retry::retry_task;
 
 const LEASE: Duration = Duration::seconds(30);
 pub(crate) const MAX_STEP_JSON_BYTES: usize = 4 * 1024 * 1024;
@@ -23,6 +31,15 @@ const STEP_QUERY: &str = "SELECT t.*,w.spec,w.owner_id AS workflow_owner_id,
     e.expires_at AS delegation_expires_at,e.run_as AS delegation_run_as,e.maximum_rules
     FROM tasks t JOIN task_steps s ON s.task_id=t.id JOIN workflows w ON w.id=t.workflow_id
     JOIN execution_delegations e ON e.id=t.delegation_id";
+const IDLE_DEADLINE_DUE: &str = "t.admission IS NOT NULL
+    AND t.state IN ('queued','running','waiting_dependency') AND t.deadline_at<=statement_timestamp()
+    AND NOT EXISTS (
+        SELECT 1 FROM task_steps s WHERE s.task_id=t.id AND (
+            s.state IN ('running','unknown') OR EXISTS (
+                SELECT 1 FROM attempts a WHERE a.step_id=s.id AND a.state IN ('leased','running')
+            )
+        )
+    )";
 const ACTIVE_ATTEMPTS: &str = "SELECT t.id,t.state,t.deadline_at,w.spec,s.id AS step_id,s.step_key,
     s.attempt_count,s.state AS step_state,s.fence AS step_fence,a.fence AS attempt_fence,
     a.id AS attempt_id,a.state AS attempt_state,a.lease_expires_at,a.broker_call_id
@@ -269,7 +286,7 @@ pub(crate) async fn record_broker_call(
         ));
     }
     let updated = tx.execute(
-        "UPDATE attempts a SET broker_call_id=c.id,revision=a.revision+1,updated_at=clock_timestamp()
+        "UPDATE attempts a SET broker_call_id=c.id,dispatch_started=false,revision=a.revision+1,updated_at=clock_timestamp()
          FROM calls c JOIN instances i ON i.id=c.provider_instance_id
          JOIN deployments d ON d.id=i.deployment_id JOIN installations n ON n.id=d.installation_id
          JOIN task_steps s ON s.provider_deployment_id=d.id
@@ -308,6 +325,33 @@ pub(crate) async fn record_broker_call(
     Ok(())
 }
 
+/// Cross the dispatch barrier in the Broker's final authorization transaction.
+/// The caller holds the call ledger and Task locks.
+pub(crate) async fn mark_broker_dispatch(
+    tx: &Transaction<'_>,
+    lease: &Lease,
+    call: Uuid,
+) -> Result<()> {
+    let updated = tx.execute(
+        "UPDATE attempts a SET dispatch_started=true,revision=a.revision+1,updated_at=clock_timestamp()
+         FROM task_steps s JOIN tasks t ON t.id=s.task_id JOIN execution_delegations e ON e.id=t.delegation_id,
+              calls c
+         WHERE a.id=$1 AND a.broker_call_id=$2 AND c.id=$2 AND a.dispatch_started IS FALSE
+           AND a.step_id=s.id AND s.id=$3 AND s.fence=a.fence AND a.fence=$4
+           AND t.id=$5 AND a.execution_id=$6 AND a.idempotency_key=$7
+           AND a.state='running' AND s.state='running' AND t.state='running' AND c.state='running'
+           AND e.status='active'
+           AND LEAST(a.lease_expires_at,t.deadline_at,e.expires_at,c.deadline_at)>clock_timestamp()",
+        &[&lease.attempt_id,&call,&lease.step_id,&lease.fence,&lease.task_id,&lease.execution_id,&lease.idempotency_key],
+    ).await?;
+    if updated != 1 {
+        return Err(Error::conflict(
+            "Task Call cannot cross the dispatch barrier",
+        ));
+    }
+    Ok(())
+}
+
 /// Recreate exact Task authority for one transaction on an admitted Call.
 pub(crate) async fn authorize_broker_call(
     tx: &Transaction<'_>,
@@ -330,18 +374,29 @@ pub(crate) async fn authorize_broker_call(
 }
 
 /// Inspect durable settlement even if the dispatch future lost its response.
-pub(crate) async fn broker_call(
-    tx: &Transaction<'_>,
-    lease: &Lease,
-) -> Result<Option<(Uuid, String, Option<Value>)>> {
-    let active = load(tx, lease).await?;
+pub(crate) async fn broker_call(tx: &Transaction<'_>, lease: &Lease) -> Result<WorkerCall> {
+    let row = lock_step(tx, lease).await?;
+    if matches!(row.get::<_, &str>("state"), "cancel_requested" | "canceled") {
+        return Ok(WorkerCall::Canceled);
+    }
+    let active = load_attempt(tx, lease, row).await?;
     let Some(call) = active.broker_call_id else {
-        return Ok(None);
+        return Ok(WorkerCall::Unlinked);
     };
     let row = tx
         .query_one("SELECT state,result FROM calls WHERE id=$1", &[&call])
         .await?;
-    Ok(Some((call, row.get("state"), row.get("result"))))
+    Ok(WorkerCall::Linked(
+        call,
+        row.get("state"),
+        row.get("result"),
+    ))
+}
+
+pub(crate) enum WorkerCall {
+    Canceled,
+    Unlinked,
+    Linked(Uuid, String, Option<Value>),
 }
 
 /// A revoked or expired credential can close a lease that never admitted a Call.
@@ -452,12 +507,18 @@ impl Active {
 }
 
 async fn load(tx: &Transaction<'_>, lease: &Lease) -> Result<Active> {
+    load_attempt(tx, lease, lock_step(tx, lease).await?).await
+}
+
+async fn lock_step(tx: &Transaction<'_>, lease: &Lease) -> Result<Row> {
     db::auth_lock(tx, false).await?;
     let query = format!("{STEP_QUERY} WHERE t.id=$1 AND s.id=$2 FOR UPDATE OF t,s");
-    let row = tx
-        .query_opt(&query, &[&lease.task_id, &lease.step_id])
+    tx.query_opt(&query, &[&lease.task_id, &lease.step_id])
         .await?
-        .ok_or_else(Error::not_found)?;
+        .ok_or_else(Error::not_found)
+}
+
+async fn load_attempt(tx: &Transaction<'_>, lease: &Lease, row: Row) -> Result<Active> {
     if row.get::<_, i64>("step_fence") != lease.fence {
         return Err(Error::conflict("Task step fence changed"));
     }
@@ -677,7 +738,7 @@ async fn promote_dependents(
 pub async fn expire(tx: &Transaction<'_>) -> Result<bool> {
     db::auth_lock(tx, false).await?;
     let query = format!(
-        "{ACTIVE_ATTEMPTS} AND a.lease_expires_at<=clock_timestamp()
+        "{ACTIVE_ATTEMPTS} AND a.lease_expires_at<=statement_timestamp()
            AND s.state='running' AND s.fence=a.fence
          ORDER BY a.lease_expires_at,a.id LIMIT 1 FOR UPDATE OF t,s,a SKIP LOCKED"
     );
@@ -693,7 +754,8 @@ pub async fn expire(tx: &Transaction<'_>) -> Result<bool> {
 }
 
 /// Close old attempts after positive runtime stop or on the isolated restore
-/// target. The caller holds the offline and exclusive authorization fences.
+/// target. The caller holds the startup leader and Call lock, or the offline
+/// and exclusive authorization fences.
 pub(crate) async fn reconcile_stopped(tx: &Transaction<'_>) -> Result<()> {
     let query = format!("{ACTIVE_ATTEMPTS} ORDER BY t.id,s.id,a.id LIMIT 64 FOR UPDATE OF t,s,a");
     let mut previous_task = None;
@@ -727,6 +789,7 @@ async fn settle_inactive_attempt(
     let task = row.get("id");
     let step = row.get("step_id");
     let attempt = row.get("attempt_id");
+    let task_state: &str = row.get("state");
     let call: Option<Uuid> = row.get("broker_call_id");
     if row.get::<_, String>("attempt_state") == "running" || call.is_some() {
         set_attempt(tx, attempt, "unknown", now).await?;
@@ -742,16 +805,19 @@ async fn settle_inactive_attempt(
             reason
         };
         if !matches!(
-            row.get::<_, String>("state").as_str(),
-            "succeeded" | "failed" | "canceled"
+            task_state,
+            "succeeded" | "failed" | "cancel_requested" | "canceled"
         ) {
             set_task(tx, task, "unknown", None, Some(reason.detail())).await?;
         }
         step_event(tx, task, step, attempt, "unknown").await?;
     } else {
-        let spec = step_spec(row, &row.get::<_, String>("step_key"))?;
         set_attempt(tx, attempt, "expired", now).await?;
-        let task_state: String = row.get("state");
+        if matches!(task_state, "cancel_requested" | "canceled") {
+            set_step(tx, step, "canceled", None, now).await?;
+            return step_event(tx, task, step, attempt, "canceled").await;
+        }
+        let spec = step_spec(row, row.get("step_key"))?;
         if task_state == "running"
             && row.get::<_, DateTime<Utc>>("deadline_at") > now
             && row.get::<_, i32>("attempt_count") < maximum_attempts(&spec)
@@ -771,6 +837,38 @@ async fn settle_inactive_attempt(
         }
     }
     Ok(())
+}
+
+/// Close a bounded batch of Tasks whose deadline elapsed without active or
+/// uncertain work. The existing step results and Broker ledger stay intact.
+pub async fn expire_idle(tx: &Transaction<'_>) -> Result<u64> {
+    db::auth_lock(tx, false).await?;
+    let select = format!(
+        "SELECT t.id FROM tasks t WHERE {IDLE_DEADLINE_DUE}
+         ORDER BY t.deadline_at,t.id LIMIT 16 FOR UPDATE OF t SKIP LOCKED"
+    );
+    let tasks: Vec<Uuid> = tx
+        .query(&select, &[])
+        .await?
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    if tasks.is_empty() {
+        return Ok(0);
+    }
+
+    // A claim or completion may have committed after selection took its
+    // snapshot. Recheck the Task and its steps under the acquired Task locks.
+    let update = format!(
+        "UPDATE tasks t SET state='failed',error=$2,revision=revision+1,updated_at=clock_timestamp()
+         WHERE t.id=ANY($1) AND {IDLE_DEADLINE_DUE}"
+    );
+    let error = Error::new(
+        "DEADLINE_EXCEEDED",
+        "Task deadline elapsed with no active step",
+        axum::http::StatusCode::GATEWAY_TIMEOUT,
+    );
+    Ok(tx.execute(&update, &[&tasks, &error.detail()]).await?)
 }
 
 async fn set_attempt(
@@ -811,7 +909,8 @@ async fn set_live_attempt(
 ) -> Result<()> {
     let updated = tx
         .execute(
-            "UPDATE attempts SET state=$2,revision=revision+1,updated_at=$3
+            "UPDATE attempts SET state=$2,revision=revision+1,updated_at=$3,
+                pre_dispatch_failure=($2='failed' AND state='leased' AND broker_call_id IS NULL)
          WHERE id=$1 AND LEAST(lease_expires_at,$4::timestamptz)>clock_timestamp()",
             &[&attempt, &state, &now, &deadline],
         )

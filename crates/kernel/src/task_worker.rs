@@ -3,7 +3,7 @@ use crate::{
     api::App,
     broker,
     error::{Error, Result},
-    task_engine::{self, Lease, Outcome},
+    task_engine::{self, Lease, Outcome, WorkerCall},
 };
 use axum::http::StatusCode;
 use serde_json::Value;
@@ -20,8 +20,27 @@ const HEARTBEAT: Duration = Duration::from_secs(10);
 const METADATA_BUDGET: Duration = Duration::from_secs(5);
 
 pub(crate) async fn run(app: Arc<App>) {
-    while !stopping(&app) {
-        match run_once(&app).await {
+    tokio::join!(reconcile(&app), dispatch(&app));
+}
+
+async fn reconcile(app: &App) {
+    while !stopping(app) {
+        if let Err(error) = bounded(reconcile_once(app)).await {
+            tracing::warn!(reason_code = error.code, "Task reconciliation failed");
+        }
+        if let Err(error) = bounded(reconcile_cancellations_once(app)).await {
+            tracing::warn!(
+                reason_code = error.code,
+                "Task cancellation reconciliation failed"
+            );
+        }
+        time::sleep(IDLE_DELAY).await;
+    }
+}
+
+async fn dispatch(app: &App) {
+    while !stopping(app) {
+        match dispatch_once(app).await {
             Ok(true) => continue,
             Ok(false) => (),
             Err(error) => tracing::warn!(reason_code = error.code, "Task worker iteration failed"),
@@ -30,7 +49,14 @@ pub(crate) async fn run(app: Arc<App>) {
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn run_once(app: &App) -> Result<bool> {
+    bounded(reconcile_once(app)).await?;
+    bounded(reconcile_cancellations_once(app)).await?;
+    dispatch_once(app).await
+}
+
+async fn dispatch_once(app: &App) -> Result<bool> {
     if !ready(app) {
         return Ok(false);
     }
@@ -72,19 +98,44 @@ async fn next_lease(app: &App) -> Result<Option<Lease>> {
     if !ready(app) {
         return Ok(None);
     }
-    task_engine::expire(&tx).await?;
-    tx.commit().await?;
-
-    let tx = connection.transaction().await?;
-    if !ready(app) {
-        return Ok(None);
-    }
     let lease = task_engine::claim_broker(&tx, &app.auth).await?;
     if !ready(app) {
         return Ok(None);
     }
     tx.commit().await?;
     Ok(lease)
+}
+
+async fn reconcile_once(app: &App) -> Result<()> {
+    if !ready(app) {
+        return Ok(());
+    }
+    let mut connection = app.db.connect_scoped(METADATA_BUDGET).await?;
+    let tx = connection.transaction().await?;
+    if !ready(app) {
+        return Ok(());
+    }
+    task_engine::expire(&tx).await?;
+    task_engine::expire_idle(&tx).await?;
+    if !ready(app) {
+        return Ok(());
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn reconcile_cancellations_once(app: &App) -> Result<()> {
+    if !ready(app) {
+        return Ok(());
+    }
+    let mut connection = app.db.connect_scoped(METADATA_BUDGET).await?;
+    let tx = connection.transaction().await?;
+    task_engine::finish_cancellations(&tx).await?;
+    if !ready(app) {
+        return Ok(());
+    }
+    tx.commit().await?;
+    Ok(())
 }
 
 async fn heartbeat(app: &App, lease: &Lease) {
@@ -126,18 +177,21 @@ async fn finish(app: &App, lease: &Lease, invocation: Result<Value>) -> Result<(
         return Ok(());
     }
     let outcome = match task_engine::broker_call(&tx, lease).await? {
-        Some((call, state, result)) => Some(match durable_output(call, &state, result) {
-            Some(output) => Outcome::Succeeded(output),
-            None => Outcome::Unknown(
-                Error::new(
-                    "OUTCOME_UNKNOWN",
-                    "Task Call has no confirmed result",
-                    StatusCode::CONFLICT,
-                )
-                .with_resource(call),
-            ),
-        }),
-        None => match invocation {
+        WorkerCall::Canceled => return Ok(()),
+        WorkerCall::Linked(call, state, result) => {
+            Some(match durable_output(call, &state, result) {
+                Some(output) => Outcome::Succeeded(output),
+                None => Outcome::Unknown(
+                    Error::new(
+                        "OUTCOME_UNKNOWN",
+                        "Task Call has no confirmed result",
+                        StatusCode::CONFLICT,
+                    )
+                    .with_resource(call),
+                ),
+            })
+        }
+        WorkerCall::Unlinked => match invocation {
             // Transient admission failures leave an undispatched lease for
             // expiry to reconcile under the Task's existing attempt budget.
             Err(error)

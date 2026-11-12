@@ -1,6 +1,9 @@
 //! Exercised by the real signed OCI HTTP test, never a standalone metadata mock.
 use super::*;
 
+mod task_cancel;
+pub(super) use task_cancel::cancel_and_restart_hold_tasks;
+
 async fn register(
     router: &Router,
     token: &str,
