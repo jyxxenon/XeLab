@@ -274,15 +274,13 @@ async fn object_limits_share_fifo_across_skills_and_subjects_without_queue_charg
         .map(|n| c.owner_call(&format!("active-{n}"), 15000))
         .collect();
     c.entered(4).await;
-    let started = Instant::now();
-    let mut first = c.start(&token, c.secondary, "first-waiter", 15000);
-    c.pending(1).await;
-    let mut waiting: Vec<_> = (0..31)
-        .map(|n| c.owner_call(&format!("pending-{n}"), 15000))
-        .collect();
-    c.pending(32).await;
+    let mut waiting = Vec::new();
+    for start in (0..32).step_by(4) {
+        waiting.extend((start..start + 4).map(|n| c.owner_call(&format!("pending-{n}"), 15000)));
+        c.pending(waiting.len()).await;
+    }
     let full = c
-        .owner_call("full-queue", 15000)
+        .start(&token, c.secondary, "full-queue", 15000)
         .await
         .unwrap()
         .unwrap_err();
@@ -304,13 +302,6 @@ async fn object_limits_share_fifo_across_skills_and_subjects_without_queue_charg
     let canceled = waiting.pop().unwrap();
     canceled.abort();
     assert!(canceled.await.unwrap_err().is_cancelled());
-    c.pending(31).await;
-    c.gate.add_permits(1);
-    tokio::select! {
-        _ = c.entered(5) => {},
-        result = &mut first => panic!("FIFO head ended before dispatch after {:?}: {result:?}", started.elapsed()),
-    }
-    assert_eq!(c.ledger().await, (5, 4, 5));
     for request in &waiting {
         request.abort();
     }
@@ -321,6 +312,23 @@ async fn object_limits_share_fifo_across_skills_and_subjects_without_queue_charg
         }
     }
     c.pending(0).await;
+    assert_eq!(c.ledger().await, (4, 4, 4));
+
+    // The same saturated instance takes the oldest queued Skill from another
+    // subject before a later request for its original Skill.
+    let mut first = c.start(&token, c.secondary, "first-waiter", 15000);
+    c.pending(1).await;
+    let second = c.owner_call("second-waiter", 15000);
+    c.pending(2).await;
+    c.gate.add_permits(1);
+    tokio::select! {
+        _ = c.entered(5) => {},
+        result = &mut first => panic!("FIFO head ended before dispatch: {result:?}"),
+    }
+    second.abort();
+    assert!(second.await.unwrap_err().is_cancelled());
+    c.pending(0).await;
+    assert_eq!(c.ledger().await, (5, 4, 5));
     c.gate.add_permits(4);
     for request in active {
         request.await.unwrap().unwrap();

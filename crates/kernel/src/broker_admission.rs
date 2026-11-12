@@ -634,8 +634,7 @@ impl Request<'_> {
                 })
                 .ok_or_else(Error::exhausted)?;
             if has_proxy {
-                host_blobs::check_approval(tx, app, deployment, &manifest).await?;
-                host_blobs::authorize_skill_blob_inputs(
+                let inputs = host_blobs::authorize_skill_blob_inputs(
                     tx,
                     app,
                     &ctx,
@@ -646,6 +645,11 @@ impl Request<'_> {
                     skill.definition["input_blobs"] == true,
                 )
                 .await?;
+                // Each authorized input already checked the current signed
+                // approval. Without an input, check approval independently.
+                if inputs.is_empty() {
+                    host_blobs::check_approval(tx, app, deployment, &manifest).await?;
+                }
             }
             if waiting.is_none() {
                 let maximum =
