@@ -240,11 +240,7 @@ async fn tick(app: &App, first: bool, state: &mut ControllerState) -> Result<()>
             &[],
         )
         .await?;
-        tx.execute(
-            "UPDATE execution_delegations SET status='revoked' WHERE status='active'",
-            &[],
-        )
-        .await?;
+        crate::tasks::revoke_transient_delegations(&tx).await?;
         tx.execute(
             "UPDATE reservations SET status='released' WHERE kind='call' AND status<>'released'",
             &[],

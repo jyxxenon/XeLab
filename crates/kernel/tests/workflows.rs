@@ -3,6 +3,8 @@
 
 #[path = "support/http_host.rs"]
 mod http_host;
+#[path = "support/task_admission.rs"]
+mod task_admission;
 
 use axum::{
     body::{to_bytes, Body},

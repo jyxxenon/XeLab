@@ -1,6 +1,6 @@
 use crate::{
     api::{etag, read_object},
-    contracts::string,
+    contracts::{reject_jsonb_nul, string},
     error::{Error, Result},
 };
 use axum::http::HeaderMap;
@@ -21,11 +21,7 @@ pub(super) async fn publish(
     owner: Uuid,
     spec: &Value,
 ) -> Result<Value> {
-    if contains_nul(spec) {
-        return Err(Error::invalid(
-            "Workflow spec cannot contain NUL characters",
-        ));
-    }
+    reject_jsonb_nul(spec)?;
     let name = string(spec, "name")?;
     // A row lock cannot serialize the first publication. Acquire the family
     // lock in the API transaction before reading the latest version.
@@ -79,16 +75,4 @@ pub(super) async fn archive(
         .await?;
     }
     Ok(())
-}
-
-// PostgreSQL text and jsonb reject the JSON escape for U+0000.
-fn contains_nul(value: &Value) -> bool {
-    match value {
-        Value::String(value) => value.contains('\0'),
-        Value::Array(values) => values.iter().any(contains_nul),
-        Value::Object(values) => values
-            .iter()
-            .any(|(key, value)| key.contains('\0') || contains_nul(value)),
-        _ => false,
-    }
 }

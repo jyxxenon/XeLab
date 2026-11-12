@@ -28,7 +28,8 @@ const OAUTH_STATE: &str = include_str!("../migrations/0016_oauth_state.sql");
 const DEPENDENCIES: &str = include_str!("../migrations/0017_dependencies.sql");
 const HOST_CALLS: &str = include_str!("../migrations/0018_host_calls.sql");
 const EVENT_STORE: &str = include_str!("../migrations/0019_events.sql");
-const MIGRATIONS: [&str; 19] = [
+const TASK_ADMISSION: &str = include_str!("../migrations/0020_task_admission.sql");
+const MIGRATIONS: [&str; 20] = [
     BASELINE,
     CALL_CHARGES,
     SECRET_AUTHORITY,
@@ -48,6 +49,7 @@ const MIGRATIONS: [&str; 19] = [
     DEPENDENCIES,
     HOST_CALLS,
     EVENT_STORE,
+    TASK_ADMISSION,
 ];
 pub const SCHEMA_VERSION: u64 = MIGRATIONS.len() as u64;
 pub const LEADER_LOCK: i64 = 0x58454c41424d3101;

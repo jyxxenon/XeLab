@@ -156,6 +156,24 @@ pub fn validate_business(schema: &Value, input: &Value) -> Result<()> {
     }
 }
 
+/// PostgreSQL text and jsonb cannot represent U+0000.
+pub(crate) fn reject_jsonb_nul(value: &Value) -> Result<()> {
+    fn contains_nul(value: &Value) -> bool {
+        match value {
+            Value::String(value) => value.contains('\0'),
+            Value::Array(values) => values.iter().any(contains_nul),
+            Value::Object(values) => values
+                .iter()
+                .any(|(key, value)| key.contains('\0') || contains_nul(value)),
+            _ => false,
+        }
+    }
+    if contains_nul(value) {
+        return Err(Error::invalid("Stored JSON cannot contain NUL characters"));
+    }
+    Ok(())
+}
+
 // M1 accepts self-contained schemas only. It never resolves network or host-file refs.
 pub fn reject_refs(value: &Value) -> Result<()> {
     match value {

@@ -135,7 +135,10 @@ async fn validate_targets(
     Ok(())
 }
 
-async fn validate_contract(c: &(impl GenericClient + Sync), contract: &Value) -> Result<()> {
+pub(crate) async fn validate_contract(
+    c: &(impl GenericClient + Sync),
+    contract: &Value,
+) -> Result<()> {
     let name = string(contract, "name")?;
     let version = string(contract, "version")?;
     let row = c

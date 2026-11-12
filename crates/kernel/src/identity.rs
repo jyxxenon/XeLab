@@ -74,6 +74,7 @@ pub fn audit_resource(
         "createSecret" => Some(("secret", &response["id"])),
         "registerSkill" => Some(("skill", &response["id"])),
         "createWorkflow" => Some(("workflow", &response["id"])),
+        "createTask" => Some(("task", &response["id"])),
         "createClient" => Some(("client", &response["id"])),
         "bindSecret" => Some(("secret", &response["spec"]["secret_id"])),
         _ => None,
@@ -92,12 +93,16 @@ pub fn audit_resource(
     if name == "createWorkflow" {
         return Resource::new("workflow", "new", Some(subject)).json();
     }
+    if name == "createTask" {
+        return Resource::new("task", "new", Some(subject)).json();
+    }
     if matches!(name, "getDefaultUi" | "setDefaultUi") {
         return Resource::new("platform", "node", None).json();
     }
     for (parameter, kind) in [
         ("skill_id", "skill"),
         ("workflow_id", "workflow"),
+        ("task_id", "task"),
         ("client_id", "client"),
         ("call_id", "call"),
         ("credential_id", "credential"),

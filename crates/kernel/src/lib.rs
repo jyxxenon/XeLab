@@ -41,6 +41,7 @@ pub mod secrets;
 pub(crate) mod skill_streams;
 pub mod skills;
 pub mod storage;
+mod tasks;
 pub mod tls;
 pub mod ui;
 pub mod upgrades;
