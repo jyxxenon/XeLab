@@ -160,6 +160,91 @@ class ShellVisual(unittest.TestCase):
         self.assertEqual(self.page.evaluate(
             "() => getComputedStyle(document.querySelector('.menubar')).height"), "44px")
 
+    def open_builtin(self, title, launcher=False):
+        if launcher:
+            self.page.get_by_role("button", name="打开应用启动器", exact=True).click()
+            self.page.get_by_role("button", name=f"启动{title}", exact=True).click()
+        else:
+            self.fixture.app(title)
+        window = self.page.locator(".window").last
+        window.locator("[data-window-toolbar]").wait_for()
+        return window
+
+    def test_builtin_windows_share_a_window_toolbar_and_named_actions(self):
+        self.open()
+        windows = [
+            ("总览", "总览", False), ("插件中心", "插件中心", False),
+            ("Skill", "Skill 浏览器", False), ("账户与权限", "账户与权限", False),
+            ("系统状态", "资源与系统状态", False), ("设置", "桌面设置", False),
+            ("UI 客户端", "UI 客户端", True), ("插件页面", "插件页面", True),
+            ("任务与知识库", "任务与能力", True),
+        ]
+        for window_name, title, launcher in windows:
+            with self.subTest(window=window_name):
+                window = self.open_builtin(window_name, launcher=launcher)
+                toolbar = window.locator("[data-window-toolbar]")
+                self.assertEqual(toolbar.count(), 1, window_name)
+                self.assertIn("window-toolbar", toolbar.get_attribute("class"), window_name)
+                self.assertEqual(toolbar.locator(".window-toolbar-title").inner_text(), title)
+                group = toolbar.get_by_role("group", name=f"{title}操作", exact=True)
+                self.assertEqual(group.count(), 1, title)
+                refresh = group.get_by_role("button", name=f"刷新{title}", exact=True)
+                self.assertEqual(refresh.count(), 1, title)
+                self.assertEqual(refresh.inner_text(), "刷新", title)
+                self.assertEqual(window.get_by_role("button", name="刷新", exact=True).count(), 0,
+                                 "refresh must keep its window-specific accessible name")
+                window.get_by_role("button", name=f"关闭{window_name}", exact=True).click()
+
+    def test_window_toolbar_stays_visible_while_content_scrolls(self):
+        self.open()
+        window = self.open_builtin("系统状态")
+        content = window.locator(".window-content")
+        content.evaluate("""el => {
+          const spacer = document.createElement('div');
+          spacer.style.height = '1600px';
+          spacer.textContent = 'toolbar sticky probe';
+          el.append(spacer);
+          el.scrollTop = 600;
+        }""")
+        self.assertGreater(content.evaluate("el => el.scrollTop"), 0)
+        toolbar = window.locator("[data-window-toolbar]")
+        self.assertTrue(toolbar.is_visible())
+        content_box, toolbar_box = content.bounding_box(), toolbar.bounding_box()
+        self.assertLessEqual(abs(toolbar_box["y"] - content_box["y"]), 1)
+        self.assertGreaterEqual(toolbar_box["height"], 48)
+
+    def test_window_toolbar_wraps_without_inner_overflow_on_narrow_screens(self):
+        self.open()
+        self.page.set_viewport_size({"width": 390, "height": 760})
+        window = self.open_builtin("Skill")
+        content = window.locator(".window-content")
+        self.assertLessEqual(
+            content.evaluate("el => el.scrollWidth"), content.evaluate("el => el.clientWidth") + 1)
+        title = window.locator(".window-toolbar-title")
+        actions = window.locator(".window-toolbar-actions")
+        title_box, actions_box = title.bounding_box(), actions.bounding_box()
+        self.assertGreaterEqual(actions_box["y"], title_box["y"] + title_box["height"] - 1,
+                                "action group takes its own row on a narrow window")
+        self.assertEqual(title.evaluate("el => getComputedStyle(el).textOverflow"), "ellipsis")
+        self.assertEqual(title.evaluate("el => getComputedStyle(el).whiteSpace"), "nowrap")
+        self.assertTrue(actions.get_by_role("button", name="刷新Skill 浏览器", exact=True).is_visible())
+
+    def test_window_toolbar_refresh_is_keyboard_reachable_and_named(self):
+        self.open()
+        window = self.open_builtin("总览")
+        self.assertEqual(self.page.evaluate(
+            "() => document.activeElement && document.activeElement.className"), "window-title")
+        for _ in range(12):
+            self.page.keyboard.press("Tab")
+            if self.page.evaluate(
+                    "() => document.activeElement && document.activeElement.getAttribute('aria-label')") == "刷新总览":
+                break
+        self.assertEqual(self.page.evaluate(
+            "() => document.activeElement && document.activeElement.getAttribute('aria-label')"), "刷新总览")
+        self.assertNotEqual(self.page.evaluate(
+            "() => getComputedStyle(document.activeElement).outlineStyle"), "none")
+        self.assertTrue(window.locator(".window-toolbar-actions").is_visible())
+
 
 if __name__ == "__main__":
     unittest.main()
