@@ -249,13 +249,16 @@ class Store:
         database = page_count * page_size
         wal = self._database_size("-wal")
         index = self._database_size("-shm")
-        # With spilling off, one commit can add at most one WAL frame per
-        # database page. Count the possible new WAL index blocks as well,
-        # including when an older reader pins the existing WAL.
+        # With spilling off, budget a WAL frame per database page plus the
+        # repeated commit frames SQLite may use to reach a sector boundary.
+        # SQLite's pager caps that sector at 64 KiB. Include the WAL index
+        # growth even when an older reader pins the existing WAL.
         # https://www.sqlite.org/fileformat2.html#the_write_ahead_log
         # https://www.sqlite.org/walformat.html#wal_index_hash_tables
+        # https://sqlite.org/src/file/src/pager.c
         frame_size = page_size + 24
-        wal_peak = max(wal, 32) + page_count * frame_size
+        padding_frames = (64 * 1024 + frame_size - 1) // frame_size
+        wal_peak = max(wal, 32) + (page_count + padding_frames) * frame_size
         frames = (wal_peak - 32 + frame_size - 1) // frame_size
         index_blocks = 1 + (max(frames - 4062, 0) + 4095) // 4096
         metadata_peak = database + wal_peak + max(index, 32768 * index_blocks)
