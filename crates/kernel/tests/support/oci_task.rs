@@ -1,8 +1,16 @@
 use axum::Router;
+use chrono::{DateTime, TimeDelta, Timelike, Utc};
 use serde_json::{json, Value};
 use std::time::Duration;
+use tokio_postgres::Client;
 use uuid::Uuid;
-use xelab_kernel::{api::App, contracts};
+use xelab_kernel::{api::App, auth::Resource, contracts};
+
+#[derive(Clone, Copy)]
+pub(crate) enum TaskTrigger {
+    Direct,
+    Schedule,
+}
 
 pub(crate) struct TaskCase<'a> {
     pub(crate) skill: Uuid,
@@ -12,6 +20,7 @@ pub(crate) struct TaskCase<'a> {
     pub(crate) input: Value,
     pub(crate) expected_output: Value,
     pub(crate) suffix: &'a str,
+    pub(crate) trigger: TaskTrigger,
 }
 
 /// Submit through the public API and wait for the real OCI Controller worker.
@@ -37,7 +46,10 @@ pub(crate) async fn run(app: &App, router: &Router, token: &str, case: TaskCase<
         .as_u64()
         .unwrap()
         .min(15_000);
-    let suffix = case.suffix;
+    let suffix = match case.trigger {
+        TaskTrigger::Direct => case.suffix.to_owned(),
+        TaskTrigger::Schedule => format!("{}-scheduled", case.suffix),
+    };
     let (status, workflow) = super::api(
         router,
         "createWorkflow",
@@ -57,18 +69,26 @@ pub(crate) async fn run(app: &App, router: &Router, token: &str, case: TaskCase<
     )
     .await;
     assert_eq!(status, 201, "{workflow}");
-    let (status, task) = super::api(
-        router,
-        "createTask",
-        &[],
-        Some(token),
-        json!({"workflow_id":workflow["id"],"input":case.input,"timeout_ms":45_000}),
-        &format!("oci-task-submit-{suffix}"),
-        None,
-    )
-    .await;
-    assert_eq!(status, 201, "{task}");
-    let task_id = contracts::id(&task, "id").unwrap();
+    let workflow_id = contracts::id(&workflow, "id").unwrap();
+    let task_id = match case.trigger {
+        TaskTrigger::Direct => {
+            let (status, task) = super::api(
+                router,
+                "createTask",
+                &[],
+                Some(token),
+                json!({"workflow_id":workflow_id,"input":case.input,"timeout_ms":45_000}),
+                &format!("oci-task-submit-{suffix}"),
+                None,
+            )
+            .await;
+            assert_eq!(status, 201, "{task}");
+            contracts::id(&task, "id").unwrap()
+        }
+        TaskTrigger::Schedule => {
+            wait_for_schedule(&c, router, token, workflow_id, &case.input, &suffix).await
+        }
+    };
     let result = wait_for_task(router, token, task_id).await;
     assert_eq!(result["output"], json!({"probe":case.expected_output}));
 
@@ -79,18 +99,27 @@ pub(crate) async fn run(app: &App, router: &Router, token: &str, case: TaskCase<
                 c.skill_definition_digest,c.provider_instance_id,c.idempotency_key AS call_key,c.result,
                 c.delegation_id AS call_delegation,t.delegation_id AS task_delegation,r.status AS reservation_status,
                 e.issuer_credential_id,
+                (SELECT count(*) FROM tasks other WHERE other.workflow_id=t.workflow_id) AS tasks,
                 (SELECT count(*) FROM attempts other WHERE other.step_id=s.id) AS attempts,
                 (SELECT count(*) FROM calls other WHERE other.owner_id=t.owner_id AND other.idempotency_key=a.idempotency_key) AS calls,
-                (SELECT count(*) FROM call_credential_charges q WHERE q.call_id=c.id AND q.credential_id=$2) AS issuer_charges
+                (SELECT count(*) FROM call_credential_charges q WHERE q.call_id=c.id AND q.credential_id=$2) AS issuer_charges,
+                (SELECT count(*) FROM audit_events e WHERE e.subject_id=t.owner_id AND e.credential_id=$2
+                   AND e.action='createTask' AND e.resource=$3 AND e.outcome='succeeded' AND e.reason_code='COMMITTED') AS creation_audits
          FROM tasks t JOIN task_steps s ON s.task_id=t.id JOIN attempts a ON a.step_id=s.id
          JOIN execution_delegations e ON e.id=t.delegation_id JOIN calls c ON c.id=a.broker_call_id
          JOIN reservations r ON r.id=c.id AND r.kind='call' WHERE t.id=$1",
-        &[&task_id, &issuer],
+        &[&task_id, &issuer, &Resource::new("task", task_id, Some(owner)).json()],
     ).await.unwrap();
     for column in ["step_state", "attempt_state", "call_state"] {
         assert_eq!(row.get::<_, String>(column), "succeeded", "{column}");
     }
-    for column in ["attempts", "calls", "issuer_charges"] {
+    for column in [
+        "tasks",
+        "attempts",
+        "calls",
+        "issuer_charges",
+        "creation_audits",
+    ] {
         assert_eq!(row.get::<_, i64>(column), 1, "{column}");
     }
     assert_eq!(row.get::<_, Uuid>("skill_id"), case.skill);
@@ -136,6 +165,86 @@ pub(crate) async fn run(app: &App, router: &Router, token: &str, case: TaskCase<
         json!({"task_id":task_id,"step_id":step,"attempt_id":attempt,"state":"succeeded"})
     );
     call
+}
+
+async fn wait_for_schedule(
+    c: &Client,
+    router: &Router,
+    token: &str,
+    workflow: Uuid,
+    input: &Value,
+    suffix: &str,
+) -> Uuid {
+    let fire_at: DateTime<Utc> = c
+        .query_one(
+            "SELECT date_trunc('minute',clock_timestamp(),'UTC')-interval '1 minute'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let (status, schedule) = super::api(
+        router,
+        "createSchedule",
+        &[],
+        Some(token),
+        json!({
+            "name":format!("oci-task-{suffix}"),
+            "workflow_id":workflow, "input":input, "timezone":"UTC", "misfire":"run_once",
+            "cron":format!("{} {} * * *",fire_at.minute(),fire_at.hour()),
+        }),
+        &format!("oci-task-schedule-{suffix}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 201, "{schedule}");
+    let id = contracts::id(&schedule, "id").unwrap();
+    let next: DateTime<Utc> = schedule["next_fire_at"].as_str().unwrap().parse().unwrap();
+    assert_eq!(next, fire_at + TimeDelta::days(1));
+    // Simulate one missed occurrence by moving only the cursor. The real
+    // Controller worker computes misfire, admission, and the durable linkage.
+    assert_eq!(
+        c.execute(
+            "UPDATE schedules SET next_fire_at=$2 WHERE id=$1 AND next_fire_at=$3",
+            &[&id, &fire_at, &next],
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    tokio::time::timeout(Duration::from_secs(45), async {
+        loop {
+            if let Some(row) = c
+                .query_opt(
+                    "SELECT f.scheduled_at,f.outcome,f.task_id,s.next_fire_at,t.workflow_id,
+                            s.delegation_id AS schedule_delegation,t.delegation_id AS task_delegation
+                     FROM schedule_fires f JOIN schedules s ON s.id=f.schedule_id
+                     LEFT JOIN tasks t ON t.id=f.task_id WHERE f.schedule_id=$1",
+                    &[&id],
+                )
+                .await
+                .unwrap()
+            {
+                assert_eq!(row.get::<_, DateTime<Utc>>("scheduled_at"), fire_at);
+                match row.get::<_, &str>("outcome") {
+                    "created" => {
+                        assert_eq!(row.get::<_, DateTime<Utc>>("next_fire_at"), next);
+                        assert_eq!(row.get::<_, Uuid>("workflow_id"), workflow);
+                        assert_ne!(
+                            row.get::<_, Uuid>("schedule_delegation"),
+                            row.get::<_, Uuid>("task_delegation")
+                        );
+                        return row.get("task_id");
+                    }
+                    "pending" => assert_eq!(row.get::<_, Option<Uuid>>("task_id"), None),
+                    outcome => panic!("Schedule {id} settled the missed fire as {outcome}"),
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("Schedule {id} did not create a Task within 45 seconds"))
 }
 
 async fn wait_for_task(router: &Router, token: &str, task: Uuid) -> Value {

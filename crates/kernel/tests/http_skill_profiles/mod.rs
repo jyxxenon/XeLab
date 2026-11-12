@@ -1,4 +1,5 @@
 //! Exercised by the real signed OCI HTTP test, never a standalone metadata mock.
+use super::oci_task::{self, TaskTrigger};
 use super::*;
 
 mod task_cancel;
@@ -145,41 +146,48 @@ pub(super) async fn fixed_methods_and_stream(
         } else {
             contracts::digest(&serde_json::to_vec(&task_input).unwrap())
         };
-        let call = super::oci_task::run(
-            app,
-            router,
-            token,
-            super::oci_task::TaskCase {
-                skill: skill.parse().unwrap(),
-                expected_instance: instance,
-                reference_call: contracts::id(&called.1["call"], "call_id").unwrap(),
-                input_mapping: mapping,
-                input: task_input,
-                expected_output: task_output,
-                suffix,
-            },
-        )
-        .await;
+        let reference_call = contracts::id(&called.1["call"], "call_id").unwrap();
         let c = app.db.connect().await.unwrap();
-        let row = c
-            .query_one(
-                "SELECT c.http_binding,c.input_digest,i.generation FROM calls c
-                 JOIN instances i ON i.id=c.provider_instance_id WHERE c.id=$1",
-                &[&call],
+        for trigger in [TaskTrigger::Direct, TaskTrigger::Schedule] {
+            let call = oci_task::run(
+                app,
+                router,
+                token,
+                oci_task::TaskCase {
+                    skill: skill.parse().unwrap(),
+                    expected_instance: instance,
+                    reference_call,
+                    input_mapping: mapping.clone(),
+                    input: task_input.clone(),
+                    expected_output: task_output.clone(),
+                    suffix,
+                    trigger,
+                },
             )
-            .await
-            .unwrap();
-        let target = &manifest["skills"][index]["target"];
-        assert_eq!(
-            row.get::<_, Value>("http_binding"),
-            json!({
-                "installation_id":installed["installation_id"], "deployment_id":deployment,
-                "generation":row.get::<_,i64>("generation"), "required_action":"plugin.http.invoke",
-                "http_contract_digest":target["http_contract_digest"], "operation_id":target["http_operation_id"],
-                "method":method, "path":path,
-            })
-        );
-        assert_eq!(row.get::<_, String>("input_digest"), input_digest);
+            .await;
+            let row = c
+                .query_one(
+                    "SELECT c.http_binding,c.input_digest,i.generation FROM calls c
+                     JOIN instances i ON i.id=c.provider_instance_id WHERE c.id=$1",
+                    &[&call],
+                )
+                .await
+                .unwrap();
+            let target = &manifest["skills"][index]["target"];
+            assert_eq!(
+                row.get::<_, Value>("http_binding"),
+                json!({
+                    "installation_id":installed["installation_id"], "deployment_id":deployment,
+                    "generation":row.get::<_,i64>("generation"), "required_action":"plugin.http.invoke",
+                    "http_contract_digest":target["http_contract_digest"], "operation_id":target["http_operation_id"],
+                    "method":method, "path":path,
+                })
+            );
+            assert_eq!(row.get::<_, String>("input_digest"), input_digest);
+            if matches!(trigger, TaskTrigger::Schedule) {
+                println!("SCHEDULE_OCI_ACCEPTANCE_PASSED fixture={suffix} call={call}");
+            }
+        }
     }
     let skill = register(router, token, manifest, installed, 1).await;
     let result = completed(router, token, &skill, deployment, "http-oci-stream-skill").await;
