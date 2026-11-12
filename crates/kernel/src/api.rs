@@ -621,6 +621,11 @@ fn dispatch<'a>(
             )
             .await?;
             if let Some(row)=tx.query_opt("SELECT fingerprint,safe_response,response_status,sensitive,resource_id FROM idempotency_records WHERE subject_id=$1 AND credential_id=$2 AND method=$3 AND path=$4 AND key=$5 AND expires_at>now()",&[&ctx.subject,&ctx.credential,&method,&path,&key]).await?{
+            if name == "resolveUnknownStep" {
+                // A stale resolver grant must not reveal whether a previously
+                // submitted idempotency key or fingerprint exists.
+                authorize_operation(&tx, &app.auth, &ctx, name, &params, &body).await?;
+            }
             if row.get::<_,String>("fingerprint")!=fingerprint{return Err(Error::new("IDEMPOTENCY_CONFLICT","Idempotency key fingerprint differs",StatusCode::CONFLICT));}
             if row.get::<_,bool>("sensitive") {
                 authorize_operation(&tx,&app.auth,&ctx,name,&params,&body).await?;
@@ -631,7 +636,7 @@ fn dispatch<'a>(
             if let Some(value) = response {
                 if name == "trustPublisher" && row.get::<_,i32>("response_status") == 201 {
                     auth::authorize(&tx, &ctx, "publisher.trust", &Resource::new("publisher", "new", Some(ctx.subject))).await?;
-                } else {
+                } else if name != "resolveUnknownStep" {
                     authorize_operation(&tx, &app.auth, &ctx, name, &params, &body).await?;
                 }
                 if matches!(name, "upgradeDeployment" | "rollbackDeployment") {
@@ -652,7 +657,15 @@ fn dispatch<'a>(
                 Some(ctx.credential),
                 request_id,
                 name,
-                &identity::audit_resource(name, &params, ctx.subject, &Value::Null),
+                &operation_audit_resource(
+                    &tx,
+                    name,
+                    &params,
+                    ctx.subject,
+                    &Value::Null,
+                    error.code != "PERMISSION_DENIED",
+                )
+                .await?,
                 "denied",
                 error.code,
             )
@@ -681,7 +694,7 @@ fn dispatch<'a>(
     } else if crate::workflows::handles(name) {
         crate::workflows::execute(&tx,&app.auth,&ctx,name,&params,&body,&headers,uri.query().unwrap_or("")).await?
     } else if crate::tasks::handles(name) {
-        crate::tasks::execute(&tx,&app.auth,&ctx,name,&params,&body,uri.query().unwrap_or("")).await?
+        crate::tasks::execute(&tx,&app.auth,&ctx,name,&params,&body,&headers,uri.query().unwrap_or("")).await?
     } else if crate::volumes::handles(name) {
         crate::volumes::execute(&tx,app,&ctx,name,&params,&body,&headers,uri.query().unwrap_or("" )).await?
     } else if crate::backups::handles(name) {
@@ -967,7 +980,15 @@ fn dispatch<'a>(
                     Some(ctx.credential),
                     request_id,
                     name,
-                    &identity::audit_resource(name, &params, ctx.subject, &Value::Null),
+                    &operation_audit_resource(
+                        &tx,
+                        name,
+                        &params,
+                        ctx.subject,
+                        &Value::Null,
+                        matches!(e.code, "RESOURCE_NOT_FOUND" | "INVALID_CREDENTIAL"),
+                    )
+                    .await?,
                     "failed",
                     e.code,
                 )
@@ -983,7 +1004,8 @@ fn dispatch<'a>(
                 Some(ctx.credential),
                 request_id,
                 name,
-                &identity::audit_resource(name, &params, ctx.subject, &result.0),
+                &operation_audit_resource(&tx, name, &params, ctx.subject, &result.0, false)
+                    .await?,
                 "succeeded",
                 "COMMITTED",
             )
@@ -1017,6 +1039,26 @@ fn dispatch<'a>(
         tx.commit().await?;
         Ok(result)
     })
+}
+
+async fn operation_audit_resource(
+    c: &(impl GenericClient + Sync),
+    name: &str,
+    params: &HashMap<String, String>,
+    subject: Uuid,
+    response: &Value,
+    concealed: bool,
+) -> Result<Value> {
+    let fallback = || identity::audit_resource(name, params, subject, response);
+    if name == "resolveUnknownStep" && !concealed {
+        let Ok(step) = path_id(params, "step_id") else {
+            return Ok(fallback());
+        };
+        return Ok(crate::tasks::step_task_resource(c, step)
+            .await?
+            .map_or_else(fallback, |resource| resource.json()));
+    }
+    Ok(fallback())
 }
 
 async fn authorize_operation(

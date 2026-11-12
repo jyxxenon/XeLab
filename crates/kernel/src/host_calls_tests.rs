@@ -334,7 +334,15 @@ struct Echo {
     calls: Arc<std::sync::atomic::AtomicUsize>,
     output_bytes: Arc<std::sync::atomic::AtomicUsize>,
     fail_after_dispatch: Arc<std::sync::atomic::AtomicBool>,
+    first_call_gate: Option<Arc<EchoGate>>,
 }
+
+#[derive(Default)]
+struct EchoGate {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
 #[tonic::async_trait]
 impl rpc::capability_service_server::CapabilityService for Echo {
     type InvokeStreamStream = tokio_stream::wrappers::ReceiverStream<
@@ -352,7 +360,15 @@ impl rpc::capability_service_server::CapabilityService for Echo {
             .unwrap()
             .delegation_token
             .starts_with("host:"));
-        self.calls.fetch_add(1, Ordering::SeqCst);
+        let previous_calls = self.calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(gate) = self
+            .first_call_gate
+            .as_ref()
+            .filter(|_| previous_calls == 0)
+        {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
         if self.fail_after_dispatch.load(Ordering::SeqCst) {
             return Err(tonic::Status::unavailable(
                 "Simulated transport failure after dispatch",
@@ -427,6 +443,14 @@ impl rpc::capability_service_server::CapabilityService for Echo {
     }
 }
 async fn echo(f: &Fixture, instance: Uuid) -> (Echo, tokio::task::JoinHandle<()>) {
+    echo_with_gate(f, instance, None).await
+}
+
+async fn echo_with_gate(
+    f: &Fixture,
+    instance: Uuid,
+    first_call_gate: Option<Arc<EchoGate>>,
+) -> (Echo, tokio::task::JoinHandle<()>) {
     let root = f.directory.path();
     let key = KeyPair::from_pem(&fs::read_to_string(root.join("ca.key")).unwrap()).unwrap();
     let ca = CertificateParams::from_ca_cert_pem(&fs::read_to_string(root.join("ca.crt")).unwrap())
@@ -469,7 +493,10 @@ async fn echo(f: &Fixture, instance: Uuid) -> (Echo, tokio::task::JoinHandle<()>
         .unwrap(),
     )
     .unwrap();
-    let plugin = Echo::default();
+    let plugin = Echo {
+        first_call_gate,
+        ..Echo::default()
+    };
     let service = rpc::capability_service_server::CapabilityServiceServer::new(plugin.clone());
     let identity = tonic::transport::Identity::from_pem(cert.pem(), leaf.serialize_pem());
     let server = tokio::spawn(async move {

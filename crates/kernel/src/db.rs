@@ -30,7 +30,9 @@ const HOST_CALLS: &str = include_str!("../migrations/0018_host_calls.sql");
 const EVENT_STORE: &str = include_str!("../migrations/0019_events.sql");
 const TASK_ADMISSION: &str = include_str!("../migrations/0020_task_admission.sql");
 const TASK_BROKER_CALL: &str = include_str!("../migrations/0021_task_broker_call.sql");
-const MIGRATIONS: [&str; 21] = [
+const TASK_DEADLINE_INDEXES: &str = include_str!("../migrations/0022_task_deadline_indexes.sql");
+const TASK_STEP_RESOLUTIONS: &str = include_str!("../migrations/0023_task_step_resolutions.sql");
+const MIGRATIONS: [&str; 23] = [
     BASELINE,
     CALL_CHARGES,
     SECRET_AUTHORITY,
@@ -52,6 +54,8 @@ const MIGRATIONS: [&str; 21] = [
     EVENT_STORE,
     TASK_ADMISSION,
     TASK_BROKER_CALL,
+    TASK_DEADLINE_INDEXES,
+    TASK_STEP_RESOLUTIONS,
 ];
 pub const SCHEMA_VERSION: u64 = MIGRATIONS.len() as u64;
 pub const LEADER_LOCK: i64 = 0x58454c41424d3101;

@@ -17,7 +17,9 @@
 | 事件 | 持久化发布/outbox、24h 去重、独立游标、30s 租约、旧租约 fencing、退避重投/死信、保留和容量上限、SSE/HostService、原生快照及恢复授权重置 | 当前源代码与专项证据见 [M4 事件](../../docs/implementation/m4-events.md)和[#54](https://github.com/jyxxe/XeLab/issues/54)；正式 daemon/独立宿主及 AWS 仍由 #50 跟踪 |
 | 工作流定义 | `createWorkflow/getWorkflow/listWorkflows/archiveWorkflow`；同一所有者和名称下递增不可变版本，校验 DAG、输入映射和签名目标，按当前权限分页，使用 ETag 归档 | 归档阻止同一版本的新任务，历史任务继续可读 |
 | 任务提交与查询 | `createTask/getTask/listTasks/listTaskSteps`；在一个事务中固定 Workflow 版本、deadline、执行权限上限、授权来源和需要固定的提供者，初始化步骤状态 | 服务身份执行需单独审批。HTTP 与真实 PostgreSQL 回归见 `crates/kernel/tests/workflows.rs` |
-| 同步 TaskEngine | 控制器以 PostgreSQL 租约领取能力契约型或固定 HTTP 同步 Skill，经 Broker 准入、计费及调用，原子记录 Attempt 与 Call；结果提交检查 fence 并推进下游与 outbox | Task 步骤采用单次调用；任务级 HostService 附属授权、Blob 大结果、长任务 TaskWorker 与 UNKNOWN 核实待实现 |
+| 同步 TaskEngine | 控制器以 PostgreSQL 租约领取能力契约型或固定 HTTP 同步 Skill，经 Broker 准入、计费及调用，原子记录 Attempt 与 Call；结果提交检查 fence 并推进下游与 outbox | Task 步骤采用单次调用；任务级 HostService 附属授权、Blob 大结果与长任务 TaskWorker 待实现 |
+| Task 期限对账 | 控制器定期回收过期租约，并独立于同步调用处理已到整体期限、无活动或待核实步骤的 Task | Task 记录 `DEADLINE_EXCEEDED`，保留既有步骤输出、Attempt 和 Call。取消待实现 |
+| UNKNOWN 核实 | `resolveUnknownStep` 在当前授权与步骤 ETag 下核对已成功结算的关联 Call，记录操作者和证据，推进步骤 fence | 未执行的证明、显式重试和取消仍待实现 |
 | HTTP | #43 已合并签名原始 OpenAPI、精确操作/动作/Schema、共享 Broker 账本、直接 HTTP SSE、隔离来源静态 GET/HEAD 与物理槽；#47 扩展固定 HTTP Skill 的六方法、成功状态和 SSE | #47 精确 HTTP Skill 六方法/流真实 OCI 门禁已通过；不是任意 URL/路径模板/查询参数代理，未声明协议拒绝 |
 | 独立 WebUI/消息桥 | #45 实现 UID 65532 OCI 桌面、公开管理 API/OAuth 客户端、window/widget、固定 alias 的 skill.call、同部署 window.open、通道撤权/登出/升级失效及独立 UI 参考插件 | 组件与打包探针通过不能替代真实核心 OCI/Owner OAuth/iframe 全链；#45 精确完整/专项门禁均通过，未来 batch 方法明确不可用 |
 | 持久卷 | 独立 XFS 硬配额、预留/扩容/回收、实际计数、单写者 fence、OCI 挂载、新私有卷恢复、同格式克隆/回退、内部格式证明 | 多副本应用行为、公开格式安装/迁移、正式独立宿主恢复验收 |
@@ -67,14 +69,14 @@ cargo fmt --all -- --check
 
 ```bash
 xelabctl validate-config --config /etc/xelab/kernel.toml
-xelabctl migrate --config /etc/xelab/kernel.toml --target 21
+xelabctl migrate --config /etc/xelab/kernel.toml --target 23
 xelabctl bootstrap --config /etc/xelab/kernel.toml --owner-name admin
 xelabd --config /etc/xelab/kernel.toml
 ```
 
-`validate-config` 只验证结构和本地约束；不宣称宿主检查已经通过。当前迁移目标为 21：
-空库先建立原始基线，已有库先检查已应用的版本和校验和，再顺序执行追加迁移；
-重复执行仍核对布局与校验和。v20 新增任务准入证明，v21 新增 Attempt 与 Broker Call 的关联。已有数据库可按顺序迁移；旧版本离线快照须先在对应版本恢复并迁移，再重新导出。bootstrap 只允许空账户库，须在启动守护进程前执行。
+`validate-config` 检查配置结构和本地约束。当前迁移目标为 23。
+迁移会先为空库建立原始基线。已有库先检查已应用的版本和校验和，再顺序执行追加迁移。
+重复执行仍核对布局与校验和。v20 新增任务准入证明，v21 新增 Attempt 与 Broker Call 的关联，v22 为任务期限和活动租约增加索引，v23 保存任务核实证据。旧版本离线快照须先在对应版本恢复并迁移，再重新导出。bootstrap 只允许空账户库，须在启动守护进程前执行。
 守护进程不会隐式迁移数据库。
 
 ## 管理与插件示例
@@ -176,7 +178,7 @@ CI 另在一次性 Linux 主机运行 `tests/oci.rs`：真实 containerd + Rust/
 - 自授 Grant 证明签发权限时，忽略同账户其他非引导自授绑定，只使用独立来源（外部 Grant、父级继承或初始 Owner）。这些自授绑定仍在最外层保留权限/来源记录；撤销独立来源后不能互相维持权限。此优化针对同账户自授，其他来源图仍受现有深度/路径边界限制。
 - 控制器启用与停用清理分别保存 `(created_at,id)` 游标与上界，每轮各最多 16 项，并在项间检查 250 ms 时间片。Probe 按实例代次复用、分批回收；已清理禁用记录不反复协调。完整行为、回归与单项延迟限制见 [Controller 稳定化](../../docs/implementation/m1-acceptance.md#controller-稳定化pr-4-遗留项)。
 
-升级前备份并停机，确认没有未完成任务，执行上面的 `--target 21` 后再启动。
+升级前备份并停机，确认没有未完成任务，执行上面的 `--target 23` 后再启动。
 旧二进制拒绝不匹配的元数据版本，不能直接回退；原生快照恢复同样要求精确布局。
 v1 已有的凭证/账户派生调用继续计入预算；旧版本未记录的实际 Grant 来源无法事后精确重建，因此已有受此漏洞影响的限次来源 Key 应在升级时撤销后重新签发，不把旧账本当成完整历史计费证据。v7 持久备份任务见 [备份任务记录](../../docs/implementation/m2-backup-jobs.md)，v8 新卷恢复和切换见 [恢复实现](../../docs/implementation/m2-restores.md)，v9 元数据快照、启动门禁与权限重置见 [离线恢复组件](../../docs/implementation/m2-platform-recovery.md)。
 v10–11 部署重建与卷克隆见[部署重建实现](../../docs/implementation/m2-deployment-upgrades.md)，
