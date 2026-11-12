@@ -55,7 +55,7 @@ def deployment_item(identifier=DEPLOYMENT, name="fixture deployment", phase="rea
             "observed_generation": 1, "phase": phase, "conditions": ["Available"]}
 
 
-def instance_item(identifier=INSTANCE, deployment=DEPLOYMENT, phase="running", health="healthy"):
+def instance_item(identifier=INSTANCE, deployment=DEPLOYMENT, phase="ready", health="alive"):
     return {"id": identifier, "revision": 1, "created_at": NOW, "updated_at": NOW,
             "deployment_id": deployment, "generation": 1,
             "runtime_id": "containerd://private-runtime-id", "phase": phase, "health": health,
@@ -160,7 +160,7 @@ class OverviewWindow(unittest.TestCase):
         for expected in ("fixture deployment", "ready", "已启用", "副本 2", "Available", DEPLOYMENT):
             self.assertIn(expected, deployments)
         instances = self.section(window, "instances").inner_text()
-        for expected in ("running", "healthy", "重启次数 0", f"最近心跳 {NOW}", INSTANCE):
+        for expected in ("ready", "alive", "重启次数 0", f"最近心跳 {NOW}", INSTANCE):
             self.assertIn(expected, instances)
         self.assertIn("无历史趋势、全局总数或实时监控", window.locator(".overview-note").inner_text())
         text = window.inner_text()
