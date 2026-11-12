@@ -104,6 +104,21 @@ class ShellVisual(unittest.TestCase):
             timeout=2000,
         )
 
+    def test_shell_motion_is_finite_and_reducible(self):
+        self.open()
+        self.fixture.app("系统状态")
+        window = self.page.locator(".window").last
+        self.assertEqual(window.evaluate("el => getComputedStyle(el).animationName"), "shell-window-in")
+        self.assertEqual(window.evaluate("el => getComputedStyle(el).animationDuration"), "0.16s")
+        self.assertTrue(self.page.evaluate(
+            "() => [...document.querySelectorAll('*')].every(el => {"
+            " const style = getComputedStyle(el);"
+            " return style.animationIterationCount !== 'infinite';})"),
+            "the shell must not run an endless decorative animation",
+        )
+        self.page.evaluate("() => document.documentElement.classList.add('reduced-motion')")
+        self.assertEqual(window.evaluate("el => getComputedStyle(el).animationName"), "none")
+
     def test_narrow_viewport_has_no_overflow_and_scales_icons(self):
         self.open()
         self.page.set_viewport_size({"width": 390, "height": 760})
