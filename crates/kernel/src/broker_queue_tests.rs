@@ -274,11 +274,12 @@ async fn object_limits_share_fifo_across_skills_and_subjects_without_queue_charg
         .map(|n| c.owner_call(&format!("active-{n}"), 15000))
         .collect();
     c.entered(4).await;
-    let mut waiting = Vec::new();
-    for start in (0..32).step_by(4) {
-        waiting.extend((start..start + 4).map(|n| c.owner_call(&format!("pending-{n}"), 15000)));
-        c.pending(waiting.len()).await;
-    }
+    // Fill the pool in one burst. Sequential admission batches would spend
+    // the first tickets' signed wait budget while later batches start.
+    let mut waiting: Vec<_> = (0..32)
+        .map(|n| c.owner_call(&format!("pending-{n}"), 15000))
+        .collect();
+    c.pending(32).await;
     let full = c
         .start(&token, c.secondary, "full-queue", 15000)
         .await
