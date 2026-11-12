@@ -184,6 +184,7 @@ impl Fixture {
                 "account_id",
                 "backup_id",
                 "skill_id",
+                "call_id",
                 "blob_id",
             ] {
                 path = path.replace(&format!("{{{p}}}"), &id.to_string());
