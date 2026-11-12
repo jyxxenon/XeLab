@@ -307,21 +307,32 @@ async fn process_identity(app: &App, instance: Uuid) -> (u32, String) {
         .skip(1)
         .find_map(|line| {
             let fields = line.split_whitespace().collect::<Vec<_>>();
-            (fields.first() == Some(&expected.as_str()))
-                .then(|| fields.get(1)?.parse::<u32>().ok())
-                .flatten()
+            match fields.as_slice() {
+                [id, pid, "RUNNING", ..] if *id == expected => pid.parse::<u32>().ok(),
+                _ => None,
+            }
         })
         .expect("Live HTTP instance task missing");
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
-    let start = stat
-        .rsplit_once(") ")
-        .unwrap()
-        .1
-        .split_whitespace()
-        .nth(19)
-        .unwrap()
-        .to_owned();
-    (pid, start)
+    (
+        pid,
+        process_start(pid).expect("Live HTTP instance PID missing"),
+    )
+}
+
+fn process_start(pid: u32) -> Option<String> {
+    match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => Some(
+            stat.rsplit_once(") ")
+                .unwrap()
+                .1
+                .split_whitespace()
+                .nth(19)
+                .unwrap()
+                .to_owned(),
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => panic!("Cannot read HTTP instance PID {pid}: {error}"),
+    }
 }
 
 struct OpenedEvents {
@@ -1046,7 +1057,7 @@ async fn signed_http_and_static_gateway_use_real_oci_and_shared_broker() {
     )
     .await;
     enabled(&router, &deployment, &token, false, "http-finish-only").await;
-    let (mixed, _, mixed_deployment) = install(
+    let (mixed, mixed_installed, mixed_deployment) = install(
         &router,
         &token,
         &signing,
@@ -1257,6 +1268,16 @@ async fn signed_http_and_static_gateway_use_real_oci_and_shared_broker() {
     assert!(body.next().await.unwrap().is_ok());
     drop(body);
     wait_active(&db, 0).await;
+    wait_ready(&db, &mixed_deployment).await;
+    skill_profiles::cancel_hold_task(
+        &router,
+        &app,
+        &token,
+        &mixed,
+        &mixed_installed,
+        &mixed_deployment,
+    )
+    .await;
     enabled(
         &router,
         &mixed_deployment,
@@ -1275,5 +1296,5 @@ async fn signed_http_and_static_gateway_use_real_oci_and_shared_broker() {
     app.shutdown.store(true, Ordering::SeqCst);
     worker.abort();
     let _ = worker.await;
-    println!("HTTP-OCI: signed HTTP-only readiness, fixed GET/PUT/PATCH/DELETE Skill, JSON/streaming Skill, direct HTTP, static origin, SSE, original-authority revocation, restart and mixed physical slots passed");
+    println!("HTTP-OCI: signed HTTP-only readiness, fixed GET/PUT/PATCH/DELETE Skill, JSON/streaming Skill, direct HTTP, static origin, SSE, original-authority revocation, restart, Task cancellation and mixed physical slots passed");
 }
