@@ -71,6 +71,8 @@ class IndependentPage(unittest.TestCase):
         self.results = {}
         self.defer_echo = False
         self.deferred_echo = None
+        self.defer_result_checks = False
+        self.deferred_result_checks = []
         self.page.on("pageerror", lambda error: self.errors.append(str(error)))
         self.page.route("**/*", self.route)
 
@@ -135,6 +137,9 @@ window.bridge=new BridgeHost({{iframe,api,contribution,subjectId:{json.dumps(SUB
         elif "/ui/contributions/" in parsed.path:
             identifier = parsed.path.rsplit("/", 1)[1]
             value = self.current if identifier == self.current["spec"]["id"] else self.contribution(identifier)
+            if self.defer_result_checks and any(call["path"].startswith("/api/platform/v1/calls/") for call in self.calls):
+                self.deferred_result_checks.append((route, cors, value))
+                return
             route.fulfill(headers=cors, content_type="application/json", body=json.dumps(value))
         elif request.method == "POST" and parsed.path == f"/api/platform/v1/skills/{SKILL}/calls":
             value = json.loads(request.post_data)
@@ -183,6 +188,43 @@ window.bridge=new BridgeHost({{iframe,api,contribution,subjectId:{json.dumps(SUB
         self.assertEqual(body["idempotency_key"], post["headers"]["idempotency-key"])
         self.assertNotIn("cookie", post["headers"])
         self.assertTrue(frame.evaluate("!document.body.textContent.includes('parent-only-component-token') && localStorage.length===0 && sessionStorage.length===0"))
+
+    def test_echo_waits_for_current_result_checks_after_the_business_timeout_window(self):
+        frame = self.launch()
+        self.defer_echo = True
+        self.defer_result_checks = True
+        message = "Wait for the fixed Call and contribution proofs"
+        frame.locator("#message").fill(message)
+        frame.locator("#call").click()
+        deadline = time.monotonic() + 5
+        while self.deferred_echo is None and time.monotonic() < deadline:
+            self.page.wait_for_timeout(10)
+        self.assertIsNotNone(self.deferred_echo, "expected a submitted Skill Call")
+        route, cors, result = self.deferred_echo
+        self.assertEqual(json.loads(route.request.post_data)["timeout_ms"], 10000)
+        proof_path = "/api/platform/v1/calls/" + result["call"]["call_id"]
+        # Both operations fit within their own ten-second HTTP budgets. The
+        # iframe has to wait for their combined time and the host's other checks.
+        self.page.wait_for_timeout(4200)
+        with self.page.expect_response(lambda response: response.url == CORE + proof_path and response.status == 200):
+            route.fulfill(headers=cors, content_type="application/json", body=json.dumps(result))
+        deadline = time.monotonic() + 5
+        while not self.deferred_result_checks and time.monotonic() < deadline:
+            self.page.wait_for_timeout(10)
+        self.assertTrue(self.deferred_result_checks, "expected a contribution check after the Call proof")
+        self.page.wait_for_timeout(6200)
+        state = frame.locator("#skill-state").inner_text()
+        output = frame.locator("#result").inner_text()
+        self.defer_result_checks = False
+        for pending, headers, contribution in self.deferred_result_checks:
+            pending.fulfill(headers=headers, content_type="application/json", body=json.dumps(contribution))
+        self.assertEqual(state, "Waiting for the actual Skill result…")
+        self.assertEqual(output, "")
+        frame.wait_for_function("() => document.querySelector('#skill-state').textContent === 'Skill call completed.'", timeout=5000)
+        self.assertEqual(frame.locator("#result").inner_text(), message)
+        self.assertEqual(self.backend_messages, [{"message": message}])
+        self.assertEqual(sum(call["method"] == "POST" for call in self.calls), 1)
+        self.assertEqual(sum(call["path"] == proof_path for call in self.calls), 1)
 
     def assert_edited_message_keeps_result_attributed_to_submitted_message(self):
         frame = self.launch()
