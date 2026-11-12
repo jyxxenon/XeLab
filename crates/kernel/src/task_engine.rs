@@ -32,6 +32,11 @@ const IDLE_DEADLINE_DUE: &str = "t.admission IS NOT NULL
             )
         )
     )";
+const ACTIVE_ATTEMPTS: &str = "SELECT t.id,t.state,t.deadline_at,w.spec,s.id AS step_id,s.step_key,
+    s.attempt_count,s.state AS step_state,s.fence AS step_fence,a.fence AS attempt_fence,
+    a.id AS attempt_id,a.state AS attempt_state,a.lease_expires_at,a.broker_call_id
+    FROM attempts a JOIN task_steps s ON s.id=a.step_id JOIN tasks t ON t.id=s.task_id
+    JOIN workflows w ON w.id=t.workflow_id WHERE a.state IN ('leased','running')";
 
 #[derive(Debug, Clone)]
 pub struct Lease {
@@ -680,37 +685,67 @@ async fn promote_dependents(
 /// return to ready; an admitted dispatch must never be automatically replayed.
 pub async fn expire(tx: &Transaction<'_>) -> Result<bool> {
     db::auth_lock(tx, false).await?;
-    let Some(row) = tx
-        .query_opt(
-            "SELECT t.id,t.state,t.deadline_at,w.spec,s.id AS step_id,s.step_key,s.attempt_count,
-                a.id AS attempt_id,a.state AS attempt_state,a.lease_expires_at,a.broker_call_id
-         FROM attempts a JOIN task_steps s ON s.id=a.step_id JOIN tasks t ON t.id=s.task_id
-         JOIN workflows w ON w.id=t.workflow_id
-         WHERE a.state IN ('leased','running') AND a.lease_expires_at<=statement_timestamp()
+    let query = format!(
+        "{ACTIVE_ATTEMPTS} AND a.lease_expires_at<=statement_timestamp()
            AND s.state='running' AND s.fence=a.fence
-         ORDER BY a.lease_expires_at,a.id LIMIT 1 FOR UPDATE OF t,s,a SKIP LOCKED",
-            &[],
-        )
-        .await?
-    else {
+         ORDER BY a.lease_expires_at,a.id LIMIT 1 FOR UPDATE OF t,s,a SKIP LOCKED"
+    );
+    let Some(row) = tx.query_opt(&query, &[]).await? else {
         return Ok(false);
     };
     let now = clock(tx).await?;
     if row.get::<_, DateTime<Utc>>("lease_expires_at") > now {
         return Ok(false);
     }
+    settle_inactive_attempt(tx, &row, now).await?;
+    Ok(true)
+}
+
+/// Close old attempts after positive runtime stop or on the isolated restore
+/// target. The caller holds the offline and exclusive authorization fences.
+pub(crate) async fn reconcile_stopped(tx: &Transaction<'_>) -> Result<()> {
+    let query = format!("{ACTIVE_ATTEMPTS} ORDER BY t.id,s.id,a.id LIMIT 64 FOR UPDATE OF t,s,a");
+    let mut previous_task = None;
+    loop {
+        let rows = tx.query(&query, &[]).await?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        for row in rows {
+            let task: Uuid = row.get("id");
+            if previous_task.replace(task) == Some(task) {
+                return Err(Error::conflict("Task has multiple active steps"));
+            }
+            if row.get::<_, String>("step_state") != "running"
+                || row.get::<_, i64>("step_fence") != row.get::<_, i64>("attempt_fence")
+            {
+                return Err(Error::conflict(
+                    "Active Task attempt does not match its step fence",
+                ));
+            }
+            settle_inactive_attempt(tx, &row, clock(tx).await?).await?;
+        }
+    }
+}
+
+async fn settle_inactive_attempt(
+    tx: &Transaction<'_>,
+    row: &Row,
+    now: DateTime<Utc>,
+) -> Result<()> {
     let task = row.get("id");
     let step = row.get("step_id");
     let attempt = row.get("attempt_id");
-    if row.get::<_, String>("attempt_state") == "running" {
+    let call: Option<Uuid> = row.get("broker_call_id");
+    if row.get::<_, String>("attempt_state") == "running" || call.is_some() {
         set_attempt(tx, attempt, "unknown", now).await?;
         set_step(tx, step, "unknown", None, now).await?;
         let reason = Error::new(
             "OUTCOME_UNKNOWN",
-            "Task attempt expired without a committed outcome",
+            "Task attempt ended without a committed outcome",
             axum::http::StatusCode::CONFLICT,
         );
-        let reason = if let Some(call) = row.get::<_, Option<Uuid>>("broker_call_id") {
+        let reason = if let Some(call) = call {
             reason.with_resource(call)
         } else {
             reason
@@ -723,7 +758,7 @@ pub async fn expire(tx: &Transaction<'_>) -> Result<bool> {
         }
         step_event(tx, task, step, attempt, "unknown").await?;
     } else {
-        let spec = step_spec(&row, &row.get::<_, String>("step_key"))?;
+        let spec = step_spec(row, &row.get::<_, String>("step_key"))?;
         set_attempt(tx, attempt, "expired", now).await?;
         let task_state: String = row.get("state");
         if task_state == "running"
@@ -735,7 +770,7 @@ pub async fn expire(tx: &Transaction<'_>) -> Result<bool> {
             set_step(tx, step, "failed", None, now).await?;
             let reason = Error::new(
                 "DEADLINE_EXCEEDED",
-                "Task attempt expired before dispatch",
+                "Task attempt ended before dispatch",
                 axum::http::StatusCode::GATEWAY_TIMEOUT,
             );
             if task_state == "running" {
@@ -744,7 +779,7 @@ pub async fn expire(tx: &Transaction<'_>) -> Result<bool> {
             step_event(tx, task, step, attempt, "failed").await?;
         }
     }
-    Ok(true)
+    Ok(())
 }
 
 /// Close a bounded batch of Tasks whose deadline elapsed without active or
