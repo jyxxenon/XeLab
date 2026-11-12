@@ -188,13 +188,13 @@ async fn api_key_authority(
         "action":"credential.api-key.create",
         "resource":{"kind":"account","match":"ids","ids":[f.owner]}
     }));
-    let expiry = chrono::Utc::now() + chrono::Duration::hours(1);
+    let now = chrono::Utc::now();
     let issuer = f
         .api(
             "createApiKey",
             Some(f.owner),
             json!({"name":"Object list key issuer","inheritance":{"mode":"selected","rules":issuer_rules},
-                   "conditions":{"expires_at":expiry}}),
+                   "conditions":{"expires_at":now + chrono::Duration::hours(1)}}),
             "object-issue-list-issuer",
             None,
             None,
@@ -206,7 +206,7 @@ async fn api_key_authority(
         .api_as(
             ("createApiKey", Some(f.owner)),
             json!({"name":"Object list only","inheritance":{"mode":"selected","rules":list_rules},
-                   "conditions":{"expires_at":expiry}}),
+                   "conditions":{"expires_at":now + chrono::Duration::minutes(30)}}),
             "object-issue-list-key",
             None,
             None,
