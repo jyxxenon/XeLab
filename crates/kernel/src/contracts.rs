@@ -10,6 +10,8 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
 };
 
+mod workflow_spec;
+
 pub const OPENAPI: &str = include_str!("../../../docs/contracts/openapi.json");
 
 pub fn openapi() -> &'static Value {
@@ -47,11 +49,13 @@ pub fn validate(name: &str, input: &Value) -> Result<()> {
         v
     };
     drop(cache);
-    if validator.is_valid(input) {
-        Ok(())
-    } else {
-        Err(Error::invalid("Value does not match the existing contract"))
+    if !validator.is_valid(input) {
+        return Err(Error::invalid("Value does not match the existing contract"));
     }
+    if name == "WorkflowSpec" {
+        workflow_spec::validate_graph(input)?;
+    }
+    Ok(())
 }
 
 /// Attach only the checked-in models reachable from this schema. Each cached
@@ -150,6 +154,24 @@ pub fn validate_business(schema: &Value, input: &Value) -> Result<()> {
     } else {
         Err(Error::invalid("Business value does not match its schema"))
     }
+}
+
+/// PostgreSQL text and jsonb cannot represent U+0000.
+pub(crate) fn reject_jsonb_nul(value: &Value) -> Result<()> {
+    fn contains_nul(value: &Value) -> bool {
+        match value {
+            Value::String(value) => value.contains('\0'),
+            Value::Array(values) => values.iter().any(contains_nul),
+            Value::Object(values) => values
+                .iter()
+                .any(|(key, value)| key.contains('\0') || contains_nul(value)),
+            _ => false,
+        }
+    }
+    if contains_nul(value) {
+        return Err(Error::invalid("Stored JSON cannot contain NUL characters"));
+    }
+    Ok(())
 }
 
 // M1 accepts self-contained schemas only. It never resolves network or host-file refs.

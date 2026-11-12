@@ -41,11 +41,13 @@ pub mod secrets;
 pub(crate) mod skill_streams;
 pub mod skills;
 pub mod storage;
+mod tasks;
 pub mod tls;
 pub mod ui;
 pub mod upgrades;
 pub mod volumes;
 pub mod webui;
+mod workflows;
 
 #[allow(clippy::result_large_err)] // Generated Tonic service signatures use tonic::Status.
 pub mod rpc {
