@@ -154,12 +154,31 @@ async config => {
       value = await readJson(response);
     } else {
       const controller = new AbortController();
-      if (config.cancel && !config.afterCancel) setTimeout(() => controller.abort(
-        config.customCancel ? 'local component view closed' : undefined), 50);
+      const reason = config.customCancel ? 'local component view closed' : undefined;
+      const options = {};
+      if (config.cancel && !config.afterCancel && config.bodyCancel) {
+        // A fixed cancel timer can beat the fixture's first body chunk on a
+        // loaded runner; abort when the first chunk actually reaches the page.
+        const native = globalThis.fetch.bind(globalThis);
+        options.fetcher = async (...args) => {
+          const response = await native(...args);
+          const [probe, rest] = response.body.tee();
+          (async () => {
+            const reader = probe.getReader();
+            try { await reader.read(); } catch { /* stream already aborted */ }
+            reader.cancel().catch(() => {});
+            controller.abort(reason);
+          })();
+          return new Response(rest, {status: response.status, statusText: response.statusText, headers: response.headers});
+        };
+      } else if (config.cancel && !config.afterCancel) {
+        setTimeout(() => controller.abort(reason), 50);
+      }
       const key = crypto.randomUUID();
       const api = new ApiClient(
         {core_origin: config.core, client_id: 'http2-browser-component'},
         {accessToken: async () => config.fixtureToken},
+        options,
       );
       value = (await api.invoke('invokeSkill', {
         params: {skill_id: config.skill},
@@ -372,6 +391,7 @@ class Http2BrowserReader(unittest.TestCase):
                 "fixtureToken": FIXTURE_TOKEN, "primitive": primitive,
                 "deadline": kind.endswith("deadline"), "cancel": kind.endswith("cancel"),
                 "afterCancel": kind == "aftercancel",
+                "bodyCancel": kind == "bodycancel",
                 "customCancel": custom_cancel,
             })
             deadline = time.monotonic() + 3
