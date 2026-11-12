@@ -42,6 +42,8 @@ mod platform_versioned;
 
 #[path = "support/m4.rs"]
 mod m4;
+#[path = "support/oci_task.rs"]
+mod oci_task;
 #[path = "support/ordinary_effects.rs"]
 mod ordinary_effects;
 #[path = "support/upgrades.rs"]
@@ -856,6 +858,28 @@ async fn signed_oci_plugin_runs_through_the_management_api_and_recovers() {
         fixed_skill.1["call"]["provider_instance_id"],
         python_instance.to_string()
     );
+    let task_message = json!({"message":"fixed Capability Skill from an OCI Task"});
+    let task_call = oci_task::run(
+        &app,
+        &router,
+        token,
+        oci_task::TaskCase {
+            skill: skill.parse().unwrap(),
+            expected_instance: instance,
+            reference_call: contracts::id(&fixed_skill.1["call"], "call_id").unwrap(),
+            input_mapping: json!({"message":{"task_input":"/message"}}),
+            input: task_message.clone(),
+            expected_output: task_message,
+            suffix: "capability",
+        },
+    )
+    .await;
+    let task_contract: Value = c
+        .query_one("SELECT contract FROM calls WHERE id=$1", &[&task_call])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(task_contract, fixed_skill.1["call"]["contract"]);
     let python_input = json!({"contract":manifest["capabilities"][0]["contract"],"input":{"message":"hello OCI"},"provider_deployment_id":python_deployment,"timeout_ms":10000});
     let python_result = api(
         &router,
