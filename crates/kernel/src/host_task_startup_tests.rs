@@ -1,7 +1,7 @@
 //! Real PostgreSQL startup metadata settlement after fixture process stop.
 use super::*;
 
-async fn startup_connection(fixture: &TaskFixture) -> tokio_postgres::Client {
+pub(super) async fn startup_connection(fixture: &TaskFixture) -> tokio_postgres::Client {
     let mut c = fixture.host.app.db.connect().await.unwrap();
     let tx = c.transaction().await.unwrap();
     crate::admission::initialize(
@@ -16,7 +16,7 @@ async fn startup_connection(fixture: &TaskFixture) -> tokio_postgres::Client {
     c
 }
 
-async fn settle_startup(c: &mut tokio_postgres::Client) {
+pub(super) async fn settle_startup(c: &mut tokio_postgres::Client) {
     // Exercise the Controller transaction that follows a positive stop. This
     // component does not start or fence an OCI workload.
     let tx = c.transaction().await.unwrap();

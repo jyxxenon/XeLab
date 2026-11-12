@@ -39,6 +39,7 @@ pub(super) struct StepAdmission {
     step_key: String,
     provider: Option<Provider>,
     binding: Value,
+    pub(super) synchronous_skill: bool,
     pub(super) targets: Vec<Target>,
 }
 
@@ -63,10 +64,45 @@ pub(super) async fn resolve(
     ctx: &Context,
     step: &Value,
 ) -> Result<StepAdmission> {
+    resolve_selected(c, ctx, step, None).await
+}
+
+pub(super) async fn resolve_pinned(
+    c: &(impl GenericClient + Sync),
+    ctx: &Context,
+    step: &Value,
+    deployment: Uuid,
+    installation: Uuid,
+) -> Result<StepAdmission> {
+    resolve_selected(c, ctx, step, Some((deployment, installation))).await
+}
+
+async fn resolve_selected(
+    c: &(impl GenericClient + Sync),
+    ctx: &Context,
+    step: &Value,
+    pin: Option<(Uuid, Uuid)>,
+) -> Result<StepAdmission> {
     let mut targets = Vec::new();
     let step_key = string(step, "id")?.to_owned();
     let skill = if step.get("skill_id").is_some() {
-        let skill = crate::skills::resolve_for_invoke(c, ctx, id(step, "skill_id")?).await?;
+        let skill_id = id(step, "skill_id")?;
+        if let Some((_, installation)) = pin {
+            let row = c
+                .query_opt(
+                    "SELECT installation_id,archived_at IS NOT NULL AS archived
+                 FROM skills WHERE id=$1 FOR SHARE",
+                    &[&skill_id],
+                )
+                .await?
+                .ok_or_else(Error::not_found)?;
+            if row.get::<_, bool>("archived")
+                || row.get::<_, Uuid>("installation_id") != installation
+            {
+                return Err(Error::conflict("Scheduled Skill binding changed"));
+            }
+        }
+        let skill = crate::skills::resolve_for_invoke(c, ctx, skill_id).await?;
         if unsigned(&step["timeout_ms"])? > unsigned(&skill.definition["maximum_timeout_ms"])? {
             return Err(Error::invalid("Workflow step exceeds the Skill timeout"));
         }
@@ -79,16 +115,36 @@ pub(super) async fn resolve(
         None
     };
 
+    if let Some((deployment, installation)) = pin {
+        let row = c
+            .query_opt(
+                "SELECT installation_id,archived_at IS NOT NULL AS archived,
+                    coalesce(spec->>'enabled'='true',false) AS enabled
+             FROM deployments WHERE id=$1 FOR SHARE",
+                &[&deployment],
+            )
+            .await?
+            .ok_or_else(Error::not_found)?;
+        if row.get::<_, bool>("archived") || row.get::<_, Uuid>("installation_id") != installation {
+            return Err(Error::conflict("Scheduled deployment binding changed"));
+        }
+        if !row.get::<_, bool>("enabled") {
+            return Err(Error::unavailable("Scheduled deployment is disabled"));
+        }
+    }
+
     if let Some(skill) = skill
         .as_ref()
         .filter(|skill| skill.definition["target"]["kind"] == "http")
     {
-        let (provider, binding, target) = http_provider(c, ctx, skill).await?;
+        let (provider, binding, target, synchronous_skill) =
+            http_provider(c, ctx, skill, pin.map(|(deployment, _)| deployment)).await?;
         targets.push(target);
         return Ok(StepAdmission {
             step_key,
             provider: Some(provider),
             binding,
+            synchronous_skill,
             targets,
         });
     }
@@ -115,7 +171,7 @@ pub(super) async fn resolve(
     let provider = capability_provider(
         c,
         contract,
-        fixed,
+        pin.map(|(deployment, _)| deployment).or(fixed),
         skill.as_ref().map(|s| s.installation_id),
     )
     .await?;
@@ -125,10 +181,12 @@ pub(super) async fn resolve(
         None => json!({"kind":"capability", "contract":contract,
             "routing": if provider.is_some() { "fixed" } else { "stateless_direct" }}),
     };
+    let synchronous_skill = skill.is_some() && provider.is_some();
     Ok(StepAdmission {
         step_key,
         provider,
         binding,
+        synchronous_skill,
         targets,
     })
 }
@@ -181,15 +239,17 @@ async fn http_provider(
     c: &(impl GenericClient + Sync),
     ctx: &Context,
     skill: &ResolvedSkill,
-) -> Result<(Provider, Value, Target)> {
+    pinned_deployment: Option<Uuid>,
+) -> Result<(Provider, Value, Target, bool)> {
     let registry = crate::http_contracts::load(c, skill.installation_id).await?;
     let operation = registry.bind_skill(&skill.definition)?;
     let plugin = string(&skill.definition["target"], "plugin_id")?;
     let rows = c
         .query(
             "SELECT id,owner_id FROM deployments WHERE installation_id=$1 AND archived_at IS NULL
+         AND ($2::uuid IS NULL OR id=$2)
          ORDER BY id LIMIT 129 FOR SHARE",
-            &[&skill.installation_id],
+            &[&skill.installation_id, &pinned_deployment],
         )
         .await?;
     if rows.is_empty() {
@@ -225,6 +285,11 @@ async fn http_provider(
         "operation_id":operation.id, "http_contract_digest":operation.contract_digest,
         "method":operation.method.as_str(), "path":operation.path,
     });
+    let synchronous_skill = skill.definition["stream_item_schema"].is_null()
+        && !operation
+            .responses
+            .values()
+            .any(|response| response.media_type.as_deref() == Some("text/event-stream"));
     Ok((
         Provider {
             deployment,
@@ -232,5 +297,6 @@ async fn http_provider(
         },
         binding,
         target,
+        synchronous_skill,
     ))
 }

@@ -97,6 +97,74 @@ async fn actual_postgres_reset_rejects_old_authority_and_anchors_only_fresh_owne
     let secret = Uuid::new_v4();
     c.execute("INSERT INTO secrets(id,owner_id,name,encrypted_value,encryption_key_id,status,created_at,updated_at) VALUES($1,$2,'old secret',$3,'snapshot-key','active',now(),now())", &[&secret,&owner,&vec![1u8,2,3]]).await.unwrap();
     c.execute("INSERT INTO secret_bindings(id,deployment_id,secret_id,maximum_lease_seconds,status,created_at,updated_at) SELECT $1,deployment_id,$2,60,'active',now(),now() FROM backups WHERE id=$3", &[&Uuid::new_v4(),&secret,&f.backup]).await.unwrap();
+    let workflow = Uuid::new_v4();
+    c.execute(
+        "INSERT INTO workflows(id,owner_id,name,version,spec,status,created_at,updated_at)
+         VALUES($1,$2,'restored schedule workflow',1,'{}','active',now(),now())",
+        &[&workflow, &owner],
+    )
+    .await
+    .unwrap();
+    let schedule = Uuid::new_v4();
+    let legacy_schedule = Uuid::new_v4();
+    let deleted_schedule = Uuid::new_v4();
+    let proof = Some(json!({"version":1}));
+    let schedule_spec = json!({
+        "name":"restored schedule","workflow_id":workflow,"cron":"0 12 * * *","input":{}
+    });
+    let next_fire: chrono::DateTime<chrono::Utc> = c
+        .query_one("SELECT now()+interval '1 day'", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let task_delegation = Uuid::new_v4();
+    for id in [schedule, legacy_schedule, deleted_schedule, task_delegation] {
+        c.execute(
+            "INSERT INTO execution_delegations
+                (id,subject_id,issuer_credential_id,maximum_rules,run_as,expires_at,status,created_at)
+             VALUES($1,$2,$3,'[]','user',$4,'active',now())",
+            &[&id, &owner, &old.credential, &next_fire],
+        )
+        .await
+        .unwrap();
+    }
+    for (id, admission, deleted) in [
+        (schedule, proof.clone(), false),
+        (legacy_schedule, None, false),
+        (deleted_schedule, proof.clone(), true),
+    ] {
+        c.execute(
+            "INSERT INTO schedules
+                (id,owner_id,spec,delegation_id,admission,next_fire_at,deleted_at,created_at,updated_at)
+             VALUES($1,$2,$3,$1,$4,$5,CASE WHEN $6 THEN now() END,now(),now())",
+            &[&id, &owner, &schedule_spec, &admission, &next_fire, &deleted],
+        )
+        .await
+        .unwrap();
+    }
+    let linked_task = Uuid::new_v4();
+    c.execute(
+        "INSERT INTO tasks(id,owner_id,workflow_id,delegation_id,input,deadline_at,state,created_at,updated_at)
+         VALUES($1,$2,$3,$4,'{}',$5,'succeeded',now(),now())",
+        &[&linked_task, &owner, &workflow, &task_delegation, &next_fire],
+    )
+    .await
+    .unwrap();
+    c.execute(
+        "INSERT INTO schedule_fires(schedule_id,scheduled_at,task_id,outcome) VALUES
+             ($1,$4::timestamptz-interval '2 hours',$5,'pending'),
+             ($1,$4::timestamptz-interval '1 hour',NULL,'skipped'),
+             ($1,$4,NULL,'pending'),($2,$4,NULL,'pending'),($3,$4,NULL,'pending')",
+        &[
+            &schedule,
+            &legacy_schedule,
+            &deleted_schedule,
+            &next_fire,
+            &linked_task,
+        ],
+    )
+    .await
+    .unwrap();
     assert!(f.app.db.check().await.is_ok());
     let recovery = gate(&c, f.backup).await;
     assert!(f.app.db.check().await.is_err());
@@ -109,6 +177,43 @@ async fn actual_postgres_reset_rejects_old_authority_and_anchors_only_fresh_owne
         f.app.db.check().await.is_err(),
         "rebuilding must still block startup"
     );
+    for (id, expected_fire, expected_revision, expected_admission, pending_outcome) in [
+        (schedule, None, 2, proof.clone(), "paused"),
+        (legacy_schedule, Some(next_fire), 1, None, "pending"),
+        (deleted_schedule, Some(next_fire), 1, proof, "pending"),
+    ] {
+        let row = c
+            .query_one(
+                "SELECT s.next_fire_at,s.revision,s.admission,s.spec,e.status,f.outcome
+                 FROM schedules s JOIN execution_delegations e ON e.id=s.delegation_id
+                 JOIN schedule_fires f ON f.schedule_id=s.id AND f.scheduled_at=$2 WHERE s.id=$1",
+                &[&id, &next_fire],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            row.get::<_, Option<chrono::DateTime<chrono::Utc>>>(0),
+            expected_fire
+        );
+        assert_eq!(row.get::<_, i64>(1), expected_revision);
+        assert_eq!(row.get::<_, Option<Value>>(2), expected_admission);
+        assert_eq!(row.get::<_, Value>(3), schedule_spec);
+        assert_eq!(row.get::<_, &str>(4), "revoked");
+        assert_eq!(row.get::<_, &str>(5), pending_outcome);
+    }
+    let history = c
+        .query(
+            "SELECT task_id,outcome FROM schedule_fires
+             WHERE schedule_id=$1 AND scheduled_at<$2 ORDER BY scheduled_at",
+            &[&schedule, &next_fire],
+        )
+        .await
+        .unwrap();
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0].get::<_, Option<Uuid>>(0), Some(linked_task));
+    assert_eq!(history[0].get::<_, &str>(1), "pending");
+    assert_eq!(history[1].get::<_, Option<Uuid>>(0), None);
+    assert_eq!(history[1].get::<_, &str>(1), "skipped");
     for token in [&f.token, old_child_token] {
         assert!(f
             .app

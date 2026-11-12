@@ -7,7 +7,7 @@ struct Submitted {
     definition_digest: String,
 }
 
-async fn submit(f: &Component, index: usize, mapping: Value, input: Value) -> Submitted {
+async fn publish_workflow(f: &Component, index: usize, mapping: Value) -> (Uuid, Uuid) {
     let definition = &f.manifest["skills"][index];
     let registered = management(
         &f.router,
@@ -49,12 +49,17 @@ async fn submit(f: &Component, index: usize, mapping: Value, input: Value) -> Su
     )
     .await;
     assert_eq!(workflow.0, 201, "{}", workflow.1);
+    (skill, contracts::id(&workflow.1, "id").unwrap())
+}
+
+async fn submit(f: &Component, index: usize, mapping: Value, input: Value) -> Submitted {
+    let (skill, workflow) = publish_workflow(f, index, mapping).await;
     let task = management(
         &f.router,
         "createTask",
         &[],
         &f.token,
-        json!({"workflow_id":workflow.1["id"],"input":input}),
+        json!({"workflow_id":workflow,"input":input}),
         &format!("task-http-submit-{index}"),
         None,
     )
@@ -64,8 +69,115 @@ async fn submit(f: &Component, index: usize, mapping: Value, input: Value) -> Su
     Submitted {
         task: contracts::id(&task.1, "id").unwrap(),
         skill,
-        definition_digest: crate::skills::definition_digest(definition).unwrap(),
+        definition_digest: crate::skills::definition_digest(&f.manifest["skills"][index]).unwrap(),
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn postgres_task_http_schedule_reuses_frozen_pin_and_dispatches_when_ready() {
+    let Some(f) = Component::new().await else {
+        return;
+    };
+    let (skill, workflow) =
+        publish_workflow(&f, 3, json!({"message":{"task_input":"/message"}})).await;
+    let input = json!({"message":"scheduled fixed Task PUT"});
+    let created = management(
+        &f.router,
+        "createSchedule",
+        &[],
+        &f.token,
+        json!({"name":"fixed HTTP Schedule","workflow_id":workflow,"cron":"* * * * *",
+               "timezone":"UTC","input":input}),
+        "schedule-fixed-http-create",
+        None,
+    )
+    .await;
+    assert_eq!(created.0, 201, "{}", created.1);
+    let schedule = contracts::id(&created.1, "id").unwrap();
+    let schedule_delegation = contracts::id(&created.1, "delegation_id").unwrap();
+    let mut c = f.app.db.connect().await.unwrap();
+    let due: chrono::DateTime<chrono::Utc> = c
+        .query_one(
+            "SELECT next_fire_at FROM schedules WHERE id=$1",
+            &[&schedule],
+        )
+        .await
+        .unwrap()
+        .get(0);
+
+    // A later eligible installation binding must not make the previously
+    // admitted pin ambiguous or change which deployment receives this fire.
+    c.execute(
+        "INSERT INTO deployments(id,owner_id,installation_id,spec,phase,created_at,updated_at)
+         SELECT $1,owner_id,installation_id,jsonb_set(spec,'{enabled}','false'),'disabled',now(),now()
+         FROM deployments WHERE id=$2",
+        &[&Uuid::new_v4(), &f.deployment],
+    )
+    .await
+    .unwrap();
+    c.execute(
+        "UPDATE deployments SET phase='reconciling' WHERE id=$1",
+        &[&f.deployment],
+    )
+    .await
+    .unwrap();
+    let tx = c.transaction().await.unwrap();
+    assert!(
+        crate::schedules::tick(&tx, &f.app.auth, due, due - chrono::TimeDelta::seconds(1))
+            .await
+            .unwrap()
+    );
+    tx.commit().await.unwrap();
+    let fire = c
+        .query_one(
+            "SELECT f.task_id,f.outcome,t.state,t.input,t.admission,t.delegation_id,
+                    s.provider_deployment_id
+             FROM schedule_fires f JOIN tasks t ON t.id=f.task_id
+             JOIN task_steps s ON s.task_id=t.id WHERE f.schedule_id=$1 AND f.scheduled_at=$2",
+            &[&schedule, &due],
+        )
+        .await
+        .unwrap();
+    let task: Uuid = fire.get("task_id");
+    assert_eq!(fire.get::<_, String>("outcome"), "created");
+    assert_eq!(fire.get::<_, String>("state"), "queued");
+    assert_eq!(fire.get::<_, Value>("input"), input);
+    assert_ne!(fire.get::<_, Uuid>("delegation_id"), schedule_delegation);
+    assert_eq!(fire.get::<_, Uuid>("provider_deployment_id"), f.deployment);
+    let admitted: Value = fire.get("admission");
+    assert_eq!(admitted["steps"][0]["deployment_id"], json!(f.deployment));
+    assert_eq!(
+        admitted["steps"][0]["installation_id"],
+        json!(f.installation)
+    );
+    assert_eq!(admitted["steps"][0]["binding"]["skill_id"], json!(skill));
+    assert!(!crate::task_worker::run_once(&f.app).await.unwrap());
+
+    c.execute(
+        "UPDATE deployments SET phase='ready' WHERE id=$1",
+        &[&f.deployment],
+    )
+    .await
+    .unwrap();
+    assert!(crate::task_worker::run_once(&f.app).await.unwrap());
+    let completed = c
+        .query_one(
+            "SELECT t.state,t.output,a.state AS attempt_state,c.state AS call_state,c.http_binding
+             FROM tasks t JOIN task_steps s ON s.task_id=t.id JOIN attempts a ON a.step_id=s.id
+             JOIN calls c ON c.id=a.broker_call_id WHERE t.id=$1",
+            &[&task],
+        )
+        .await
+        .unwrap();
+    for column in ["state", "attempt_state", "call_state"] {
+        assert_eq!(completed.get::<_, String>(column), "succeeded", "{column}");
+    }
+    assert_eq!(completed.get::<_, Value>("output"), json!({"http":input}));
+    let binding: Value = completed.get("http_binding");
+    assert_eq!(binding["deployment_id"], json!(f.deployment));
+    assert_eq!(binding["installation_id"], json!(f.installation));
+    assert_eq!(binding["method"], "PUT");
+    assert!(!crate::task_worker::run_once(&f.app).await.unwrap());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

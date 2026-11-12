@@ -18,6 +18,9 @@ mod resolution;
 #[path = "host_task_retry_tests.rs"]
 mod retry;
 
+#[path = "host_task_schedule_tests.rs"]
+mod schedule;
+
 struct TaskFixture {
     host: Fixture,
     workflow: Uuid,

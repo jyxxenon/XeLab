@@ -79,6 +79,21 @@ pub(crate) async fn reset_rows(
         &[],
     )
     .await?;
+    // A restored Schedule needs fresh owner approval before it can fire.
+    // Existing Task links and pre-admission history remain intact.
+    c.execute(
+        "UPDATE schedules SET next_fire_at=NULL,revision=revision+1,updated_at=clock_timestamp()
+         WHERE admission IS NOT NULL AND deleted_at IS NULL AND next_fire_at IS NOT NULL",
+        &[],
+    )
+    .await?;
+    c.execute(
+        "UPDATE schedule_fires f SET outcome='paused' FROM schedules s
+         WHERE f.schedule_id=s.id AND s.admission IS NOT NULL AND s.deleted_at IS NULL
+           AND f.outcome='pending' AND f.task_id IS NULL",
+        &[],
+    )
+    .await?;
     c.execute(
         "UPDATE rpc_delegations SET status='revoked' WHERE status='active'",
         &[],

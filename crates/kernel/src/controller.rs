@@ -78,7 +78,13 @@ pub async fn run(app: Arc<App>) {
             && !app.shutdown.load(Ordering::SeqCst)
             && !app.leader.is_closed()
         {
-            workers.spawn(crate::task_worker::run(app.clone()));
+            let app = app.clone();
+            workers.spawn(async move {
+                tokio::join!(
+                    crate::task_worker::run(app.clone()),
+                    crate::schedules::run(app)
+                );
+            });
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }

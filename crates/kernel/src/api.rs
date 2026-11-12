@@ -408,6 +408,7 @@ fn dispatch<'a>(
         let name = op["operationId"].as_str().unwrap();
         crate::workflows::validate_query(name, uri.query().unwrap_or(""))?;
         crate::tasks::validate_query(name, uri.query().unwrap_or(""))?;
+        crate::schedules::validate_query(name, uri.query().unwrap_or(""))?;
         if name == "getLiveness" {
             return Ok((
                 json!({"status":"ok","spec_version":crate::SPEC_VERSION}),
@@ -621,10 +622,11 @@ fn dispatch<'a>(
             )
             .await?;
             if let Some(row)=tx.query_opt("SELECT fingerprint,safe_response,response_status,sensitive,resource_id FROM idempotency_records WHERE subject_id=$1 AND credential_id=$2 AND method=$3 AND path=$4 AND key=$5 AND expires_at>now()",&[&ctx.subject,&ctx.credential,&method,&path,&key]).await?{
-            let task_recovery = matches!(name, "resolveUnknownStep" | "cancelTask" | "retryTask");
-            if task_recovery {
-                // A stale Task grant must not reveal whether a previously
-                // submitted idempotency key or fingerprint exists.
+            let authorize_before_replay = matches!(name, "resolveUnknownStep" | "cancelTask" | "retryTask")
+                || crate::schedules::handles(name);
+            if authorize_before_replay {
+                // A stale grant must not reveal whether a submitted
+                // idempotency key or fingerprint exists.
                 authorize_operation(&tx, &app.auth, &ctx, name, &params, &body).await?;
             }
             if row.get::<_,String>("fingerprint")!=fingerprint{return Err(Error::new("IDEMPOTENCY_CONFLICT","Idempotency key fingerprint differs",StatusCode::CONFLICT));}
@@ -637,7 +639,7 @@ fn dispatch<'a>(
             if let Some(value) = response {
                 if name == "trustPublisher" && row.get::<_,i32>("response_status") == 201 {
                     auth::authorize(&tx, &ctx, "publisher.trust", &Resource::new("publisher", "new", Some(ctx.subject))).await?;
-                } else if !task_recovery {
+                } else if !authorize_before_replay {
                     authorize_operation(&tx, &app.auth, &ctx, name, &params, &body).await?;
                 }
                 if matches!(name, "upgradeDeployment" | "rollbackDeployment") {
@@ -696,6 +698,8 @@ fn dispatch<'a>(
         crate::workflows::execute(&tx,&app.auth,&ctx,name,&params,&body,&headers,uri.query().unwrap_or("")).await?
     } else if crate::tasks::handles(name) {
         crate::tasks::execute(&tx,&app.auth,&ctx,name,&params,&body,&headers,uri.query().unwrap_or("")).await?
+    } else if crate::schedules::handles(name) {
+        crate::schedules::execute(&tx,&app.auth,&ctx,name,&params,&body,&headers,uri.query().unwrap_or("")).await?
     } else if crate::volumes::handles(name) {
         crate::volumes::execute(&tx,app,&ctx,name,&params,&body,&headers,uri.query().unwrap_or("" )).await?
     } else if crate::backups::handles(name) {
@@ -1098,6 +1102,9 @@ async fn authorize_operation(
     }
     if crate::tasks::handles(name) {
         return crate::tasks::authorize(c, ctx, name, params, body).await;
+    }
+    if crate::schedules::handles(name) {
+        return crate::schedules::authorize(c, ctx, name, params, body).await;
     }
     if secrets::handles(name) {
         return secrets::authorize(c, ctx, name, params, body).await;
