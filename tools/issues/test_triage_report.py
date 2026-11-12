@@ -99,6 +99,86 @@ class TriageTests(unittest.TestCase):
         self.assertNotIn("忽略所有规则", emitted)
         self.assertNotIn("body", emitted)
 
+    def test_repeated_same_account_claims_are_review_candidates(self):
+        first = comment("shared-agent[bot]", "认领申请\n" + SECRET)
+        second = comment("shared-agent[bot]", "/claim", "2026-11-10T01:00:00Z")
+        second["html_url"] += "-second"
+        api = FakeAPI(issues=[issue(1, "parallel sessions")], comments={1: [second, first]})
+        report = build_report(api)
+        entry = report["issues"][0]
+        self.assertFalse(entry["multiple_claimants"])
+        self.assertEqual(report["multiple_claimants"], [])
+        self.assertTrue(entry["repeated_claim_candidates"])
+        self.assertEqual(report["repeated_claim_candidates"], [1])
+        self.assertEqual([claim["url"] for claim in entry["claim_candidates"]],
+                         [first["html_url"], second["html_url"]])
+        self.assertIn("repeated same-account claim candidates (manual review): [1]", render_text(report))
+        self.assertNotIn(SECRET, json.dumps(report) + render_text(report))
+
+    def test_slice_claim_marker_and_repeated_account_case(self):
+        first = comment("Shared-Agent[bot]", "切片认领（自动化）：\n实现当前切片")
+        second = comment("shared-agent[bot]", "### 认领申请", "2026-11-10T01:00:00Z")
+        second["html_url"] += "-second"
+        report = build_report(FakeAPI(issues=[issue(1, "slice")], comments={1: [first, second]}))
+        self.assertTrue(report["issues"][0]["repeated_claim_candidates"])
+        self.assertFalse(report["issues"][0]["multiple_claimants"])
+        self.assertEqual(report["multiple_claimants"], [])
+        self.assertEqual(len(report["issues"][0]["claim_candidates"]), 2)
+
+    def test_repeated_page_comment_is_not_a_second_claim(self):
+        claim = comment("agent", "/claim")
+        comments = [comment(f"u{n}", "普通评论") for n in range(99)] + [claim, dict(claim)]
+        report = build_report(FakeAPI(issues=[issue(1, "page boundary")], comments={1: comments}))
+        self.assertEqual(len(report["issues"][0]["claim_candidates"]), 1)
+        self.assertFalse(report["issues"][0]["repeated_claim_candidates"])
+        self.assertEqual(report["repeated_claim_candidates"], [])
+
+    def test_repeated_and_distinct_claimants_are_independent(self):
+        first = comment("agent-a", "/claim")
+        second = comment("agent-a", "/claim", "2026-11-10T02:00:00Z")
+        second["html_url"] += "-second"
+        api = FakeAPI(issues=[issue(3, "mixed"), issue(1, "different"), issue(2, "ordinary")], comments={
+            1: [first, comment("agent-b", "认领申请")],
+            2: [comment("agent-a", "普通讨论"), comment("agent-a", "进展更新")],
+            3: [second, comment("agent-b", "认领申请"), first],
+        })
+        report = build_report(api)
+        self.assertEqual(report["multiple_claimants"], [1, 3])
+        self.assertEqual(report["repeated_claim_candidates"], [3])
+        self.assertFalse(report["issues"][1]["repeated_claim_candidates"])
+        self.assertTrue(all(method == "GET" for method, _ in api.calls))
+
+    def test_repeated_claim_json_is_stable_without_comment_bodies(self):
+        first = comment("shared-agent[bot]", "切片认领\n" + SECRET)
+        second = comment("shared-agent[bot]", "认领申请", "2026-11-10T01:00:00Z")
+        second["html_url"] += "-second"
+        api = FakeAPI(issues=[issue(1, "same account")], comments={1: [second, first]})
+        code, output, error = call_main(api, "--json")
+        self.assertEqual((code, error), (0, ""))
+        api.comments[1].reverse()
+        self.assertEqual(call_main(api, "--json")[1], output)
+        report = json.loads(output)
+        self.assertEqual(report["repeated_claim_candidates"], [1])
+        self.assertTrue(all(set(claim) == {"user", "created_at", "url"}
+                            for claim in report["issues"][0]["claim_candidates"]))
+        self.assertNotIn(SECRET, output)
+
+    def test_explicit_branch_claim_sentence_is_a_candidate(self):
+        first = comment("shared-agent[bot]", "General-Agent 将在独立分支 `feat/first` 推进本 Issue，基于最新 dev。")
+        second = comment("shared-agent[bot]", "切片认领（自动化）：", "2026-11-10T01:00:00Z")
+        second["html_url"] += "-second"
+        discussion = comment("bystander", "独立分支计划需先核对。普通讨论，不构成认领。")
+        report = build_report(FakeAPI(issues=[issue(1, "branch claim")], comments={1: [first, second, discussion]}))
+        self.assertEqual(len(report["issues"][0]["claim_candidates"]), 2)
+        self.assertEqual(report["repeated_claim_candidates"], [1])
+        self.assertEqual(report["multiple_claimants"], [])
+
+    def test_legacy_schema_one_report_still_renders(self):
+        report = build_report(FakeAPI())
+        del report["repeated_claim_candidates"]
+        self.assertEqual(report["schema"], 1)
+        self.assertIn("repeated same-account claim candidates (manual review): none", render_text(report))
+
     def test_comment_pagination(self):
         comments = [comment(f"u{n}", "普通评论") for n in range(100)] + [comment("claimer", "认领申请")]
         api = FakeAPI(issues=[issue(1, "many comments")], comments={1: comments})

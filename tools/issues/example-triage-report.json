@@ -20,6 +20,7 @@
       ],
       "multiple_claimants": false,
       "number": 3,
+      "repeated_claim_candidates": false,
       "status": "status:needs-triage",
       "title": "[bug] add   offline ARTIFACT checker!",
       "url": "https://github.com/example/project/issues/3"
@@ -35,6 +36,11 @@
           "user": "agent-x"
         },
         {
+          "created_at": "2026-11-10T01:30:00Z",
+          "url": "https://github.com/example/project/issues/5#issuecomment-agent-x-second",
+          "user": "agent-x"
+        },
+        {
           "created_at": "2026-11-10T02:00:00Z",
           "url": "https://github.com/example/project/issues/1#issuecomment-agent-y",
           "user": "agent-y"
@@ -45,6 +51,7 @@
       ],
       "multiple_claimants": true,
       "number": 5,
+      "repeated_claim_candidates": true,
       "status": "status:in-progress",
       "title": "claim collision example",
       "url": "https://github.com/example/project/issues/5"
@@ -57,6 +64,7 @@
       ],
       "multiple_claimants": false,
       "number": 7,
+      "repeated_claim_candidates": false,
       "status": "no-status",
       "title": "[feature] Add offline artifact checker",
       "url": "https://github.com/example/project/issues/7"
@@ -69,6 +77,7 @@
       ],
       "multiple_claimants": false,
       "number": 9,
+      "repeated_claim_candidates": false,
       "status": "status:blocked",
       "title": "blocked host research",
       "url": "https://github.com/example/project/issues/9"
@@ -84,6 +93,9 @@
   ],
   "note": "Read-only report. Duplicate and claim matches are candidates for manual review, never definitive rulings; no issue state was changed.",
   "open_issues": 4,
+  "repeated_claim_candidates": [
+    5
+  ],
   "repository": "example/project",
   "schema": 1,
   "unassigned": [

@@ -2,8 +2,9 @@ example/project: 4 open issues (1 PRs excluded)
 needs triage (no-status or needs-triage): [3, 7]
 unassigned: [3, 7, 9]
 multiple claim candidates (manual review): [5]
+repeated same-account claim candidates (manual review): [5]
   #3 status:needs-triage assignees=none claims=0 [bug] add   offline ARTIFACT checker!
-  #5 status:in-progress assignees=['maintainer'] claims=2 claim collision example
+  #5 status:in-progress assignees=['maintainer'] claims=3 claim collision example
   #7 no-status assignees=none claims=0 [feature] Add offline artifact checker
   #9 status:blocked assignees=none claims=0 blocked host research
 duplicate candidates (NOT definitive; manual review required):
