@@ -13,6 +13,8 @@ SPEC.loader.exec_module(DRIVER)
 CORE = "https://core.test"
 DEPLOYMENT = "00000000-0000-4000-8000-000000000002"
 SECRET = "must-never-appear-in-report"
+CALL_PROOF = "/api/platform/v1/calls/00000000-0000-4000-8000-000000000003"
+CONTRIBUTION = f"/api/platform/v1/ui/contributions/{DEPLOYMENT}/echo_widget"
 
 
 class Request:
@@ -116,12 +118,16 @@ class SkillCallDiagnostics(unittest.TestCase):
         self.bodies = SimpleNamespace(requests={})
         self.audit = DRIVER.SkillCallAudit(self.report, self.bodies, "valid_call", 2)
 
+    def observe_read(self, path, status, method="GET"):
+        DRIVER.observe_skill_read_status(self.report["http"], self.audit, method, path, status)
+
     def test_stage_timeline_is_bounded_and_uses_fixed_labels(self):
         for stage in DRIVER.SKILL_STAGES:
             self.audit.mark(stage)
         entry = self.report["skill_call_diagnostics"][-1]
         self.assertEqual([item["stage"] for item in entry["timeline"]], list(DRIVER.SKILL_STAGES))
         self.assertLessEqual(entry["elapsed_ms"], 300000)
+        self.assertEqual(entry["status"], "completed")
         self.assertEqual(self.report["step"], "valid_call_complete")
         with self.assertRaises(DRIVER.CheckFailed):
             self.audit.mark(SECRET)
@@ -175,16 +181,63 @@ class SkillCallDiagnostics(unittest.TestCase):
         self.assertEqual(self.audit.mismatch(), "result_mismatch")
         self.audit.entry["iframe"]["result_matches"] = True
         self.assertEqual(self.audit.mismatch(), "call_proof_not_observed")
-        self.report["http"]["call_proof_statuses"] = [503]
+        self.observe_read(CALL_PROOF, 503)
         self.assertEqual(self.audit.mismatch(), "call_proof_not_successful")
-        self.report["http"]["call_proof_statuses"].append(200)
+        self.observe_read(CALL_PROOF, 200)
         self.assertEqual(self.audit.mismatch(), "contribution_recheck_not_observed")
-        self.report["http"]["contribution_recheck_statuses"] = [500]
+        self.observe_read(CONTRIBUTION, 500)
         self.assertEqual(self.audit.mismatch(), "contribution_recheck_not_successful")
-        self.report["http"]["contribution_recheck_statuses"].append(200)
+        self.observe_read(CONTRIBUTION, 200)
         self.assertEqual(self.audit.mismatch(), "none")
         self.assertEqual(self.audit.entry["attempts_delta"], 1)
         self.assertEqual(self.audit.entry["successes_delta"], 0)
+
+    def test_failed_contribution_recheck_is_reported_before_missing_frame(self):
+        self.report["http"]["skill_post_attempts"] = 1
+        self.bodies.requests[1] = {"expected_at_start": 2, "response_ms": 10, "verified": True}
+        self.observe_read(CONTRIBUTION, 200)
+        self.observe_read(CALL_PROOF, 200)
+        self.observe_read(CONTRIBUTION, 503)
+        frame = SimpleNamespace(is_detached=lambda: True)
+        with patch.object(DRIVER, "wait_for_observers"):
+            self.audit.failure(frame, SimpleNamespace(), RuntimeError(SECRET), SECRET)
+        self.assertEqual(self.report["http"]["contribution_recheck_statuses"], [200, 503])
+        self.assertEqual(self.audit.entry["contribution_recheck_statuses"], [200, 503])
+        self.assertEqual(self.audit.entry["mismatch"], "contribution_recheck_not_successful")
+        self.assertTrue(self.audit.entry["iframe"]["detached"])
+
+    def test_full_shared_history_does_not_hide_new_audit_reads(self):
+        for _ in range(12):
+            self.observe_read(CALL_PROOF, 404)
+            self.observe_read(CONTRIBUTION, 503)
+        previous = self.audit
+        previous.mark("complete")
+        self.audit = DRIVER.SkillCallAudit(self.report, self.bodies, "next_call", 3)
+        self.observe_read(CALL_PROOF, 200)
+        self.observe_read(CONTRIBUTION, 200)
+        for key, old in (("call_proof_statuses", 404), ("contribution_recheck_statuses", 503)):
+            self.assertEqual(self.report["http"][key], [old] * 7 + [200])
+            self.assertEqual(previous.entry[key], [old] * 8)
+            self.assertEqual(self.audit.entry[key], [200])
+
+    def test_read_statuses_stay_with_the_active_audit_and_selected_gets(self):
+        self.observe_read(CALL_PROOF, 200)
+        self.audit.mark("complete")
+        previous = self.audit
+        self.observe_read(CONTRIBUTION, 404)
+        DRIVER.observe_skill_read_status(self.report["http"], None, "GET", CONTRIBUTION, 503)
+        self.audit = DRIVER.SkillCallAudit(self.report, self.bodies, "next_call", 3)
+        self.observe_read(CALL_PROOF, 401, "OPTIONS")
+        self.observe_read(CONTRIBUTION, 401, "POST")
+        self.observe_read("/api/platform/v1/ui/contributions", 403)
+        self.observe_read("/api/platform/v1/calls", 403)
+        self.observe_read("/api/platform/v1/node", 403)
+        self.assertEqual(self.report["http"]["call_proof_statuses"], [200])
+        self.assertEqual(self.report["http"]["contribution_recheck_statuses"], [404, 503])
+        self.assertEqual(previous.entry["call_proof_statuses"], [200])
+        self.assertEqual(previous.entry["contribution_recheck_statuses"], [])
+        self.assertEqual(self.audit.entry["call_proof_statuses"], [])
+        self.assertEqual(self.audit.entry["contribution_recheck_statuses"], [])
 
     def test_observer_pump_reports_fixed_inner_stages(self):
         class Page:
@@ -220,8 +273,8 @@ class SkillCallDiagnostics(unittest.TestCase):
 
         self.report["http"]["skill_post_attempts"] = 1
         self.report["http"]["actual_skill_successes"] = 1
-        self.report["http"]["call_proof_statuses"] = [200]
-        self.report["http"]["contribution_recheck_statuses"] = [200]
+        self.observe_read(CALL_PROOF, 200)
+        self.observe_read(CONTRIBUTION, 200)
         self.bodies.requests[1] = {"expected_at_start": 2, "response_ms": 10, "verified": True}
         with patch.object(DRIVER, "wait_for_observers", side_effect=RuntimeError(SECRET)):
             self.audit.mark("audit_pump")
