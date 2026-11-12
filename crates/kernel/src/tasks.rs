@@ -16,6 +16,7 @@ mod authority;
 mod reads;
 #[cfg(test)]
 mod restart_tests;
+pub(crate) mod snapshot;
 mod targets;
 
 pub(crate) fn handles(name: &str) -> bool {
