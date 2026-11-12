@@ -22,6 +22,7 @@ const button = (text, action, props = {}) => node('button', {type: 'button', onc
 // script-src 'self' CSP keeps protecting the shell.
 const SVG_NS = 'http://www.w3.org/2000/svg';
 const ICONS = {
+  overview: [{tag:'rect',x:3.5,y:4.5,width:17,height:15,rx:1.8},{tag:'path',d:'M3.5 9.5h17M9.5 9.5v10'}],
   plugins: [{tag:'rect',x:4,y:4,width:7,height:7,rx:1.6},{tag:'rect',x:13,y:4,width:7,height:7,rx:1.6},{tag:'rect',x:4,y:13,width:7,height:7,rx:1.6},{tag:'rect',x:13,y:13,width:7,height:7,rx:1.6}],
   skills: [{tag:'path',d:'M13 3 6 13h5l-1 8 8-11h-5l0-7Z'}],
   accounts: [{tag:'circle',cx:12,cy:8.4,r:3.2},{tag:'path',d:'M5.2 20c.6-3.4 3.4-5.4 6.8-5.4s6.2 2 6.8 5.4'}],
@@ -696,7 +697,145 @@ async function tasks(win) {
   const result=node('div');
   win.content.replaceChildren(toolbar(win,'任务与能力'),node('p',{},'查询核心已经接受的 Operation；结果以其持久终态为准。'),node('div',{class:'inline-field'},input,button('查询 Operation',async()=>{result.replaceChildren(state('loading','查询中…'));try{const response=await request('getOperation',{params:{operation_id:input.value.trim()},signal:win.controller.signal});result.replaceChildren(raw(response.data));}catch(error){result.replaceChildren(failure(error));}})),result,state('unavailable','Batch / Workflow / 微插件 / 知识库尚不可用','未安装或实现的后续执行系统没有可展示的运行结果。'));
 }
+// Read-only overview (issue #14). Each section calls exactly one existing
+// public API and renders only whitelisted non-sensitive scalars: plugin
+// config, host runtime identifiers, credentials and raw response objects
+// never reach the DOM. Sections load, fail and refresh independently; no
+// trends, global totals or automatic polling are invented.
+const overviewNodeFields = [
+  ['host_cpu_millis','宿主 CPU（毫核）'],
+  ['host_memory_bytes','宿主内存（字节）'],
+  ['plugin_cpu_pool_millis','插件 CPU 池（毫核）'],
+  ['plugin_memory_pool_bytes','插件内存池（字节）'],
+  ['reserved_cpu_millis','已预留 CPU（毫核）'],
+  ['reserved_memory_bytes','已预留内存（字节）'],
+  ['admission_enabled','准入控制'],
+  ['updated_at','核心更新时间'],
+];
+const overviewNodeConfigFields = [
+  ['profile','运行 Profile'],
+  ['kernel_cpu_millis','内核预留 CPU（毫核）'],
+  ['kernel_memory_bytes','内核预留内存（字节）'],
+  ['system_cpu_millis','系统预留 CPU（毫核）'],
+  ['system_memory_bytes','系统预留内存（字节）'],
+];
+function overviewScalars(value, fields) {
+  const entries = [];
+  for (const [key, label] of fields) {
+    const item = value?.[key];
+    if (item === null || typeof item === 'string' || typeof item === 'boolean' || Number.isSafeInteger(item)) entries.push([label, item]);
+  }
+  return entries;
+}
+function overviewText(value) {
+  if (value === null || value === undefined) return '—';
+  if (typeof value === 'boolean') return value ? '是' : '否';
+  return String(value);
+}
+function overviewFacts(entries) {
+  const list = node('dl', {class:'overview-facts'});
+  for (const [label, value] of entries) list.append(node('dt', {}, label), node('dd', {}, overviewText(value)));
+  return list;
+}
+function overviewNode(data) {
+  const entries = overviewScalars(data, overviewNodeFields);
+  const config = overviewScalars(data?.config, overviewNodeConfigFields);
+  if (!entries.length && !config.length) return state('empty', '没有可显示的节点字段', '核心返回中没有本视图白名单内的非敏感字段。');
+  return node('div', {class:'overview-node'},
+    ...(entries.length ? [overviewFacts(entries)] : []),
+    ...(config.length ? [node('h4', {}, '内核与系统预留'), overviewFacts(config)] : []));
+}
+function overviewBadge(value, fallback) { return node('span', {class:'badge'}, typeof value === 'string' && value ? value : fallback); }
+function overviewDeployment(item) {
+  const spec = item?.spec ?? {};
+  const conditions = (Array.isArray(item?.conditions) ? item.conditions : []).filter(value => typeof value === 'string');
+  return node('article', {class:'card overview-item'},
+    node('h3', {}, typeof spec.display_name === 'string' && spec.display_name ? spec.display_name : '未命名部署'),
+    node('p', {}, overviewBadge(item?.phase, 'phase 未知'), ` · ${spec.enabled === true ? '已启用' : spec.enabled === false ? '已停用' : '启停未知'}`, Number.isSafeInteger(spec.replicas) ? ` · 副本 ${spec.replicas}` : ''),
+    ...(conditions.length ? [node('p', {}, conditions.join(' · '))] : []),
+    ...(typeof item?.id === 'string' ? [node('p', {class:'code'}, `UUID ${item.id}`)] : []),
+    ...(typeof item?.updated_at === 'string' ? [node('p', {class:'muted'}, `核心更新 ${item.updated_at}`)] : []));
+}
+function overviewInstance(item) {
+  return node('article', {class:'card overview-item'},
+    node('h3', {}, '实例'),
+    node('p', {}, overviewBadge(item?.phase, 'phase 未知'), ' ', overviewBadge(item?.health, 'health 未知')),
+    ...(Number.isSafeInteger(item?.restart_count) ? [node('p', {}, `重启次数 ${item.restart_count}`)] : []),
+    ...(typeof item?.last_heartbeat_at === 'string' ? [node('p', {}, `最近心跳 ${item.last_heartbeat_at}`)] : []),
+    ...(typeof item?.deployment_id === 'string' ? [node('p', {class:'code'}, `部署 ${item.deployment_id}`)] : []),
+    ...(typeof item?.id === 'string' ? [node('p', {class:'code'}, `UUID ${item.id}`)] : []));
+}
+async function overviewPage(win, {operation, title, renderItem, emptyMessage}) {
+  const result = await request(operation, {query:{limit:50}, signal:win.controller.signal});
+  const list = node('div', {class:'list'});
+  for (const item of rows(result.data)) list.append(renderItem(item));
+  if (!list.childElementCount) list.append(state('empty', '暂无可见项目', emptyMessage));
+  const hint = node('p', {class:'overview-page-hint muted'}, result.data.next_cursor ? '仅显示当前已取到的项目；还有更多可加载。' : '');
+  const more = button('加载下一页', async () => {
+    more.disabled = true;
+    try {
+      const next = await request(operation, {query:{limit:50, cursor:more.dataset.cursor}, signal:win.controller.signal});
+      for (const item of rows(next.data)) list.append(renderItem(item));
+      more.dataset.cursor = next.data.next_cursor || '';
+      more.hidden = !next.data.next_cursor;
+      hint.textContent = next.data.next_cursor ? '仅显示当前已取到的项目；还有更多可加载。' : '已加载全部可见项目。';
+    } catch (error) {
+      list.append(failure(error));
+      hint.textContent = '下一页读取失败；已加载内容保持不变。';
+    } finally { more.disabled = false; }
+  }, {'aria-label':`加载下一页${title}`, hidden:!result.data.next_cursor});
+  more.dataset.cursor = result.data.next_cursor || '';
+  return node('div', {}, list, more, hint);
+}
+function overviewSection(win, {key, title, source, load}) {
+  const headingId = `overview-${key}-${win.id}`;
+  const readAt = node('span', {class:'overview-read-at'}, '尚未读取');
+  const body = node('div', {class:'overview-body', 'aria-live':'polite'});
+  const section = node('section', {class:'overview-section', 'data-section':key, 'aria-labelledby':headingId},
+    node('header', {class:'overview-head'},
+      node('h3', {id:headingId}, title),
+      node('span', {class:'overview-source'}, `来源 ${source}`),
+      readAt,
+      button('刷新', () => { run(); }, {'aria-label':`刷新${title}`, class:'overview-refresh'})),
+    body);
+  const refresh = section.querySelector('.overview-refresh');
+  let sequence = 0;
+  async function run() {
+    const current = ++sequence;
+    refresh.disabled = true;
+    body.replaceChildren(state('loading', '正在读取核心…'));
+    try {
+      const rendered = await load();
+      if (current !== sequence || !section.isConnected) return;
+      readAt.textContent = `读取于 ${new Intl.DateTimeFormat('zh-CN', {hour:'2-digit', minute:'2-digit', second:'2-digit'}).format(new Date())}`;
+      body.replaceChildren(rendered);
+    } catch (error) {
+      if (current !== sequence || !section.isConnected) return;
+      readAt.textContent = '读取失败';
+      body.replaceChildren(failure(error));
+    } finally {
+      if (current === sequence && section.isConnected) refresh.disabled = false;
+    }
+  }
+  return {section, run};
+}
+async function overview(win) {
+  const sections = [
+    overviewSection(win, {key:'node', title:'节点资源', source:'getNode',
+      load:async () => overviewNode((await request('getNode', {signal:win.controller.signal})).data)}),
+    overviewSection(win, {key:'deployments', title:'部署', source:'listDeployments',
+      load:() => overviewPage(win, {operation:'listDeployments', title:'部署', renderItem:overviewDeployment, emptyMessage:'当前账户授权范围内没有可见部署。'})}),
+    overviewSection(win, {key:'instances', title:'实例', source:'listInstances',
+      load:() => overviewPage(win, {operation:'listInstances', title:'实例', renderItem:overviewInstance, emptyMessage:'当前账户授权范围内没有可见实例。'})}),
+  ];
+  win.content.replaceChildren(
+    toolbar(win, '总览'),
+    node('p', {class:'muted overview-note'}, '只读总览：仅展示当前账户已取到的公开 API 数据；各区域独立刷新。无历史趋势、全局总数或实时监控。'),
+    node('div', {class:'overview-grid'}, ...sections.map(entry => entry.section)));
+  await Promise.all(sections.map(entry => entry.run()));
+}
 const apps = [
+  {id:'overview',title:'总览',icon:'overview',render:overview},
   {id:'plugins',title:'插件中心',icon:'plugins',render:plugins},
   {id:'skills',title:'Skill',icon:'skills',render:skills},
   {id:'accounts',title:'账户与权限',icon:'accounts',render:accounts},
