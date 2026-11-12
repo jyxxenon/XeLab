@@ -29,7 +29,11 @@ python3 tools/acceptance/sdk-conformance.py \
   --client target/cpp-sdk/xelab-sdk-conformance
 ```
 
-同一个生成的 RPC 客户端在隔离回环网络中驱动两个参考二进制。脚本核对两端的原始契约，使用临时 CA 测试内核身份、生命周期、输入校验、期限、取消、流终帧和错误。C++ HostService 客户端另有 mTLS、委托拒绝及父调用取消传播的回环测试。本地使用 Linux 用户命名空间，CI 使用仅有回环接口的 Docker 容器。签名 OCI 安装及内核授权另走实际部署验收。
+同一个生成的 RPC 客户端在隔离回环网络中驱动两个参考二进制。脚本核对两端的原始契约，使用临时 CA 测试内核身份、生命周期、输入校验、期限、取消、流终帧和错误。C++ HostService 客户端另有 mTLS、委托拒绝及父调用取消传播的回环测试。本地使用 Linux 用户命名空间，CI 使用仅有回环接口的 Docker 容器。
+
+## 签名 OCI 验收
+
+CI 在独立的 Ubuntu runner 构建最终镜像，按平台 manifest 的不可变摘要导入 containerd。验收通过平台 API 拒绝绑定到其他摘要的签名，再安装正确签名的镜像。启用获批的部署后，经 mTLS 执行一元能力调用和 Skill SSE 流式调用，并核对调用记录对应同一个容器实例。停用部署后检查容器已移除，CPU 和内存预留已释放。[验收工作流](../../.github/workflows/plugin-sdk.yml)
 
 ## 生成制品并提交
 
