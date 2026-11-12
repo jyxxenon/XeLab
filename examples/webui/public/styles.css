@@ -94,7 +94,11 @@ button:active{transform:translateY(1px)}
   background-image:
     radial-gradient(1100px 720px at 78% 4%,color-mix(in srgb,var(--accent) 18%,transparent),transparent 64%),
     radial-gradient(900px 640px at 8% 98%,color-mix(in srgb,var(--accent) 10%,transparent),transparent 62%),
+    url('/ui/org.xelab.webui/wallpaper.svg'),
     linear-gradient(145deg,color-mix(in srgb,var(--desktop) 90%,#fff) 0%,var(--desktop) 46%,color-mix(in srgb,var(--desktop) 88%,var(--accent)) 100%);
+  background-position:center;
+  background-size:cover;
+  background-repeat:no-repeat;
 }
 .welcome{max-width:520px}
 .welcome h1{

@@ -6,6 +6,8 @@ The desktop uses browser ES modules and standard DOM/CSS without a frontend fram
 
 ## Shell visual language
 
+`public/wallpaper.svg` is an original, dependency-free abstract backdrop drawn for this application: layered translucent curves and circles that stay legible under both light and dark theme tokens, with no raster image, font, or third-party asset. `#desktop` stacks it under the existing theme gradients with `background-size: cover`, so it scales to any viewport or narrow layout without a separate asset.
+
 `public/styles.css` keeps the original layout and interaction rules and adds one token-led shell layer: `--menubar-h`, `--shell-radius`, `--shell-border` and `--ease-shell` derive every surface from the existing `--accent`, `--surface`, `--desktop`, `--text`, `--border`, `--radius` and `--blur` theme variables, so light, dark and custom themes stay consistent without per-theme overrides. Shell blur is limited to the menu bar, Dock and launcher dialog; window bodies stay opaque. `reduced-transparency` removes that blur and restores solid surfaces, and `prefers-reduced-motion` disables the remaining transitions.
 
 Dock, launcher, pinned-contribution and restore entries share one inline 24x24 stroke icon set declared in `public/app.js` (`ICONS`). Icons are built as SVG DOM nodes rather than markup strings, so the `script-src 'self'` policy is unchanged and no image, font or icon-library asset is added. Window controls keep their 24px hit target while drawing macOS-style dots that reveal `×`, `−` and `□` on hover, focus or touch. Window appearance and toast entry use one finite fade each (≤180ms, opacity plus a 6px transform); nothing loops or runs while idle, and both reduced-motion rules remove the motion entirely.
