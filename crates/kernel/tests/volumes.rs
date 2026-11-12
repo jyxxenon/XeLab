@@ -305,7 +305,7 @@ async fn actual_kernel_process_death_resumes_initializing_checkpoint() {
     kernel_process_death::exercise().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires the signed object-storage fixture and dedicated XFS/containerd runner"]
 async fn actual_object_storage_kernel_round_trip() {
     object_storage_kernel::exercise().await;

@@ -141,7 +141,7 @@ pub(super) async fn exercise() {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
     assert_eq!(unsafe { libc::geteuid() }, 0);
     assert_eq!(std::env::var("XELAB_XFS_TEST").unwrap(), "1");
-    let f = Fixture::new(true).await.expect("isolated PostgreSQL");
+    let f = Arc::new(Fixture::new(true).await.expect("isolated PostgreSQL"));
     let c = f.app.db.connect().await.unwrap();
     let publisher: Uuid = "00000000-0000-4000-8000-000000000001".parse().unwrap();
     let pem = SigningKey::from_bytes(&[7; 32])
@@ -292,37 +292,55 @@ pub(super) async fn exercise() {
     let object = &put["output"]["object"];
     assert_eq!(object["revision"], 1);
     assert_eq!(object["digest"], source["digest"]);
-    let fixture = &f;
     let stat_id = skills["data.object.stat"];
-    let concurrent = futures_util::future::join_all((0..12).map(|index| async move {
-        fixture
-            .api(
-                "invokeSkill",
-                Some(stat_id),
-                json!({"input":{"key":key},"timeout_ms":15000}),
-                &format!("object-concurrent-stat-{index}"),
-                None,
-                None,
-            )
-            .await
+    let start: chrono::DateTime<chrono::Utc> = c
+        .query_one("SELECT clock_timestamp()", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let barrier = Arc::new(tokio::sync::Barrier::new(12));
+    let concurrent = futures_util::future::try_join_all((0..12).map(|index| {
+        let fixture = f.clone();
+        let barrier = barrier.clone();
+        tokio::spawn(async move {
+            barrier.wait().await;
+            let started = tokio::time::Instant::now();
+            let result = fixture
+                .api(
+                    "invokeSkill",
+                    Some(stat_id),
+                    json!({"input":{"key":key},"timeout_ms":15000}),
+                    &format!("object-concurrent-stat-{index}"),
+                    None,
+                    None,
+                )
+                .await;
+            (result, started.elapsed())
+        })
     }))
-    .await;
-    if concurrent.iter().any(|(status, _)| *status != 200) {
+    .await
+    .unwrap();
+    if concurrent.iter().any(|((status, _), _)| *status != 200) {
         let results: Vec<_> = concurrent
             .iter()
             .enumerate()
-            .filter(|(_, (status, _))| *status != 200)
-            .map(|(index, (status, body))| (index, *status, &body["error"]))
+            .map(|(index, ((status, body), elapsed))| (index, *status, elapsed, &body["error"]))
             .collect();
         let ledger: Vec<_> = c.query(
-            "SELECT idempotency_key,state,error->>'code' FROM calls WHERE idempotency_key LIKE 'object-concurrent-stat-%' ORDER BY idempotency_key",
-            &[],
+            "SELECT idempotency_key,state,error->>'code',
+                    extract(epoch FROM (created_at-$1::timestamptz))::float8 AS admission,
+                    extract(epoch FROM (completed_at-$1::timestamptz))::float8 AS settlement
+               FROM calls WHERE idempotency_key LIKE 'object-concurrent-stat-%' ORDER BY idempotency_key",
+            &[&start],
         ).await.unwrap().into_iter()
-            .map(|row| (row.get::<_,String>(0),row.get::<_,String>(1),row.get::<_,Option<String>>(2)))
+            .map(|row| (row.get::<_,String>(0),row.get::<_,String>(1),row.get::<_,Option<String>>(2),
+                        row.get::<_,f64>("admission"),row.get::<_,Option<f64>>("settlement")))
             .collect();
-        panic!("Concurrent object reads failed: responses {results:?}; Call ledger {ledger:?}");
+        panic!("Concurrent object reads failed: responses {results:?}; Call transaction offsets (seconds) {ledger:?}");
     }
-    for (_, result) in concurrent {
+    let longest = concurrent.iter().map(|(_, elapsed)| elapsed).max().unwrap();
+    eprintln!("All 12 concurrent object stat calls completed in at most {longest:?}");
+    for ((_, result), _) in concurrent {
         assert_eq!(result["call"]["output"]["object"], *object);
     }
     let listed = skill(&f, skills["data.object.list"], json!({}), "object-list").await;
