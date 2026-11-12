@@ -1,4 +1,4 @@
--- Object storage data_schema_version=1; SQLite3.37+ logical baseline, not an applied migration.
+-- Initial object storage layout for data_schema_version=1, SQLite 3.37+.
 PRAGMA foreign_keys=ON;
 PRAGMA journal_mode=WAL;
 BEGIN;
@@ -45,16 +45,29 @@ CREATE TABLE os_write_reservations (
   state TEXT NOT NULL CHECK(state IN ('reserved','copying','published','released','unknown')),
   updated_at TEXT NOT NULL, UNIQUE(owner_id,idempotency_key)
 ) STRICT;
+-- Only one in-flight writer may deduct the same head's previous logical size.
+CREATE UNIQUE INDEX os_write_reservations_head ON os_write_reservations(owner_id,logical_key);
 CREATE TABLE os_read_pins (
   id TEXT PRIMARY KEY NOT NULL, content_id TEXT NOT NULL REFERENCES os_contents(id), call_id TEXT NOT NULL,
   expires_at TEXT NOT NULL
 ) STRICT;
+CREATE INDEX os_read_pins_content ON os_read_pins(content_id);
+CREATE INDEX os_contents_gc ON os_contents(state,id);
 CREATE TABLE os_operations (
   owner_id TEXT NOT NULL, capability TEXT NOT NULL, idempotency_key TEXT NOT NULL, input_digest TEXT NOT NULL,
   state TEXT NOT NULL CHECK(state IN ('running','succeeded','failed','unknown')),
   result_json TEXT CHECK(result_json IS NULL OR json_valid(result_json)),
   error_json TEXT CHECK(error_json IS NULL OR json_valid(error_json)), output_blob_id TEXT,
   expires_at TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(owner_id,capability,idempotency_key)
+) STRICT;
+CREATE INDEX os_operations_expiry ON os_operations(expires_at);
+-- QueryResult must resolve an admitted Call, including one that replayed a
+-- prior result, without deriving its owner or operation from untrusted input.
+CREATE TABLE os_operation_calls (
+  owner_id TEXT NOT NULL, call_id TEXT NOT NULL, capability TEXT NOT NULL, idempotency_key TEXT NOT NULL,
+  PRIMARY KEY(owner_id,call_id),
+  FOREIGN KEY(owner_id,capability,idempotency_key)
+    REFERENCES os_operations(owner_id,capability,idempotency_key) ON DELETE CASCADE
 ) STRICT;
 CREATE TABLE os_storage_usage (
   singleton INTEGER PRIMARY KEY CHECK(singleton=1), physical_content_bytes INTEGER NOT NULL CHECK(physical_content_bytes>=0),
