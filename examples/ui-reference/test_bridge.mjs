@@ -51,6 +51,24 @@ test('only fixed echo alias and same-plugin window requests are emitted', async 
   } finally { f.client.close(); }
 });
 
+test('echo response waiting includes the host checks and still expires', async context => {
+  const schedule = context.mock.method(globalThis, 'setTimeout', () => 0);
+  const f = fixture();
+  try {
+    f.initialize();
+    const echo = f.client.callEcho('x', 'stable-intent').catch(error => error);
+    assert.equal(f.sent.at(-1).message.params.timeout_ms, 10_000);
+    const window = f.client.openWindow().catch(error => error);
+    const [, echoTimer, windowTimer] = schedule.mock.calls.map(call => call.arguments);
+    assert.equal(echoTimer[1], 40_000);
+    assert.equal(windowTimer[1], 10_000);
+    windowTimer[0]();
+    assert.equal((await window).code, 'DEADLINE_EXCEEDED');
+    echoTimer[0]();
+    assert.equal((await echo).code, 'DEADLINE_EXCEEDED');
+  } finally { f.client.close(); }
+});
+
 test('binding absence, mismatched response, inflight cap and disposal fail closed', async () => {
   const f=fixture();
   try {
