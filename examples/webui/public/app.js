@@ -234,6 +234,8 @@ function focus(win) {
   saveLayout();
 }
 function closeWindow(win, persist = true) {
+  // Keep keyboard focus inside the desktop instead of dropping it on the document body.
+  const hadFocus = win.element.contains(document.activeElement);
   win.controller?.abort();
   win.dispose?.();
   win.element.remove();
@@ -241,6 +243,12 @@ function closeWindow(win, persist = true) {
   renderDock();
   const next = [...windows.values()].filter(value => !value.minimized).at(-1);
   if (next) focus(next); else $('#active-app').textContent = '桌面';
+  if (hadFocus) {
+    const target = next
+      ? next.element.querySelector('.window-title')
+      : $('#dock').querySelector(`[data-app-id="${win.app.id}"]`);
+    (target || $('#desktop')).focus();
+  }
   if (persist) saveLayout();
 }
 function pointerMove(win, handle, resize) {

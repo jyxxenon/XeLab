@@ -97,6 +97,23 @@ class ShellVisual(unittest.TestCase):
         }""", references)
         self.assertEqual(missing, [], "every stylesheet and script referenced by index.html must load")
 
+    def test_closing_a_window_hands_focus_back_to_the_desktop(self):
+        self.open()
+        self.fixture.app("系统状态")
+        settings = self.fixture.app("设置")
+        settings.get_by_role("button", name="关闭设置").click()
+        self.page.wait_for_function("() => document.querySelectorAll('.window').length === 1")
+        active = self.page.evaluate("() => {const el = document.activeElement;"
+                                    " return el.classList.contains('window-title') ? el.closest('.window').dataset.app : el.tagName;}")
+        self.assertEqual(active, "resources", "focus should move into the remaining window")
+
+        self.page.locator('.window[data-app="resources"]').get_by_role("button", name="关闭系统状态").click()
+        self.page.wait_for_function("() => document.querySelectorAll('.window').length === 0")
+        self.assertEqual(
+            self.page.evaluate("() => document.activeElement.getAttribute('data-app-id')"),
+            "resources",
+            "closing the last window should return focus to its Dock button")
+
     def test_launcher_manages_keyboard_focus(self):
         self.open()
         trigger = self.page.get_by_role("button", name="打开应用启动器", exact=True)
