@@ -252,6 +252,70 @@ class TriageTests(unittest.TestCase):
         self.assertNotIn((3, 5), [tuple(c["issues"]) for c in report["duplicate_candidates"]])
         self.assertIn("NOT definitive", render_text(report))
 
+    def test_templated_plugin_titles_preserve_compound_identifiers(self):
+        api = FakeAPI(issues=[
+            issue(30, "[P1] 实现微插件 micro-json-validator（json.validate）"),
+            issue(31, "[P1] 实现微插件 micro-json-project（json.project）"),
+            issue(33, "[P2] 实现微插件 micro-csv-json（convert.csv-json, convert.json-csv）"),
+            issue(37, "[P2] 实现微插件 micro-datetime-convert（datetime.convert）"),
+            issue(38, "[P1] 实现微插件 micro-flow-condition（flow.condition）"),
+            issue(39, "[P1] 实现微插件 micro-flow-map（flow.map）"),
+            issue(53, "[P3] 实现普通 OCI 插件 notification（notification.send）"),
+            issue(56, "[P3] 实现普通 OCI 插件 email-connector（email.send）"),
+            issue(60, "[P4] 实现普通 OCI 插件 git-connector（git.repository）"),
+        ])
+        self.assertEqual(build_report(api)["duplicate_candidates"], [])
+        with_duplicate = FakeAPI(issues=[
+            *api.issues,
+            issue(99, "[bug] micro-json-validator（json.validate）校验失败"),
+        ])
+        self.assertEqual(build_report(with_duplicate)["duplicate_candidates"], [{
+            "kind": "shared-keywords",
+            "issues": [30, 99],
+            "shared": ["json.validate", "micro-json-validator"],
+        }])
+
+    def test_redacted_placeholder_and_multiple_leading_tags_in_duplicates(self):
+        api = FakeAPI(issues=[
+            issue(1, "login " + SECRET + " timeout"),
+            issue(2, "backup " + SECRET + " timeout"),
+            issue(3, "login " + SECRET + " session timeout"),
+            issue(4, "login session timeout"),
+            issue(5, "[M6][P2] Add Foo tool"),
+            issue(6, "[feature] add foo tool"),
+        ])
+        report = build_report(api)
+        self.assertEqual(report["duplicate_candidates"], [
+            {"kind": "same-normalized-title", "issues": [5, 6]},
+            {"kind": "shared-keywords", "issues": [1, 3], "shared": ["login", "timeout"]},
+            {"kind": "shared-keywords", "issues": [1, 4], "shared": ["login", "timeout"]},
+            {"kind": "shared-keywords", "issues": [3, 4], "shared": ["login", "session", "timeout"]},
+        ])
+        self.assertNotIn("redacted", json.dumps(report["duplicate_candidates"]))
+
+    def test_zero_comment_issues_skip_comment_endpoint(self):
+        zero = dict(issue(1, "no comments"), comments=0)
+        nonzero = dict(issue(2, "has claim"), comments=1)
+        stale_zero = dict(issue(3, "page 1 zero"), comments=0)
+        updated_nonzero = dict(issue(3, "page 2 commented"), comments=1)
+        padding = [dict(issue(n, f"pad {n}"), comments=0) for n in range(4, 102)]
+        api = FakeAPI(
+            issues=[zero, nonzero, stale_zero, *padding, updated_nonzero],
+            comments={
+                1: [comment("unexpected", "/claim")],
+                2: [comment("agent-a", "/claim")],
+                3: [comment("agent-b", "认领申请")],
+            },
+        )
+        report = build_report(api)
+        self.assertNotIn(("GET", "/issues/1/comments?per_page=100&page=1"), api.calls)
+        self.assertIn(("GET", "/issues/2/comments?per_page=100&page=1"), api.calls)
+        self.assertIn(("GET", "/issues/3/comments?per_page=100&page=1"), api.calls)
+        by_num = {item["number"]: item for item in report["issues"]}
+        self.assertEqual(by_num[1]["claim_candidates"], [])
+        self.assertEqual(len(by_num[2]["claim_candidates"]), 1)
+        self.assertEqual(len(by_num[3]["claim_candidates"]), 1)
+
     def test_only_get_calls(self):
         api = FakeAPI(issues=[issue(1, "x")], comments={1: [comment("a", "认领申请")]})
         build_report(api)
