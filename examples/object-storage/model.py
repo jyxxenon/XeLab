@@ -26,6 +26,7 @@ class StoreError(Exception):
     def __init__(self, code, message):
         super().__init__(message)
         self.code = code
+        self.completed = False
 
 
 def invalid(message):

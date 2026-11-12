@@ -13,13 +13,14 @@ async fn blob(f: &Fixture, id: Option<Uuid>, data: &[u8]) -> (u16, Vec<u8>) {
             .method("GET")
             .uri(format!("/api/platform/v1/blobs/{id}/content"))
     } else {
+        let digest = contracts::digest(data);
         request
             .method("POST")
             .uri("/api/platform/v1/blobs?content_type=application%2Foctet-stream")
             .header("content-type", "application/octet-stream")
             .header("content-length", data.len())
-            .header("x-content-sha256", contracts::digest(data))
-            .header("idempotency-key", "object-source-blob")
+            .header("x-content-sha256", &digest)
+            .header("idempotency-key", format!("object-source-{digest}"))
     };
     let mut request = request.body(Body::from(data.to_vec())).unwrap();
     request.extensions_mut().insert(ConnectInfo(
@@ -57,20 +58,19 @@ async fn skill(f: &Fixture, id: Uuid, input: Value, key: &str) -> Value {
 async fn rejected_skill(
     f: &Fixture,
     c: &tokio_postgres::Client,
-    deployment: Uuid,
     skill: Uuid,
     input: Value,
     key: &str,
     expected: (u16, &str),
+    response: (u16, Value),
 ) {
-    let (status, body) = invoke_skill(f, skill, input.clone(), key).await;
+    let (status, body) = response;
     assert_eq!(status, expected.0, "{key}: {body}");
     assert_eq!(body["error"]["code"], expected.1);
     let call = contracts::id(&body["error"], "resource_id").unwrap();
     let replay = invoke_skill(f, skill, input, key).await;
-    assert_eq!(replay.0, 409, "{key} replay: {}", replay.1);
-    assert_eq!(replay.1["error"]["code"], "OUTCOME_UNKNOWN");
-    assert_eq!(replay.1["error"]["resource_id"], call.to_string());
+    assert_eq!(replay.0, status, "{key} replay: {}", replay.1);
+    assert_eq!(replay.1["error"], body["error"]);
     let inspected = f
         .api(
             "getCall",
@@ -82,7 +82,18 @@ async fn rejected_skill(
         )
         .await;
     assert_eq!(inspected.0, 200, "{}", inspected.1);
-    assert_eq!(inspected.1["state"], "unknown");
+    assert_eq!(inspected.1["state"], "failed");
+    assert_eq!(inspected.1["error"], body["error"]);
+    assert_eq!(
+        c.query_one(
+            "SELECT status FROM reservations WHERE id=$1 AND kind='call'",
+            &[&call]
+        )
+        .await
+        .unwrap()
+        .get::<_, String>(0),
+        "released",
+    );
     assert_eq!(
         c.query_one(
             "SELECT count(*) FROM calls WHERE skill_id=$1 AND idempotency_key=$2",
@@ -94,25 +105,6 @@ async fn rejected_skill(
         1,
         "{key} left a single durable Call",
     );
-
-    // Observe the controller's real stop proof and readiness before checking
-    // the objects again. A rejected RPC still holds its slot until recovery.
-    tokio::time::timeout(Duration::from_secs(45), async {
-        loop {
-            let ready: bool = c.query_one(
-                "SELECT EXISTS(SELECT 1 FROM reservations WHERE id=$1 AND kind='call' AND status='released')
-                    AND EXISTS(SELECT 1 FROM deployments d JOIN instances i ON i.deployment_id=d.id
-                               JOIN provider_records p ON p.instance_id=i.id
-                               WHERE d.id=$2 AND d.phase='ready' AND i.phase='ready' AND i.health='alive'
-                                 AND p.availability='ready' AND p.observed_generation=i.generation)",
-                &[&call, &deployment],
-            ).await.unwrap().get(0);
-            if ready {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
-    }).await.unwrap_or_else(|_| panic!("{key}: Call {call} recovery did not settle"));
 }
 
 async fn other_subject(f: &Fixture, list: Uuid, put: Uuid, input: &Value) {
@@ -485,17 +477,77 @@ pub(super) async fn exercise() {
     .await;
     assert_ne!(stat["provider_instance_id"], put["provider_instance_id"]);
     assert_eq!(stat["output"]["object"], *object);
+    let provider = contracts::id(&stat, "provider_instance_id").unwrap();
+    let restart_count: i32 = c
+        .query_one(
+            "SELECT restart_count FROM instances WHERE id=$1",
+            &[&provider],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let other_bytes: Vec<_> = bytes.iter().map(|byte| *byte ^ 0x5a).collect();
+    let other_source = blob(&f, None, &other_bytes).await;
+    assert_eq!(other_source.0, 201);
+    let other_source: Value = serde_json::from_slice(&other_source.1).unwrap();
+    let mut replace = input.clone();
+    replace["mode"] = json!("replace");
+    replace["expected_revision"] = json!(1);
+    let mut other_replace = replace.clone();
+    other_replace["blob_id"] = other_source["id"].clone();
+    other_replace["digest"] = other_source["digest"].clone();
+    let put_id = skills["data.object.put"];
+    let (left, right) = tokio::join!(
+        invoke_skill(&f, put_id, replace.clone(), "object-replace-left"),
+        invoke_skill(&f, put_id, other_replace.clone(), "object-replace-right"),
+    );
+    let mut winning_object = None;
+    for (key, request, response) in [
+        ("object-replace-left", replace, left),
+        ("object-replace-right", other_replace, right),
+    ] {
+        if response.0 == 200 {
+            assert!(
+                winning_object.is_none(),
+                "only one concurrent CAS may succeed"
+            );
+            assert_eq!(
+                response.1["call"]["provider_instance_id"],
+                provider.to_string()
+            );
+            let output = &response.1["call"]["output"]["object"];
+            assert_eq!(output["id"], object["id"]);
+            assert_eq!(output["revision"], 2);
+            assert_eq!(output["digest"], request["digest"]);
+            winning_object = Some(output.clone());
+        } else {
+            rejected_skill(
+                &f,
+                &c,
+                put_id,
+                request,
+                key,
+                (409, "STATE_CONFLICT"),
+                response,
+            )
+            .await;
+        }
+    }
+    let winning_object = winning_object.expect("one concurrent CAS committed");
+    let after_cas = skill(&f, stat_id, json!({"key":key}), "object-stat-after-cas").await;
+    assert_eq!(after_cas["output"]["object"], winning_object);
 
     let mut overflow = input.clone();
     overflow["key"] = json!("acceptance/over-quota");
+    let quota_response = invoke_skill(&f, put_id, overflow.clone(), "object-over-quota").await;
     rejected_skill(
         &f,
         &c,
-        deployment,
-        skills["data.object.put"],
+        put_id,
         overflow,
         "object-over-quota",
         (503, "RESOURCE_EXHAUSTED"),
+        quota_response,
     )
     .await;
     let listed = skill(
@@ -505,7 +557,7 @@ pub(super) async fn exercise() {
         "object-list-after-quota-rejection",
     )
     .await;
-    assert_eq!(listed["output"]["items"], json!([object]));
+    assert_eq!(listed["output"]["items"], json!([winning_object]));
     let usage = skill(
         &f,
         skills["data.object.usage.get"],
@@ -516,8 +568,14 @@ pub(super) async fn exercise() {
     assert_eq!(usage["output"]["logical_bytes"], bytes.len());
     assert_eq!(usage["output"]["reserved_bytes"], 0);
 
-    let deleted = skill(&f, skills["data.object.delete"], target, "object-delete").await;
-    assert_eq!(deleted["output"]["deleted_revision"], 2);
+    let deleted = skill(
+        &f,
+        skills["data.object.delete"],
+        json!({"key":key,"expected_revision":2}),
+        "object-delete",
+    )
+    .await;
+    assert_eq!(deleted["output"]["deleted_revision"], 3);
     let listed = skill(
         &f,
         skills["data.object.list"],
@@ -526,16 +584,27 @@ pub(super) async fn exercise() {
     )
     .await;
     assert_eq!(listed["output"]["items"], json!([]));
+    let missing = json!({"key":key});
+    let missing_response = invoke_skill(&f, stat_id, missing.clone(), "object-stat-deleted").await;
     rejected_skill(
         &f,
         &c,
-        deployment,
         stat_id,
-        json!({"key":key}),
+        missing,
         "object-stat-deleted",
         (404, "RESOURCE_NOT_FOUND"),
+        missing_response,
     )
     .await;
+    let current = c
+        .query_one(
+            "SELECT restart_count,phase FROM instances WHERE id=$1",
+            &[&provider],
+        )
+        .await
+        .unwrap();
+    assert_eq!(current.get::<_, i32>("restart_count"), restart_count);
+    assert_eq!(current.get::<_, String>("phase"), "ready");
     disable(&f, deployment, "object-final-disable").await;
 
     f.app.shutdown.store(true, Ordering::SeqCst);
@@ -543,5 +612,5 @@ pub(super) async fn exercise() {
     controller.await.unwrap();
     host.await.unwrap().unwrap();
     println!("Object storage: verified XFS bootstrap, six Skill RPCs, delegated Blob I/O and persistent restart");
-    println!("Object storage: quota refusal and deleted object status preserved, with one Call each and physical fencing");
+    println!("Object storage: one concurrent CAS committed, and quota/missing/CAS rejections settled once without a provider restart");
 }

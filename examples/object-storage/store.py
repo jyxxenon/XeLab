@@ -566,7 +566,11 @@ class Store:
 
     def put(self, call, request, reader, check):
         """Copy an authorized Blob iterator of (offset, bytes) into the volume."""
-        request = put_request(request)
+        try:
+            request = put_request(request)
+        except StoreError as error:
+            error.completed = True
+            raise
         check()
         self.collect_garbage()
         content = str(uuid.uuid4())
@@ -585,11 +589,16 @@ class Store:
             with self._write() as conn:
                 check()
                 return self._publish_put(conn, call, request, content)
-        except BaseException:
+        except BaseException as error:
             # If recovery cannot yet inspect the ledger, keep the reservation
             # and let the next exclusive owner reconcile it.
-            with suppress(OSError, sqlite3.Error, StoreError):
+            try:
                 self._discard_put(content)
+            except (OSError, sqlite3.Error, StoreError):
+                pass
+            else:
+                if isinstance(error, StoreError):
+                    error.completed = True
             raise
 
     def delete(self, call, request, check):
@@ -662,13 +671,13 @@ class Store:
 
     def export(self, call, request, writer, check):
         """Pin a revision while the authorized Blob writer consumes its bytes."""
-        request_fields(request, ("key", "expected_revision"))
-        owner, key = call.subject, logical_key(request["key"])
-        expected = revision(request["expected_revision"])
-        request = {"key": key, "expected_revision": expected}
         pin = str(uuid.uuid4())
         dispatched = False
         try:
+            request_fields(request, ("key", "expected_revision"))
+            owner, key = call.subject, logical_key(request["key"])
+            expected = revision(request["expected_revision"])
+            request = {"key": key, "expected_revision": expected}
             with self._write() as conn:
                 check()
                 result = self._start_operation(conn, call, "data.object.export", request)
@@ -718,8 +727,13 @@ class Store:
                 self._check_budget(conn)
             return result
         except BaseException as error:
-            with suppress(OSError, sqlite3.Error, StoreError):
+            try:
                 self._unwind_export(call, pin, dispatched)
+            except (OSError, sqlite3.Error, StoreError):
+                pass
+            else:
+                if not dispatched and isinstance(error, StoreError):
+                    error.completed = True
             if dispatched and isinstance(error, Exception):
                 raise StoreError("OUTCOME_UNKNOWN", "Export outcome requires verification") from None
             raise

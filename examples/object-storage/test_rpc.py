@@ -12,6 +12,7 @@ from tempfile import TemporaryDirectory
 from threading import Event, Lock
 import time
 import unittest
+from unittest.mock import patch
 import uuid
 
 import grpc
@@ -364,6 +365,7 @@ class ObjectRpc(unittest.TestCase):
         self.lifecycle.Initialize(self.initialize(), timeout=5)
         self.fixture.pause_read = True
         request = self.put("canceled", b"data")
+        request.terminal_failure_version = 1
         future = self.capability.Invoke.future(request, timeout=6)
         self.addCleanup(future.cancel)
         self.assertTrue(self.fixture.read_started.wait(4))
@@ -385,11 +387,36 @@ class ObjectRpc(unittest.TestCase):
         self.fixture.drop_export_reply = True
         request = self.invoke("data.object.export", {"key":"exported","expected_revision":1},
                               key="stable", actions=("write",))
+        request.terminal_failure_version = 1
         self.refused(self.capability.Invoke, request, grpc.StatusCode.UNKNOWN, "OUTCOME_UNKNOWN")
         self.fixture.drop_export_reply = False
         request.call_id = identifier()
         self.refused(self.capability.Invoke, request, grpc.StatusCode.UNKNOWN, "OUTCOME_UNKNOWN")
         self.assertEqual(self.fixture.write_count, 1)
+
+    def test_negotiated_business_failure_has_the_original_call_and_contract(self):
+        self.lifecycle.Initialize(self.initialize(), timeout=5)
+        request = self.invoke("data.object.stat", {"key": "missing"})
+        self.refused(self.capability.Invoke, request, grpc.StatusCode.NOT_FOUND, "RESOURCE_NOT_FOUND")
+        request.terminal_failure_version = 1
+        reply = self.capability.Invoke(request, timeout=5)
+        self.assertEqual(reply.call_id, request.call_id)
+        self.assertEqual(reply.terminal_failure, cap.InvokeFailure(
+            version=1, contract=request.contract, code="RESOURCE_NOT_FOUND",
+        ))
+        self.assertEqual((reply.output_json, reply.output_digest), (b"", ""))
+
+        self.output(self.put("saved", b"content"))
+        stale = self.put("saved", b"new")
+        stale.terminal_failure_version = 1
+        reply = self.capability.Invoke(stale, timeout=5)
+        self.assertEqual(reply.call_id, stale.call_id)
+        self.assertEqual(reply.terminal_failure, cap.InvokeFailure(
+            version=1, contract=stale.contract, code="STATE_CONFLICT",
+        ))
+        stale.call_id = identifier()
+        with patch.object(self.service.store, "_discard_put", side_effect=OSError("cleanup failed")):
+            self.refused(self.capability.Invoke, stale, grpc.StatusCode.FAILED_PRECONDITION, "STATE_CONFLICT")
 
     def test_bounded_queue_and_drain(self):
         self.stop_plugin()

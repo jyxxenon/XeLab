@@ -25,4 +25,4 @@ docker run --rm --network none --read-only --tmpfs /tmp:rw,nosuid,nodev,noexec,m
 
 专项 CI 构建并签验导入 containerd 的发行镜像。在隔离网络中使用内核及 Blob RPC 夹具验证 mTLS 和 Proto，并在独立 XFS 项目上执行写入、只读验证和容量不足拒绝。
 
-内核集成使用同一发行镜像，保留清单声明的 4 个活动槽、32 个等待槽和 5 秒上限。测试通过内部制品登记进入真实 XFS 格式监督器，调用六项签名 Skill，并验证并发读取、委托 Blob 读写、跨主体隔离和重新启用后的数据持久性。公开版本化安装和生产恢复仍待验收。[存储协议](../../docs/preset-plugins/object-storage/storage.md) · [格式监督器](../../docs/implementation/m2-schema-bootstrap.md)
+内核集成使用同一发行镜像，保留清单声明的 4 个活动槽、32 个等待槽和 5 秒上限。测试通过内部制品登记进入真实 XFS 格式监督器，调用六项签名 Skill，并验证并发读取、同版本并发覆盖、额度拒绝、委托 Blob 读写、跨主体隔离和重新启用后的数据持久性。已确认的业务拒绝按原 Call 保存终态。公开版本化安装和生产恢复仍待验收。[存储协议](../../docs/preset-plugins/object-storage/storage.md) · [格式监督器](../../docs/implementation/m2-schema-bootstrap.md)

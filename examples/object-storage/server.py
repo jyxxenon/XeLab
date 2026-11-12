@@ -51,6 +51,11 @@ _HOST_ERRORS = {
     grpc.StatusCode.CANCELLED: "CANCELED",
     grpc.StatusCode.UNAVAILABLE: "UNAVAILABLE",
 }
+_TERMINAL_FAILURE_VERSION = 1
+_BUSINESS_REJECTIONS = frozenset({
+    "INVALID_ARGUMENT", "PERMISSION_DENIED", "RESOURCE_NOT_FOUND",
+    "STATE_CONFLICT", "RESOURCE_EXHAUSTED",
+})
 
 
 def kernel_rpc(method):
@@ -310,7 +315,25 @@ class ObjectStorage(
             raise invalid("Call contract or input digest differs")
         value = strict_json(request.input_json, contract["maximum_input_bytes"])
         with self._admit(call_id, subject, work) as store:
-            result = self._invoke(store, _CALLS[request.contract.name], subject, request, value, work)
+            operation = _CALLS[request.contract.name]
+            try:
+                result = self._invoke(store, operation, subject, request, value, work)
+            except StoreError as error:
+                # Copying and exporting can have work to unwind. Only the
+                # store can confirm completion for those operations.
+                if (request.terminal_failure_version != _TERMINAL_FAILURE_VERSION
+                        or error.code not in _BUSINESS_REJECTIONS
+                        or (operation in ("put", "export") and not error.completed)):
+                    raise
+                work.check()
+                return cap.InvokeResponse(
+                    call_id=call_id,
+                    terminal_failure=cap.InvokeFailure(
+                        version=_TERMINAL_FAILURE_VERSION,
+                        contract=request.contract,
+                        code=error.code,
+                    ),
+                )
             return self._result(call_id, result, contract["maximum_output_bytes"])
 
     @kernel_rpc
