@@ -46,11 +46,11 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
-      - name: Install C++ and sandbox dependencies
+      - name: Install C++ dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y cmake libgrpc++-dev libprotobuf-dev protobuf-compiler-grpc \
-            libssl-dev nlohmann-json3-dev bubblewrap
+            libssl-dev nlohmann-json3-dev
       - name: Build both reference plugins and the shared RPC client
         run: |
           cargo build -p xelab-kernel --bin xelab-echo --locked
@@ -59,10 +59,7 @@ jobs:
       - name: Compare the contracts and run shared loopback mTLS conformance
         run: |
           cargo test -p xelab-kernel --lib --locked artifact::tests::generated_reference_profiles_match_manifest_and_raw_contracts -- --exact
-          sudo unshare --net -- bash -euc '
-            ip link set lo up
-            runner_user=$1
-            shift
-            exec runuser -u "$runner_user" -- python3 "$@"
-          ' -- "$(id -un)" tools/acceptance/sdk-conformance.py --rust target/debug/xelab-echo \
-            --cpp "$RUNNER_TEMP/xelab-cpp/xelab-echo-cpp" --client "$RUNNER_TEMP/xelab-cpp/xelab-sdk-conformance"
+          docker build --target runtime -f examples/echo-cpp/Dockerfile -t xelab-sdk-test:local .
+          python3 tools/acceptance/sdk-conformance.py --rust target/debug/xelab-echo \
+            --cpp "$RUNNER_TEMP/xelab-cpp/xelab-echo-cpp" --client "$RUNNER_TEMP/xelab-cpp/xelab-sdk-conformance" \
+            --container-image xelab-sdk-test:local
