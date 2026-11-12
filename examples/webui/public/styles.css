@@ -413,3 +413,97 @@ dialog[open]{animation:shell-dialog-in .18s var(--ease-shell)}
 @media(hover:none){
   .window-controls button::after{opacity:1}
 }
+
+/* ==========================================================================
+   Window content control layer
+   Extends the shell layer to the surfaces inside windows: form controls,
+   list cards, badges, state blocks, result panes and button variants. Every
+   surface derives from the existing theme tokens and stays opaque, so
+   reduced-transparency needs no extra rules. No entrance motion is added;
+   the short control transitions below are disabled by the existing
+   reduced-motion rules. Toolbar layout and window navigation are unchanged.
+   ========================================================================== */
+:root{
+  --field-bg:color-mix(in srgb,var(--surface) 92%,var(--desktop));
+  --field-border:color-mix(in srgb,var(--border) 84%,transparent);
+  --content-radius:12px;
+}
+
+input,select,textarea{
+  border:1px solid var(--field-border);
+  border-radius:9px;
+  background:var(--field-bg);
+  box-shadow:inset 0 1px 2px light-dark(#0b12200f,#0000003d);
+  transition:border-color .15s var(--ease-shell),background .15s var(--ease-shell),box-shadow .15s var(--ease-shell);
+}
+input:hover,select:hover,textarea:hover{border-color:color-mix(in srgb,var(--border) 78%,var(--text))}
+input:focus,select:focus,textarea:focus{border-color:color-mix(in srgb,var(--accent) 55%,var(--border))}
+input::placeholder,textarea::placeholder{color:var(--muted-text);opacity:.75}
+input[type=checkbox],input[type=radio]{accent-color:var(--accent);box-shadow:none}
+input[type=color]{height:38px;padding:3px;border-radius:9px;background:var(--surface);cursor:pointer}
+select{cursor:pointer}
+textarea{border-radius:10px;line-height:1.6}
+label{font-size:12px;font-weight:600;color:var(--muted-text)}
+
+.primary{
+  background:linear-gradient(180deg,color-mix(in srgb,var(--accent) 86%,#fff),var(--accent));
+  border-color:color-mix(in srgb,var(--accent) 78%,var(--text));
+  box-shadow:0 1px 2px color-mix(in srgb,var(--accent) 30%,transparent),inset 0 1px 0 #ffffff40;
+}
+.primary:hover{
+  background:linear-gradient(180deg,color-mix(in srgb,var(--accent) 78%,#fff),color-mix(in srgb,var(--accent) 94%,#fff));
+  border-color:color-mix(in srgb,var(--accent) 70%,var(--text));
+  filter:none;
+}
+button.danger{border-color:color-mix(in srgb,var(--danger) 40%,var(--border));color:var(--danger)}
+button.danger:hover{background:color-mix(in srgb,var(--danger) 8%,var(--surface));border-color:color-mix(in srgb,var(--danger) 55%,var(--border));filter:none}
+button:disabled{box-shadow:none}
+
+.card{
+  border:1px solid var(--shell-border);
+  border-radius:var(--content-radius);
+  background:var(--surface);
+  box-shadow:0 1px 2px light-dark(#0b12200d,#00000033);
+}
+.card h3{font-size:14px;font-weight:650;letter-spacing:-.1px}
+.card .code{color:var(--muted-text)}
+
+.badge{
+  padding:3px 8px;
+  border:1px solid var(--shell-border);
+  border-radius:999px;
+  background:color-mix(in srgb,var(--desktop) 70%,var(--surface));
+  font-weight:600;
+  letter-spacing:.2px;
+  color:var(--muted-text);
+}
+
+.state{
+  padding:22px 18px;
+  border:1px solid var(--shell-border);
+  border-radius:var(--content-radius);
+  background:color-mix(in srgb,var(--desktop) 45%,var(--surface));
+}
+.state h3{font-size:14px;font-weight:650;margin-bottom:6px}
+.state p{font-size:12.5px;color:var(--muted-text);margin-bottom:0}
+.state[data-kind=denied],.state[data-kind=error]{
+  border-color:color-mix(in srgb,var(--danger) 42%,var(--border));
+  background:color-mix(in srgb,var(--danger) 6%,var(--surface));
+}
+.state[data-kind=denied] h3,.state[data-kind=error] h3{color:var(--danger)}
+.state[data-kind=ready]{border-color:color-mix(in srgb,var(--accent) 40%,var(--border))}
+.state[data-kind=ready] h3{color:color-mix(in srgb,var(--accent) 72%,var(--text))}
+.state[data-kind=loading] h3,.state[data-kind=empty] h3,.state[data-kind=unavailable] h3{color:var(--muted-text)}
+
+.result{
+  border:1px solid var(--shell-border);
+  border-radius:10px;
+  background:color-mix(in srgb,var(--desktop) 62%,var(--surface));
+  font-size:11.5px;
+  line-height:1.65;
+}
+
+@media(max-width:650px){
+  .card{padding:13px}
+  .state{padding:18px 14px}
+}
