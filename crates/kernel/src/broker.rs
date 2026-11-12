@@ -541,7 +541,7 @@ fn invoke_inner<'a>(
              FROM provider_records p JOIN instances i ON i.id=p.instance_id
              JOIN deployments d ON d.id=i.deployment_id JOIN installations n ON n.id=d.installation_id
              WHERE p.name=$1 AND p.version=$2 AND p.availability='ready'
-               AND p.observed_at>now()-interval '1 millisecond'*
+               AND p.observed_at>(CASE WHEN $5 THEN clock_timestamp() ELSE now() END)-interval '1 millisecond'*
                    ((n.manifest->'health'->>'interval_ms')::bigint*
                     (n.manifest->'health'->>'failure_threshold')::bigint+
                     (n.manifest->'health'->>'timeout_ms')::bigint)
@@ -558,7 +558,7 @@ fn invoke_inner<'a>(
         let instance: Uuid = row.get("id");
         let generation: i64 = row.get("generation");
         let manifest: Value = row.get("manifest");
-        if matches!(origin, CallSource::Task(_))
+        if task
             && manifest["requested_rules"].as_array().is_some_and(|rules| {
                 rules.iter().any(|rule| {
                     rule["required"] == true
@@ -984,7 +984,8 @@ async fn check_live_call_for_source(
         )
         .await?;
     let check = connection.transaction().await?;
-    if matches!(origin, CallSource::Task(_)) {
+    let task = matches!(origin, CallSource::Task(_));
+    if task {
         db::call_lock(&check).await?;
     }
     let current = origin
@@ -1009,7 +1010,25 @@ async fn check_live_call_for_source(
     if status.get::<_, String>("state") != "running" {
         return Err(Error::conflict("Admitted call is no longer running"));
     }
-    let live: bool = check.query_one("SELECT EXISTS(SELECT 1 FROM instances i JOIN deployments d ON d.id=i.deployment_id WHERE i.id=$1 AND i.generation=$2 AND i.phase='ready' AND d.archived_at IS NULL AND d.spec->>'enabled'='true')", &[&instance,&generation]).await?.get(0);
+    let live: bool = check.query_one(
+        "SELECT EXISTS(
+             SELECT 1 FROM instances i JOIN deployments d ON d.id=i.deployment_id
+             WHERE i.id=$1 AND i.generation=$2 AND i.phase='ready'
+               AND d.archived_at IS NULL AND d.spec->>'enabled'='true'
+               AND (NOT $3::boolean OR EXISTS(
+                   SELECT 1 FROM provider_records p
+                   JOIN calls c ON c.id=$4 AND c.provider_instance_id=p.instance_id
+                   JOIN installations n ON n.id=d.installation_id
+                   WHERE p.instance_id=i.id AND p.name=c.contract->>'name' AND p.version=c.contract->>'version'
+                     AND p.availability='ready' AND p.observed_generation=i.generation
+                     AND p.observed_at>clock_timestamp()-interval '1 millisecond'*
+                         ((n.manifest->'health'->>'interval_ms')::bigint*
+                          (n.manifest->'health'->>'failure_threshold')::bigint+
+                          (n.manifest->'health'->>'timeout_ms')::bigint)
+               ))
+         )",
+        &[&instance, &generation, &task, &call],
+    ).await?.get(0);
     if !live {
         return Err(Error::unavailable("Fixed Skill deployment is unavailable"));
     }

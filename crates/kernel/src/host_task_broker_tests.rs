@@ -1,5 +1,6 @@
 //! Actual PostgreSQL and loopback capability mTLS, using installed metadata fixtures.
 use super::*;
+use chrono::{DateTime, Utc};
 use tokio_postgres::Row;
 
 struct TaskFixture {
@@ -106,10 +107,22 @@ impl TaskFixture {
         })
     }
 
+    async fn claim(&self) -> crate::task_engine::Lease {
+        let mut c = self.host.app.db.connect().await.unwrap();
+        let tx = c.transaction().await.unwrap();
+        let lease = crate::task_engine::claim_broker(&tx, &self.host.app.auth)
+            .await
+            .unwrap()
+            .unwrap();
+        tx.commit().await.unwrap();
+        lease
+    }
+
     async fn journal(&self) -> Row {
         let c = self.host.app.db.connect().await.unwrap();
         c.query_one(
-            "SELECT t.state AS task_state,t.output AS task_output,t.delegation_id AS task_delegation,
+            "SELECT t.state AS task_state,t.output AS task_output,t.error AS task_error,
+                    t.delegation_id AS task_delegation,
                     s.state AS step_state,s.id AS step_id,a.state AS attempt_state,a.broker_call_id,
                     c.state AS call_state,c.result AS call_result,c.credential_id,c.skill_id,c.input_digest,
                     c.provider_instance_id,c.idempotency_key,c.delegation_id AS call_delegation,
@@ -248,14 +261,8 @@ async fn postgres_task_broker_requires_current_provider_generation_at_admission(
         return;
     };
     let (plugin, server) = echo(&f.host, f.instance).await;
-    let mut c = f.host.app.db.connect().await.unwrap();
-    let tx = c.transaction().await.unwrap();
-    let lease = crate::task_engine::claim_broker(&tx, &f.host.app.auth)
-        .await
-        .unwrap()
-        .unwrap();
-    tx.commit().await.unwrap();
-
+    let lease = f.claim().await;
+    let c = f.host.app.db.connect().await.unwrap();
     assert_eq!(
         c.execute(
             "UPDATE provider_records SET observed_generation=observed_generation-1 WHERE instance_id=$1",
@@ -272,5 +279,120 @@ async fn postgres_task_broker_requires_current_provider_generation_at_admission(
     let row = f.unadmitted().await;
     assert_eq!(row.get::<_, String>("attempt_state"), "leased");
     assert_eq!(plugin.calls.load(Ordering::SeqCst), 0);
+    server.abort();
+}
+
+#[tokio::test]
+async fn postgres_task_broker_provider_freshness_expires_during_admission_lock_wait() {
+    let Some(f) = TaskFixture::new("none", false).await else {
+        return;
+    };
+    let (plugin, server) = echo(&f.host, f.instance).await;
+    let lease = f.claim().await;
+    let mut blocker = f.host.app.db.connect().await.unwrap();
+    let lock = blocker.transaction().await.unwrap();
+    crate::db::call_lock(&lock).await.unwrap();
+    let blocker_pid: i32 = lock
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let app = f.host.app.clone();
+    let pending = tokio::spawn(async move { crate::broker::invoke_task(&app, &lease).await });
+
+    let observer = f.host.app.db.connect().await.unwrap();
+    let started: DateTime<Utc> = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(row) = observer
+                .query_opt(
+                    "SELECT xact_start FROM pg_stat_activity WHERE datname=current_database()
+                     AND wait_event_type='Lock' AND wait_event='advisory'
+                     AND $1=ANY(pg_blocking_pids(pid))",
+                    &[&blocker_pid],
+                )
+                .await
+                .unwrap()
+            {
+                break row.get(0);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Broker must wait on the call ledger lock");
+
+    // Position the health expiry after the waiting transaction's fixed now().
+    // Holding the lock through expiry tests wall-clock freshness at admission.
+    let expires = started + chrono::Duration::milliseconds(100);
+    assert_eq!(
+        lock.execute(
+            "UPDATE provider_records p SET observed_at=$2::timestamptz-interval '1 millisecond'*
+                ((n.manifest->'health'->>'interval_ms')::bigint*
+                 (n.manifest->'health'->>'failure_threshold')::bigint+
+                 (n.manifest->'health'->>'timeout_ms')::bigint)
+             FROM instances i JOIN deployments d ON d.id=i.deployment_id
+             JOIN installations n ON n.id=d.installation_id
+             WHERE p.instance_id=i.id AND i.id=$1",
+            &[&f.instance, &expires],
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    while !lock
+        .query_one("SELECT clock_timestamp()>=$1", &[&expires])
+        .await
+        .unwrap()
+        .get::<_, bool>(0)
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    lock.commit().await.unwrap();
+
+    let error = pending.await.unwrap().unwrap_err();
+    assert_eq!(error.code, "NOT_READY");
+    assert_eq!(
+        f.unadmitted().await.get::<_, String>("attempt_state"),
+        "leased"
+    );
+    assert_eq!(plugin.calls.load(Ordering::SeqCst), 0);
+    server.abort();
+}
+
+#[tokio::test]
+async fn postgres_task_broker_expired_attempt_exposes_settled_call_without_redispatch() {
+    let Some(f) = TaskFixture::new("none", false).await else {
+        return;
+    };
+    let (plugin, server) = echo(&f.host, f.instance).await;
+    let lease = f.claim().await;
+    let result = crate::broker::invoke_task(&f.host.app, &lease)
+        .await
+        .unwrap();
+    let call = contracts::id(&result["call"], "call_id").unwrap();
+
+    let c = f.host.app.db.connect().await.unwrap();
+    assert_eq!(
+        c.execute(
+            "UPDATE attempts SET lease_expires_at=clock_timestamp() WHERE id=$1",
+            &[&lease.attempt_id],
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    assert!(!crate::task_worker::run_once(&f.host.app).await.unwrap());
+    let row = f.journal().await;
+    f.assert_admission(&row);
+    for column in ["task_state", "step_state", "attempt_state"] {
+        assert_eq!(row.get::<_, String>(column), "unknown", "{column}");
+    }
+    let error: Value = row.get("task_error");
+    assert_eq!(error["code"], "OUTCOME_UNKNOWN");
+    assert_eq!(error["resource_id"], json!(call));
+    assert_eq!(row.get::<_, Uuid>("broker_call_id"), call);
+    assert_eq!(row.get::<_, String>("call_state"), "succeeded");
+    assert_eq!(row.get::<_, String>("reservation_status"), "released");
+    assert_eq!(plugin.calls.load(Ordering::SeqCst), 1);
     server.abort();
 }

@@ -616,7 +616,7 @@ pub async fn expire(tx: &Transaction<'_>) -> Result<bool> {
     let Some(row) = tx
         .query_opt(
             "SELECT t.id,t.state,t.deadline_at,w.spec,s.id AS step_id,s.step_key,s.attempt_count,
-                a.id AS attempt_id,a.state AS attempt_state,a.lease_expires_at
+                a.id AS attempt_id,a.state AS attempt_state,a.lease_expires_at,a.broker_call_id
          FROM attempts a JOIN task_steps s ON s.id=a.step_id JOIN tasks t ON t.id=s.task_id
          JOIN workflows w ON w.id=t.workflow_id
          WHERE a.state IN ('leased','running') AND a.lease_expires_at<=clock_timestamp()
@@ -640,9 +640,14 @@ pub async fn expire(tx: &Transaction<'_>) -> Result<bool> {
         set_step(tx, step, "unknown", None, now).await?;
         let reason = Error::new(
             "OUTCOME_UNKNOWN",
-            "Task dispatch was not conclusively recorded",
+            "Task attempt expired without a committed outcome",
             axum::http::StatusCode::CONFLICT,
         );
+        let reason = if let Some(call) = row.get::<_, Option<Uuid>>("broker_call_id") {
+            reason.with_resource(call)
+        } else {
+            reason
+        };
         if !matches!(
             row.get::<_, String>("state").as_str(),
             "succeeded" | "failed" | "canceled"
