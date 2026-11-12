@@ -1,7 +1,7 @@
 //! Transactional state for synchronous Workflow attempts. The in-process
 //! caller must commit a lease before preparing it for Broker dispatch.
 use crate::{
-    auth::Auth,
+    auth::{Auth, Context},
     contracts::{reject_jsonb_nul, unsigned, validate, validate_business},
     db,
     error::{Error, Result},
@@ -50,6 +50,18 @@ pub enum Outcome {
 }
 
 pub async fn claim(tx: &Transaction<'_>, auth: &Auth) -> Result<Option<Lease>> {
+    claim_with_readiness(tx, auth, false).await
+}
+
+pub(crate) async fn claim_broker(tx: &Transaction<'_>, auth: &Auth) -> Result<Option<Lease>> {
+    claim_with_readiness(tx, auth, true).await
+}
+
+async fn claim_with_readiness(
+    tx: &Transaction<'_>,
+    auth: &Auth,
+    require_provider: bool,
+) -> Result<Option<Lease>> {
     db::auth_lock(tx, false).await?;
     let query = format!(
         "{STEP_QUERY}
@@ -64,10 +76,31 @@ pub async fn claim(tx: &Transaction<'_>, auth: &Auth) -> Result<Option<Lease>> {
                       'binding',jsonb_build_object('kind','skill_capability','skill_id',k.id,
                                                  'definition_digest',k.definition_digest))))
           )
+          AND (NOT $1::boolean OR (
+              NOT EXISTS (
+                  SELECT 1 FROM task_steps other WHERE other.task_id=t.id
+                    AND NOT t.admission @> jsonb_build_object('steps',jsonb_build_array(
+                      jsonb_build_object('step_key',other.step_key,'binding',
+                                        jsonb_build_object('kind','skill_capability'))))
+              )
+              AND EXISTS (
+                  SELECT 1 FROM provider_records p JOIN instances i ON i.id=p.instance_id
+                  JOIN deployments d ON d.id=i.deployment_id JOIN installations n ON n.id=d.installation_id
+                  WHERE d.id=s.provider_deployment_id AND d.archived_at IS NULL AND d.spec->>'enabled'='true'
+                    AND i.phase='ready' AND p.availability='ready' AND p.observed_generation=i.generation
+                    AND p.observed_at>clock_timestamp()-interval '1 millisecond' *
+                        ((n.manifest->'health'->>'interval_ms')::bigint *
+                         (n.manifest->'health'->>'failure_threshold')::bigint +
+                         (n.manifest->'health'->>'timeout_ms')::bigint)
+                    AND t.admission @> jsonb_build_object('steps',jsonb_build_array(
+                      jsonb_build_object('step_key',s.step_key,'installation_id',n.id,'binding',
+                        jsonb_build_object('contract',jsonb_build_object('name',p.name,'version',p.version)))))
+              )
+          ))
           AND NOT EXISTS (SELECT 1 FROM task_steps active WHERE active.task_id=t.id AND active.state='running')
         ORDER BY s.created_at,s.id LIMIT 1 FOR UPDATE OF t,s SKIP LOCKED"
     );
-    let Some(row) = tx.query_opt(&query, &[]).await? else {
+    let Some(row) = tx.query_opt(&query, &[&require_provider]).await? else {
         return Ok(None);
     };
     let task_id = row.get("id");
@@ -144,9 +177,31 @@ pub async fn claim(tx: &Transaction<'_>, auth: &Auth) -> Result<Option<Lease>> {
 /// Persist dispatch intent before transferring a validated invocation. Until
 /// the Broker journals an admitted Call, loss after this boundary is unknown.
 pub async fn begin(tx: &Transaction<'_>, auth: &Auth, lease: &Lease) -> Result<Invocation> {
+    let (invocation, _, now) = prepare_begin(tx, auth, lease).await?;
+    set_live_attempt(tx, lease.attempt_id, "running", now, invocation.deadline).await?;
+    Ok(invocation)
+}
+
+/// Prepare a Task invocation inside the same transaction as the Broker Call.
+pub(crate) async fn begin_broker(
+    tx: &Transaction<'_>,
+    auth: &Auth,
+    lease: &Lease,
+) -> Result<(Invocation, Context)> {
+    let (invocation, prepared, now) = prepare_begin(tx, auth, lease).await?;
+    let context = prepared.into_broker_context(tx).await?;
+    set_live_attempt(tx, lease.attempt_id, "running", now, invocation.deadline).await?;
+    Ok((invocation, context))
+}
+
+async fn prepare_begin(
+    tx: &Transaction<'_>,
+    auth: &Auth,
+    lease: &Lease,
+) -> Result<(Invocation, authority::Prepared, DateTime<Utc>)> {
     let active = load(tx, lease).await?;
     active.require_running_step()?;
-    if active.state != "leased" {
+    if active.state != "leased" || active.broker_call_id.is_some() {
         return Err(Error::conflict(
             "Attempt has already crossed the dispatch boundary",
         ));
@@ -157,15 +212,126 @@ pub async fn begin(tx: &Transaction<'_>, auth: &Auth, lease: &Lease) -> Result<I
     let deadline = active.deadline(&prepared)?;
     let now = clock(tx).await?;
     require_future(active.lease_until.min(deadline), now)?;
-    set_live_attempt(tx, lease.attempt_id, "running", now, deadline).await?;
-    Ok(Invocation {
+    let invocation = Invocation {
         skill_id: prepared.skill,
         deployment_id: prepared.deployment,
         installation_id: prepared.installation,
         input,
         deadline,
         idempotency_key: lease.idempotency_key.clone(),
-    })
+    };
+    Ok((invocation, prepared, now))
+}
+
+/// Link the already admitted Call while the attempt and admission are locked.
+pub(crate) async fn record_broker_call(
+    tx: &Transaction<'_>,
+    lease: &Lease,
+    call: Uuid,
+) -> Result<()> {
+    let active = load(tx, lease).await?;
+    active.require_running_step()?;
+    if active.state != "running" || active.broker_call_id.is_some() {
+        return Err(Error::conflict(
+            "Task attempt no longer accepts a Broker Call",
+        ));
+    }
+    let updated = tx.execute(
+        "UPDATE attempts a SET broker_call_id=c.id,revision=a.revision+1,updated_at=clock_timestamp()
+         FROM calls c JOIN instances i ON i.id=c.provider_instance_id
+         JOIN task_steps s ON s.provider_deployment_id=i.deployment_id
+         JOIN tasks t ON t.id=s.task_id JOIN execution_delegations e ON e.id=t.delegation_id
+         WHERE a.id=$1 AND c.id=$2 AND s.id=a.step_id AND a.state='running'
+           AND a.broker_call_id IS NULL AND c.state='running'
+           AND LEAST(a.lease_expires_at,c.deadline_at,t.deadline_at,e.expires_at)>clock_timestamp()
+           AND c.owner_id=t.owner_id AND c.credential_id=e.issuer_credential_id
+           AND c.delegation_id<>t.delegation_id AND c.idempotency_key=a.idempotency_key
+           AND t.admission @> jsonb_build_object('version',1,'steps',jsonb_build_array(
+               jsonb_build_object('step_key',s.step_key,'deployment_id',i.deployment_id,'binding',
+                 jsonb_build_object('kind','skill_capability','skill_id',c.skill_id,
+                                    'definition_digest',c.skill_definition_digest,'contract',c.contract))))",
+        &[&lease.attempt_id, &call],
+    ).await?;
+    if updated != 1 {
+        return Err(Error::conflict(
+            "Broker Call does not match the live Task attempt",
+        ));
+    }
+    Ok(())
+}
+
+/// Recreate exact Task authority for one transaction on an admitted Call.
+pub(crate) async fn authorize_broker_call(
+    tx: &Transaction<'_>,
+    auth: &Auth,
+    lease: &Lease,
+    call: Uuid,
+) -> Result<Context> {
+    let active = load(tx, lease).await?;
+    active.require_running_step()?;
+    if active.state != "running" || active.broker_call_id != Some(call) {
+        return Err(Error::conflict(
+            "Broker Call is not linked to this Task attempt",
+        ));
+    }
+    let prepared = active.prepare(tx, auth, lease.attempt_id).await?;
+    let deadline = active.deadline(&prepared)?;
+    let context = prepared.into_broker_context(tx).await?;
+    require_future(active.lease_until.min(deadline), clock(tx).await?)?;
+    Ok(context)
+}
+
+/// Inspect durable settlement even if the dispatch future lost its response.
+pub(crate) async fn broker_call(
+    tx: &Transaction<'_>,
+    lease: &Lease,
+) -> Result<Option<(Uuid, String, Option<Value>)>> {
+    let active = load(tx, lease).await?;
+    let Some(call) = active.broker_call_id else {
+        return Ok(None);
+    };
+    let row = tx
+        .query_one("SELECT state,result FROM calls WHERE id=$1", &[&call])
+        .await?;
+    Ok(Some((call, row.get("state"), row.get("result"))))
+}
+
+/// A revoked or expired credential can close a lease that never admitted a Call.
+pub(crate) async fn pause_undispatched(
+    tx: &Transaction<'_>,
+    lease: &Lease,
+    error: &Error,
+) -> Result<()> {
+    if !matches!(error.code, "PERMISSION_DENIED" | "INVALID_CREDENTIAL") {
+        return Err(Error::invalid(
+            "Task authorization pause requires an authority error",
+        ));
+    }
+    let active = load(tx, lease).await?;
+    active.require_running_step()?;
+    if active.state != "leased" || active.broker_call_id.is_some() {
+        return Err(Error::conflict(
+            "Only an undispatched lease can pause authorization",
+        ));
+    }
+    let now = clock(tx).await?;
+    set_live_attempt(
+        tx,
+        lease.attempt_id,
+        "expired",
+        now,
+        active.row.get("deadline_at"),
+    )
+    .await?;
+    set_step(tx, lease.step_id, "ready", None, now).await?;
+    set_task(
+        tx,
+        lease.task_id,
+        "paused_authorization",
+        None,
+        Some(error.detail()),
+    )
+    .await
 }
 
 pub async fn renew(tx: &Transaction<'_>, auth: &Auth, lease: &Lease) -> Result<DateTime<Utc>> {
@@ -195,6 +361,7 @@ struct Active {
     state: String,
     lease_until: DateTime<Utc>,
     created_at: DateTime<Utc>,
+    broker_call_id: Option<Uuid>,
 }
 
 impl Active {
@@ -243,7 +410,7 @@ async fn load(tx: &Transaction<'_>, lease: &Lease) -> Result<Active> {
         return Err(Error::conflict("Task step fence changed"));
     }
     let attempt = tx.query_opt(
-        "SELECT state,lease_expires_at,created_at FROM attempts
+        "SELECT state,lease_expires_at,created_at,broker_call_id FROM attempts
          WHERE id=$1 AND step_id=$2 AND execution_id=$3 AND fence=$4 AND idempotency_key=$5 FOR UPDATE",
         &[&lease.attempt_id, &lease.step_id, &lease.execution_id, &lease.fence, &lease.idempotency_key],
     ).await?.ok_or_else(|| Error::conflict("Attempt identity changed"))?;
@@ -254,6 +421,7 @@ async fn load(tx: &Transaction<'_>, lease: &Lease) -> Result<Active> {
         state: attempt.get("state"),
         lease_until: attempt.get("lease_expires_at"),
         created_at: attempt.get("created_at"),
+        broker_call_id: attempt.get("broker_call_id"),
     })
 }
 
@@ -348,6 +516,22 @@ pub async fn complete(
         Outcome::Unknown(error) => ("unknown", None, Some(error.detail())),
     };
     let prepared = active.prepare(tx, auth, lease.attempt_id).await?;
+    if let Some(call) = active.broker_call_id {
+        let row = tx
+            .query_one("SELECT state,result FROM calls WHERE id=$1", &[&call])
+            .await?;
+        let call_state: String = row.get("state");
+        let saved: Option<Value> = row.get("result");
+        if state == "failed"
+            || (call_state == "succeeded") != (state == "succeeded")
+            || (state == "succeeded"
+                && saved.as_ref().and_then(|v| v.get("output")) != output.as_ref())
+        {
+            return Err(Error::conflict(
+                "Task outcome does not match the linked Broker Call",
+            ));
+        }
+    }
     if active.state == state && active.row.get::<_, String>("step_state") == state {
         let matches = if let Some(output) = &output {
             let saved: Option<Value> = tx

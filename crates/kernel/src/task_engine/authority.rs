@@ -6,7 +6,7 @@ use crate::{
 };
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::{
     collections::{BTreeSet, HashMap},
     net::IpAddr,
@@ -22,6 +22,21 @@ pub(super) struct Prepared {
     pub(super) maximum_input_bytes: usize,
     pub(super) maximum_output_bytes: usize,
     pub(super) deadline: DateTime<Utc>,
+    context: Context,
+    business_paths: Vec<Path>,
+}
+
+impl Prepared {
+    /// Expose only this step's live business proof to the Broker transaction.
+    pub(super) async fn into_broker_context(self, tx: &Transaction<'_>) -> Result<Context> {
+        let mut context = self.context;
+        context
+            .proxy_ceilings
+            .push(policy::rules(&self.business_paths));
+        context.proxy_paths = Some(self.business_paths);
+        context.bind_proxy_proof(tx).await?;
+        Ok(context)
+    }
 }
 
 #[derive(Deserialize)]
@@ -181,7 +196,7 @@ pub(super) async fn prepare(
     for (action, resource, saved) in saved_targets {
         current_paths.push(revalidate_paths(tx, &ctx, action, resource, saved, ceiling).await?);
     }
-    let deadline = live_deadline(tx, &ctx, &current_paths, deadline).await?;
+    let deadline = live_deadline(tx, &ctx, &mut current_paths, deadline).await?;
     Ok(Prepared {
         skill: skill_id,
         deployment,
@@ -190,6 +205,10 @@ pub(super) async fn prepare(
         maximum_input_bytes,
         maximum_output_bytes,
         deadline,
+        context: ctx,
+        // Workflow visibility is required above, but it is not delegated to
+        // the Broker as part of Skill or capability authority.
+        business_paths: current_paths.into_iter().skip(1).flatten().collect(),
     })
 }
 
@@ -297,7 +316,7 @@ async fn check_provider(
 async fn live_deadline(
     tx: &Transaction<'_>,
     ctx: &Context,
-    targets: &[Vec<Path>],
+    targets: &mut [Vec<Path>],
     deadline: DateTime<Utc>,
 ) -> Result<DateTime<Utc>> {
     let sources: Vec<_> = targets
@@ -355,27 +374,34 @@ async fn live_deadline(
     for paths in targets {
         // Alternatives are independent. A target remains authorized until its
         // longest surviving original proof ends, subject to the global deadline.
-        let until = paths
-            .iter()
-            .filter_map(|path| {
-                let conditions = path.rule.get("conditions");
-                if conditions
-                    .is_some_and(|conditions| !auth::conditions_match(conditions, ctx.peer, now))
-                {
-                    return None;
-                }
-                let rule_expiry = conditions
-                    .and_then(|conditions| conditions.get("expires_at"))
-                    .and_then(Value::as_str)
-                    .and_then(|expiry| expiry.parse::<DateTime<Utc>>().ok())
-                    .unwrap_or(DateTime::<Utc>::MAX_UTC);
-                path.sources.iter().try_fold(rule_expiry, |until, source| {
-                    Some(until.min(*grant_expiries.get(source)?))
-                })
-            })
-            .max()
-            .ok_or_else(Error::denied)?;
-        deadline = deadline.min(until);
+        let mut longest = None;
+        paths.retain_mut(|path| {
+            let conditions = path.rule.get("conditions");
+            if conditions
+                .is_some_and(|conditions| !auth::conditions_match(conditions, ctx.peer, now))
+            {
+                return false;
+            }
+            let rule_expiry = conditions
+                .and_then(|conditions| conditions.get("expires_at"))
+                .and_then(Value::as_str)
+                .and_then(|expiry| expiry.parse::<DateTime<Utc>>().ok())
+                .unwrap_or(DateTime::<Utc>::MAX_UTC);
+            let Some(until) = path.sources.iter().try_fold(rule_expiry, |until, source| {
+                Some(until.min(*grant_expiries.get(source)?))
+            }) else {
+                return false;
+            };
+            if until <= now {
+                return false;
+            }
+            if until < rule_expiry {
+                path.rule["conditions"]["expires_at"] = json!(until);
+            }
+            longest = Some(longest.map_or(until, |current: DateTime<Utc>| current.max(until)));
+            true
+        });
+        deadline = deadline.min(longest.ok_or_else(Error::denied)?);
     }
     (deadline > now)
         .then_some(deadline)

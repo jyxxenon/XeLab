@@ -630,6 +630,9 @@ mod capability_transport;
 #[path = "host_candidates_expiry_tests.rs"]
 mod candidates_expiry;
 
+#[path = "host_task_broker_tests.rs"]
+mod task_broker;
+
 #[tokio::test]
 async fn required_host_proxy_rules_need_complete_signed_current_approval() {
     let Some(f) = Fixture::new().await else {
