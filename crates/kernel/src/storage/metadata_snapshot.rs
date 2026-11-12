@@ -164,6 +164,7 @@ async fn export_inner(c: &mut Client, out: &mut (impl AsyncWrite + Unpin)) -> Re
     crate::ui::validate_snapshot(&tx).await?;
     crate::webui::validate_snapshot(&tx).await?;
     crate::events::snapshot::validate_snapshot(&tx).await?;
+    crate::tasks::snapshot::validate_snapshot(&tx).await?;
     if tx
         .query_one(
             "SELECT EXISTS(SELECT 1 FROM platform_recovery_state WHERE phase<>'ready')",
@@ -422,6 +423,7 @@ async fn import_inner(
     crate::ui::validate_snapshot(&tx).await?;
     crate::webui::validate_snapshot(&tx).await?;
     crate::events::snapshot::validate_snapshot(&tx).await?;
+    crate::tasks::snapshot::validate_snapshot(&tx).await?;
     recovery::reset_rows(&tx, owner, password, recovery).await?;
     tx.execute(
         "UPDATE platform_recovery_state SET metadata_summary=$2 WHERE recovery_id=$1",

@@ -40,6 +40,26 @@ def wait_for_reference_skill(frame):
     frame.wait_for_function("() => (document.querySelector('#skill-state') ?? document.querySelector('#state'))?.textContent === 'Skill call completed.'")
 
 
+SKILL_STAGES = ("fill_input", "submit_click", "wait_iframe_result", "check_result", "audit_settle", "audit_pump", "audit_read", "complete")
+SKILL_STATE_LABELS = ("absent", "empty", "completed", "waiting", "ready", "not_granted", "host_closed",
+                      "error_DEADLINE_EXCEEDED", "error_CHANNEL_CLOSED", "error_BACKEND_ERROR", "error_PROTOCOL_ERROR",
+                      "error_PERMISSION_DENIED", "error_BINDING_UNAVAILABLE", "error_RATE_LIMITED", "other_nonempty")
+
+
+def wait_for_skill_result(frame, expected):
+    # Wait for this call's result, not a stale completion left by the previous
+    # call. A fixed bridge error also ends the wait so diagnostics can report
+    # the failing state without consuming the full Playwright deadline.
+    frame.wait_for_function("""expected => {
+      const state=document.querySelector('#skill-state') ?? document.querySelector('#state');
+      const result=document.querySelector('#result');
+      const text=state?.textContent ?? '';
+      if(text==='Skill call completed.' && result?.textContent===expected)return true;
+      return ['DEADLINE_EXCEEDED','CHANNEL_CLOSED','BACKEND_ERROR','PROTOCOL_ERROR',
+        'PERMISSION_DENIED','BINDING_UNAVAILABLE','RATE_LIMITED'].some(code=>text.startsWith(code+':'));
+    }""", arg=expected)
+
+
 def error_bucket(error):
     message = str(error)[:8192].lower()
     for bucket, phrases in [
@@ -178,20 +198,214 @@ class LoginBootstrapAudit:
         self.snapshot(page, label, "failure")
 
 
-class RequestTimeline:
-    """Bounded request lifecycle facts without URLs, payloads or headers."""
+def observe_skill_read_status(http, audit, method, path, status):
+    if method != "GET":
+        return
+    if re.fullmatch(r"/api/platform/v1/calls/[0-9a-fA-F-]{36}", path):
+        field = "call_proof_statuses"
+    elif re.fullmatch(r"/api/platform/v1/ui/contributions/[0-9a-fA-F-]{36}/[a-z][a-z0-9_-]{0,63}", path):
+        field = "contribution_recheck_statuses"
+    else:
+        return
+    status = status if 100 <= status <= 599 else 0
+    histories = [http[field]]
+    if audit is not None and audit.entry["status"] == "running":
+        histories.append(audit.entry[field])
+    for entries in histories:
+        entries.append(status)
+        del entries[:-8]
+
+
+class SkillCallAudit:
+    """Bounded per-call stage, timing and fixed-state diagnostics.
+
+    Read-only observations never retry an action or become an acceptance gate.
+    Only fixed labels, booleans, counters and elapsed times leave the browser.
+    """
+    limit = 8
+    read_limit = 32
+
+    def __init__(self, report, bodies, label, expected_successes):
+        self.report, self.bodies = report, bodies
+        self.label, self.expected_successes = label, expected_successes
+        self.started = time.monotonic()
+        self.attempts_start = report["http"]["skill_post_attempts"]
+        self.successes_start = report["http"]["actual_skill_successes"]
+        self.read_requests = {}
+        self.entry = {"label": label, "expected_successes": expected_successes,
+                      "stage": "created", "status": "running", "timeline": [],
+                      "call_proof_statuses": [], "contribution_recheck_statuses": [],
+                      "read_requests": [], "dropped_read_requests": 0}
+        entries = report.setdefault("skill_call_diagnostics", [])
+        if len(entries) >= self.limit:
+            entries.pop(0)
+        entries.append(self.entry)
+
+    def elapsed(self):
+        return min(max(int((time.monotonic() - self.started) * 1000), 0), 300000)
+
+    def observe_read(self, event, value, core, contribution_paths):
+        if self.entry["status"] != "running":
+            return
+        try:
+            request = value.request if event == "response" else value
+            state = self.read_requests.get(request)
+            if event == "request":
+                if state is None:
+                    self.start_read(request, core, contribution_paths)
+                return
+            if state is None or state["finished_ms"] is not None or state["failed_ms"] is not None:
+                return
+            if event == "response" and state["response_ms"] is None:
+                state["response_ms"] = self.elapsed()
+                status = value.status
+                state["status"] = status if isinstance(status, int) and 100 <= status <= 599 else 0
+            elif event == "finished":
+                state["finished_ms"] = self.elapsed()
+            elif event == "failed":
+                state["failed_ms"] = self.elapsed()
+                state["failure_category"] = selected_failure_category(request.failure)
+        except Exception:
+            self.entry["read_observer_error"] = True
+
+    def start_read(self, request, core, contribution_paths):
+        if request.method != "GET":
+            return
+        parsed = urllib.parse.urlsplit(request.url)
+        if f"{parsed.scheme}://{parsed.netloc}" != core or parsed.query or parsed.fragment:
+            return
+        if parsed.path in contribution_paths:
+            role = "contribution_recheck"
+        elif re.fullmatch(r"/api/platform/v1/calls/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", parsed.path):
+            role = "call_proof"
+        else:
+            return
+        if len(self.read_requests) >= self.read_limit:
+            self.entry["dropped_read_requests"] = min(self.entry["dropped_read_requests"] + 1, 65535)
+            return
+        state = {"role": role, "start_ms": self.elapsed(), "response_ms": None, "finished_ms": None,
+                 "failed_ms": None, "status": None, "failure_category": None}
+        self.read_requests[request] = state
+        self.entry["read_requests"].append(state)
+
+    def mark(self, stage):
+        if stage not in SKILL_STAGES:
+            raise CheckFailed("invalid_skill_stage")
+        self.entry["stage"] = stage
+        if stage == "complete":
+            self.entry["status"] = "completed"
+        self.entry["elapsed_ms"] = self.elapsed()
+        self.entry["timeline"].append({"stage": stage, "ms": self.entry["elapsed_ms"]})
+        del self.entry["timeline"][:-len(SKILL_STAGES)]
+        self.report["step"] = self.label + "_" + stage
+
+    def snapshot(self, frame, expected):
+        snapshot = {"detached": None, "dom_available": False}
+        self.entry["iframe"] = snapshot
+        try:
+            snapshot["detached"] = frame.is_detached()
+            if snapshot["detached"]:
+                return
+            value = frame.locator("html").evaluate("""(element, {expected}) => {
+              const codes=['DEADLINE_EXCEEDED','CHANNEL_CLOSED','BACKEND_ERROR','PROTOCOL_ERROR',
+                'PERMISSION_DENIED','BINDING_UNAVAILABLE','RATE_LIMITED'];
+              let state='absent';
+              for(const node of [document.querySelector('#skill-state'),document.querySelector('#state')]) {
+                if(!node)continue;
+                const text=(node.textContent||'').trim();
+                if(!text)continue;
+                if(text==='Skill call completed.'){state='completed';break;}
+                if(text==='Approved channel ready.'){state='ready';break;}
+                if(text.startsWith('Waiting for the actual Skill result')){state='waiting';break;}
+                if(text==='Page is open; the echo Skill is not granted.'){state='not_granted';break;}
+                if(text.startsWith('Host closed this channel (')){state='host_closed';break;}
+                const code=codes.find(code=>text.startsWith(code+':'));
+                state=code?'error_'+code:'other_nonempty';break;
+              }
+              const result=document.querySelector('#result');
+              const context=document.querySelector('#result-context');
+              const call=document.querySelector('#call');
+              return {state_class:state,result_matches:!!result&&result.textContent===expected,
+                result_empty:!!result&&result.textContent==='',
+                result_context_matches:!!context&&context.textContent.includes(JSON.stringify(expected)),
+                call_disabled:!!call&&call.disabled,call_visible:!!call&&call.getClientRects().length>0,
+                connected:document.documentElement.isConnected,document_visible:document.visibilityState==='visible'};
+            }""", {"expected": expected}, timeout=1000)
+            snapshot["dom_available"] = True
+            snapshot["state_class"] = value.get("state_class") if value.get("state_class") in SKILL_STATE_LABELS else "other_nonempty"
+            for key in ("result_matches", "result_empty", "result_context_matches", "call_disabled", "call_visible", "connected", "document_visible"):
+                snapshot[key] = value.get(key) if isinstance(value.get(key), bool) else None
+        except Exception as error:
+            snapshot["diagnostic_error_bucket"] = error_bucket(error)
+
+    def mismatch(self):
+        attempts = self.report["http"]["skill_post_attempts"] - self.attempts_start
+        successes = self.report["http"]["actual_skill_successes"] - self.successes_start
+        self.entry["attempts_delta"] = attempts
+        self.entry["successes_delta"] = successes
+        if attempts < 1:
+            return "submit_not_observed"
+        states = [state for state in self.bodies.requests.values()
+                  if state.get("expected_at_start") == self.expected_successes]
+        if not states:
+            return "request_not_correlated"
+        if not any(state.get("response_ms") is not None for state in states):
+            return "response_not_observed"
+        if not any(state.get("verified") for state in states):
+            return "response_not_verified"
+        proofs = self.entry["call_proof_statuses"]
+        rechecks = self.entry["contribution_recheck_statuses"]
+        if proofs and proofs[-1] != 200:
+            return "call_proof_not_successful"
+        if rechecks and rechecks[-1] != 200:
+            return "contribution_recheck_not_successful"
+        iframe = self.entry.get("iframe") or {}
+        if not iframe.get("dom_available"):
+            return "iframe_unavailable"
+        if iframe.get("state_class") != "completed":
+            return "iframe_state_" + str(iframe.get("state_class"))
+        if not iframe.get("result_matches"):
+            return "result_mismatch"
+        if not proofs:
+            return "call_proof_not_observed"
+        if not rechecks:
+            return "contribution_recheck_not_observed"
+        return "none"
+
+    def failure(self, frame, page, error, expected):
+        try:
+            # Read already selected response bodies before classifying stages.
+            wait_for_observers(page, self.report.get("observation", {}), self.bodies)
+        except Exception:
+            pass
+        self.snapshot(frame, expected)
+        self.entry["status"] = "failed"
+        self.entry["elapsed_ms"] = self.elapsed()
+        name = type(error).__name__
+        self.entry["error_type"] = name if name in ("TimeoutError", "Error", "CheckFailed") else "OtherError"
+        mismatch = self.mismatch()
+        if mismatch == "none":
+            mismatch = ("observation_incomplete" if self.entry["stage"] in
+                        ("audit_settle", "audit_pump", "audit_read") else "unexpected_failure")
+        self.entry["mismatch"] = mismatch
+        self.report["step"] = self.label + "_" + self.entry["stage"]
+
+
+class WindowOpenAudit:
+    """Read-only, bounded window.open diagnostics; never an acceptance gate."""
     limit = 32
 
-    def __init__(self, core):
-        self.core = core
+    def __init__(self, core, deployment, report):
+        self.core, self.report = core, report
+        self.paths = {f"/api/platform/v1/ui/contributions/{deployment}/echo_widget": "source",
+                      f"/api/platform/v1/ui/contributions/{deployment}/echo_window": "target"}
         self.requests, self.started, self.active = {}, None, False
 
-    def begin(self, observation, field):
+    def start(self):
         self.started, self.active = time.monotonic(), True
         self.requests.clear()
-        self.observation = observation
-        self.records = observation[field] = []
-        observation["dropped_requests"] = 0
+        self.observation = {"stage": "window_open_click", "metadata_requests": [], "dropped_requests": 0}
+        self.report["window_open_observation"] = self.observation
 
     def observe(self, event, value):
         try:
@@ -212,10 +426,8 @@ class RequestTimeline:
         if not self.active or request in self.requests:
             return
         parsed = urllib.parse.urlsplit(request.url)
-        if f"{parsed.scheme}://{parsed.netloc}" != self.core or parsed.query or parsed.fragment:
-            return
-        role = self.request_role(request.method, parsed.path)
-        if role is None:
+        role = self.paths.get(parsed.path)
+        if request.method != "GET" or url_origin(request.url) != self.core or role is None or parsed.query:
             return
         if len(self.requests) >= self.limit:
             self.observation["dropped_requests"] = min(self.observation["dropped_requests"] + 1, 65535)
@@ -223,7 +435,7 @@ class RequestTimeline:
         state = {"role": role, "start_ms": self.elapsed(), "response_ms": None, "finished_ms": None,
                  "failed_ms": None, "status": None, "failure_category": None}
         self.requests[request] = state
-        self.records.append(state)
+        self.observation["metadata_requests"].append(state)
 
     def response(self, response):
         state = self.requests.get(response.request) if self.active else None
@@ -238,27 +450,6 @@ class RequestTimeline:
             state[key] = self.elapsed()
             if failed:
                 state["failure_category"] = selected_failure_category(request.failure)
-
-    def end(self):
-        self.observation["elapsed_ms"] = self.elapsed()
-        self.active = False
-
-
-class WindowOpenAudit(RequestTimeline):
-    """Read-only, bounded window.open diagnostics; never an acceptance gate."""
-    def __init__(self, core, deployment, report):
-        super().__init__(core)
-        self.report = report
-        self.paths = {f"/api/platform/v1/ui/contributions/{deployment}/echo_widget": "source",
-                      f"/api/platform/v1/ui/contributions/{deployment}/echo_window": "target"}
-
-    def start(self):
-        observation = {"stage": "window_open_click"}
-        self.begin(observation, "metadata_requests")
-        self.report["window_open_observation"] = observation
-
-    def request_role(self, method, path):
-        return self.paths.get(path) if method == "GET" else None
 
     def snapshot(self, widget):
         snapshot = {"dom_available": False}
@@ -299,81 +490,9 @@ class WindowOpenAudit(RequestTimeline):
         except Exception as error:
             snapshot["diagnostic_error_bucket"] = error_bucket(error)
 
-
-class SkillDeliveryAudit(RequestTimeline):
-    """Observe iframe delivery without changing the selected business call."""
-    labels = ("window_bridge_calls_real_http_skill", "valid_call_after_replay_rejection",
-              "widget_bridge_calls_real_http_skill", "limited_child_bridge_call_before_withdrawal")
-    stages = ("fill", "click", "wait_for_result", "verify_result", "settle_observers", "complete")
-
-    def __init__(self, core, deployment, skill, report):
-        super().__init__(core)
-        self.report = report
-        self.invoke_path = f"/api/platform/v1/skills/{skill}/calls"
-        contribution_prefix = f"/api/platform/v1/ui/contributions/{deployment}/"
-        self.contribution_paths = {contribution_prefix + "echo_window", contribution_prefix + "echo_widget"}
-
-    def start(self, label):
-        observation = {"label": label if label in self.labels else "other",
-                       "stage": "fill", "stages_ms": {"fill": 0}}
-        self.begin(observation, "network_requests")
-        records = self.report.setdefault("skill_delivery", [])
-        records.append(observation)
-        del records[:-len(self.labels)]
-
-    def mark(self, stage):
-        if self.active and stage in self.stages:
-            self.observation["stage"] = stage
-            self.observation["stages_ms"][stage] = self.elapsed()
-
-    def request_role(self, method, path):
-        if method == "POST" and path == self.invoke_path:
-            return "invoke_skill"
-        if method != "GET":
-            return None
-        if path in self.contribution_paths:
-            return "contribution"
-        prefix = "/api/platform/v1/calls/"
-        if path.startswith(prefix):
-            identifier = path.removeprefix(prefix)
-            try:
-                if str(uuid.UUID(identifier)) == identifier:
-                    return "get_call"
-            except ValueError:
-                pass
-        return None
-
-    def failure(self, frame, error):
-        self.observation["error_bucket"] = error_bucket(error)
-        snapshot = {"dom_available": False}
-        self.observation["frame_snapshot"] = snapshot
-        try:
-            snapshot["detached"] = frame.is_detached() is True
-            if snapshot["detached"]:
-                return
-            value = frame.locator("html").evaluate("""() => {
-              const state=document.querySelector('#skill-state') ?? document.querySelector('#state');
-              const text=state?.textContent || '';
-              const codes=['DEADLINE_EXCEEDED','CHANNEL_CLOSED','BACKEND_ERROR','PROTOCOL_ERROR',
-                'PERMISSION_DENIED','BINDING_UNAVAILABLE','RATE_LIMITED','UNAVAILABLE'];
-              const code=codes.find(code=>text.startsWith(code+':'));
-              const channel=document.querySelector('#state')?.textContent;
-              return {state_class:text==='Skill call completed.'?'completed':
-                  text==='Waiting for the actual Skill result…'?'waiting':!text?'empty':code||'other',
-                channel_ready:channel==='Approved channel ready.',
-                state_exists:!!state, call_disabled:document.querySelector('#call')?.disabled,
-                result_present:!!document.querySelector('#result')?.textContent,
-                document_visible:document.visibilityState==='visible'};
-            }""", timeout=1000)
-            labels = ("completed", "waiting", "empty", "DEADLINE_EXCEEDED", "CHANNEL_CLOSED",
-                      "BACKEND_ERROR", "PROTOCOL_ERROR", "PERMISSION_DENIED", "BINDING_UNAVAILABLE",
-                      "RATE_LIMITED", "UNAVAILABLE")
-            snapshot["dom_available"] = True
-            snapshot["state_class"] = value.get("state_class") if value.get("state_class") in labels else "other"
-            for key in ("channel_ready", "state_exists", "call_disabled", "result_present", "document_visible"):
-                snapshot[key] = value.get(key) if isinstance(value.get(key), bool) else None
-        except Exception as snapshot_error:
-            snapshot["diagnostic_error_bucket"] = error_bucket(snapshot_error)
+    def end(self):
+        self.observation["elapsed_ms"] = self.elapsed()
+        self.active = False
 
 
 class SkillBodyAudit:
@@ -541,13 +660,17 @@ class SkillBodyAudit:
                 and all(state["finished"] and not state["failed"] for state in self.requests.values()))
 
 
-def wait_for_observers(page, observed, bodies=None):
+def wait_for_observers(page, observed, bodies=None, on_stage=None):
     deadline = time.monotonic() + 5
     while True:
         # This outer protocol pump dispatches pending header/lifecycle events;
         # zero active callbacks alone never proves a selected JSON body exists.
+        if on_stage is not None:
+            on_stage("audit_pump")
         page.evaluate("() => true")
         if bodies is not None:
+            if on_stage is not None:
+                on_stage("audit_read")
             bodies.read_completed()
             if observed.get("observer_failure"):
                 raise CheckFailed("network_observation_failed")
@@ -688,7 +811,7 @@ def run(config, report):
     hosts = [urllib.parse.urlsplit(value).hostname for value in (core, ui, reference)]
     resolver = ",".join(f"MAP {host} {config['connect_ip']}" for host in hosts)
     report["playwright_version"] = importlib.metadata.version("playwright")
-    report["http"] = {"oauth_token_successes": 0, "callback_successes": 0, "actual_skill_successes": 0, "unique_skill_call_ids": 0, "skill_post_attempts": 0, "node_reads": 0, "preference_writes": 0, "contribution_reads": 0, "read_statuses": {}, "preflight_statuses": {}}
+    report["http"] = {"oauth_token_successes": 0, "callback_successes": 0, "actual_skill_successes": 0, "unique_skill_call_ids": 0, "skill_post_attempts": 0, "node_reads": 0, "preference_writes": 0, "contribution_reads": 0, "call_proof_statuses": [], "contribution_recheck_statuses": [], "read_statuses": {}, "preflight_statuses": {}}
     reads = {"/api/platform/v1/installations": "installation_list",
              "/api/platform/v1/deployments": "deployment_list",
              "/api/platform/v1/skills": "skill_list",
@@ -703,11 +826,15 @@ def run(config, report):
     calls = bodies.calls
     bootstrap = LoginBootstrapAudit(core, ui, reference, report)
     window_open = WindowOpenAudit(core, config["reference_deployment_id"], report)
-    skill_delivery = SkillDeliveryAudit(core, config["reference_deployment_id"], config["skill_id"], report)
+    skill_contribution_paths = {
+        f"/api/platform/v1/ui/contributions/{config['reference_deployment_id']}/{name}"
+        for name in ("echo_window", "echo_widget")
+    }
+    skill_context, active_skill_audit = None, None
 
-    def observe_delivery(event, value):
-        window_open.observe(event, value)
-        skill_delivery.observe(event, value)
+    def observe_skill_read(event, value, browser_context):
+        if browser_context is skill_context and active_skill_audit is not None:
+            active_skill_audit.observe_read(event, value, core, skill_contribution_paths)
 
     def observe_request(request, context_label=None):
         observed["active_request_observers"] += 1
@@ -729,7 +856,7 @@ def run(config, report):
         finally:
             observed["active_request_observers"] -= 1
 
-    def observe_response(response):
+    def observe_response(response, browser_context):
         observed["active_response_observers"] += 1
         phase = "response_origin"
         try:
@@ -739,6 +866,8 @@ def run(config, report):
             if url_origin(response.url) != core:
                 return
             phase = "response_read"
+            audit = active_skill_audit if browser_context is skill_context else None
+            observe_skill_read_status(report["http"], audit, response.request.method, parsed.path, response.status)
             if response.request.method in ("GET", "OPTIONS") and parsed.path in reads:
                 try:
                     value = response.json()
@@ -769,17 +898,20 @@ def run(config, report):
     def context(browser, label):
         result = browser.new_context(viewport={"width": 1440, "height": 1000})
         result.on("request", lambda request: observe_request(request, label))
-        result.on("response", observe_response)
+        result.on("response", lambda response: observe_response(response, result))
         result.on("request", lambda request: bootstrap.request(request, label))
         result.on("response", lambda response: bootstrap.response(response, label))
         result.on("requestfinished", lambda request: bootstrap.terminal(request, label, False))
         result.on("requestfailed", lambda request: bootstrap.terminal(request, label, True))
         result.on("requestfinished", bodies.finished)
         result.on("requestfailed", bodies.failed)
-        result.on("request", lambda request: observe_delivery("request", request))
-        result.on("response", lambda response: observe_delivery("response", response))
-        result.on("requestfinished", lambda request: observe_delivery("finished", request))
-        result.on("requestfailed", lambda request: observe_delivery("failed", request))
+        result.on("request", lambda request: window_open.observe("request", request))
+        result.on("response", lambda response: window_open.observe("response", response))
+        result.on("requestfinished", lambda request: window_open.observe("finished", request))
+        result.on("requestfailed", lambda request: window_open.observe("failed", request))
+        for event, phase in (("request", "request"), ("response", "response"),
+                             ("requestfinished", "finished"), ("requestfailed", "failed")):
+            result.on(event, lambda value, phase=phase: observe_skill_read(phase, value, result))
         result.on("page", lambda page: page.on("pageerror", lambda _: observed.__setitem__("page_errors", observed["page_errors"] + 1)))
         return result
 
@@ -858,26 +990,28 @@ def run(config, report):
         return frame
 
     def echo(frame, message, label, expected_successes):
-        report["step"] = label
-        bodies.expect(expected_successes)
-        skill_delivery.start(label)
+        nonlocal skill_context, active_skill_audit
+        audit = SkillCallAudit(report, bodies, label, expected_successes)
+        skill_context, active_skill_audit = frame.page.context, audit
         try:
+            audit.mark("fill_input")
+            bodies.expect(expected_successes)
             frame.locator("#message").fill(message)
-            skill_delivery.mark("click")
+            audit.mark("submit_click")
             frame.locator("#call").click()
-            skill_delivery.mark("wait_for_result")
-            wait_for_reference_skill(frame)
-            skill_delivery.mark("verify_result")
+            audit.mark("wait_iframe_result")
+            wait_for_skill_result(frame, message)
+            audit.mark("check_result")
             require(frame.locator("#result").inner_text() == message, label)
             require(frame.locator("img").count() == 0, label + "_text_not_html")
-            skill_delivery.mark("settle_observers")
-            wait_for_observers(page, observed, bodies)
-            skill_delivery.mark("complete")
+            audit.mark("audit_settle")
+            wait_for_observers(page, observed, bodies, audit.mark)
+            audit.mark("complete")
         except Exception as error:
-            skill_delivery.failure(frame, error)
+            audit.failure(frame, page, error, message)
             raise
         finally:
-            skill_delivery.end()
+            skill_context, active_skill_audit = None, None
 
     def fetch(page, path, method="GET", body=None):
         return page.evaluate(FETCH, {"core": core, "client": config["client_id"], "path": path, "method": method, "body": body, "key": str(uuid.uuid4())})
@@ -1002,6 +1136,7 @@ def run(config, report):
         widget = contribution_frame(page, "echo_widget")
         echo(widget, "Actual OCI widget Skill call", "widget_bridge_calls_real_http_skill", 4)
         window_open.start()
+        report["step"] = "widget_open_await_navigation"
         try:
             with page.expect_event("framenavigated", predicate=lambda frame: frame.url.startswith(reference_base + "window.html")) as opened:
                 widget.locator("#open-window").click()
@@ -1010,6 +1145,7 @@ def run(config, report):
             window_open.snapshot(widget)
             window_open.end()
             raise
+        report["step"] = "widget_open_verify_frame"
         require(wait_for_widget_window(page, widget, opened.value, config["reference_deployment_id"], report=report, audit=window_open)
                 and url_origin(opened.value.url) == reference, "widget_opens_same_fixed_deployment_window")
         wait_for_observers(page, observed, bodies)
