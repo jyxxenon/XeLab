@@ -201,7 +201,14 @@ class ObjectRpc(unittest.TestCase):
         port = self.server.add_secure_port("127.0.0.1:0", self.plugin_tls.listener())
         self.assertNotEqual(port, 0)
         self.server.start()
-        self.address = f"127.0.0.1:{port}"
+        self.connect_plugin(f"127.0.0.1:{port}")
+
+    def connect_plugin(self, address):
+        self.address = address
+        self.contract_refs = {
+            entry["contract"]["name"]: entry["contract"]
+            for entry in json.loads(self.manifest_path.read_bytes())["capabilities"]
+        }
         self.channel = self.client_channel(self.kernel_tls)
         self.lifecycle = lifecycle.PluginLifecycleStub(self.channel)
         self.capability = capability.CapabilityServiceStub(self.channel)
@@ -244,7 +251,7 @@ class ObjectRpc(unittest.TestCase):
         raw = canonical_json(body)
         return cap.InvokeRequest(
             context=self.context(subject or self.owner, key, actions, milliseconds),
-            call_id=identifier(), contract=common.ContractRef(**self.service.contracts[name]["contract"]),
+            call_id=identifier(), contract=common.ContractRef(**self.contract_refs[name]),
             input_json=raw, input_digest=digest(raw),
         )
 
