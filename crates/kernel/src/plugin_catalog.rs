@@ -1,4 +1,4 @@
-//! Public plugin catalog reads. Each page uses the existing current policy and
+//! Public catalog reads. Each page uses the existing current policy and
 //! actual object owner. Cursors convey position only, and encrypt positions so
 //! they cannot disclose identifiers belonging to invisible objects.
 use crate::{
@@ -37,6 +37,7 @@ fn collection(name: &str) -> Result<Collection> {
         "listInstallations" => ("installations", "Installation", "plugin.read", "plugin", "SELECT t.id,t.created_at,t.plugin_id AS resource_id,NULL::uuid AS owner_id,t.plugin_id,NULL::uuid AS deployment_id FROM installations t"),
         "listDeployments" => ("deployments", "Deployment", "plugin.read", "deployment", "SELECT t.id,t.created_at,t.id::text AS resource_id,t.owner_id,NULL::text AS plugin_id,t.id AS deployment_id FROM deployments t WHERE t.archived_at IS NULL"),
         "listInstances" => ("instances", "Instance", "plugin.read", "instance", "SELECT t.id,t.created_at,t.id::text AS resource_id,d.owner_id,NULL::text AS plugin_id,t.deployment_id FROM instances t JOIN deployments d ON d.id=t.deployment_id WHERE d.archived_at IS NULL"),
+        "listWorkflows" => ("workflows", "Workflow", "workflow.read", "workflow", "SELECT t.id,t.created_at,t.id::text AS resource_id,t.owner_id,NULL::text AS plugin_id,NULL::uuid AS deployment_id FROM workflows t"),
         _ => return Err(Error::invalid("Unknown plugin catalog operation")),
     };
     Ok(Collection {

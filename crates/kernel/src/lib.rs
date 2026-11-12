@@ -46,6 +46,7 @@ pub mod ui;
 pub mod upgrades;
 pub mod volumes;
 pub mod webui;
+mod workflows;
 
 #[allow(clippy::result_large_err)] // Generated Tonic service signatures use tonic::Status.
 pub mod rpc {
