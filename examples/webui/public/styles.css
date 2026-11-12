@@ -153,6 +153,11 @@ button:active{transform:translateY(1px)}
 .dock button:hover{background:color-mix(in srgb,var(--text) 7%,transparent);transform:translateY(-2px);filter:none}
 .dock button:active{transform:translateY(0) scale(.97)}
 .dock button[data-active=true]{background:color-mix(in srgb,var(--accent) 9%,transparent)}
+.dock .app-icon svg{
+  width:18px;
+  height:18px;
+  display:block;
+}
 .dock .app-icon{
   width:34px;
   height:34px;
@@ -315,6 +320,11 @@ dialog>header h2{font-size:18px;letter-spacing:-.25px}
   transform:translateY(-1px);
   filter:none;
 }
+.app-grid .app-icon svg{
+  width:22px;
+  height:22px;
+  display:block;
+}
 .app-grid .app-icon{
   width:42px;
   height:42px;
@@ -348,6 +358,36 @@ dialog[open]{animation:shell-dialog-in .18s var(--ease-shell)}
 .reduced-transparency .window-title{background:var(--desktop)}
 .reduced-transparency dialog::backdrop{background:#0006;backdrop-filter:none}
 
+.dock-pin button:first-child{
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  gap:5px;
+}
+.dock-pin button:first-child svg{
+  width:13px;
+  height:13px;
+  flex:none;
+}
+.dock button.dock-restore{
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  gap:5px;
+  width:auto;
+  min-width:60px;
+  padding:0 10px;
+  border-radius:12px;
+  background:color-mix(in srgb,var(--accent) 9%,transparent);
+  font-size:10px;
+}
+.dock button.dock-restore svg{
+  width:13px;
+  height:13px;
+  flex:none;
+}
+.dock button.dock-restore:hover{background:color-mix(in srgb,var(--accent) 16%,transparent)}
+
 @media(max-width:650px){
   :root{--menubar-h:44px}
   .menubar{gap:6px;padding:0 8px}
@@ -355,6 +395,8 @@ dialog[open]{animation:shell-dialog-in .18s var(--ease-shell)}
   .dock{gap:2px;padding:6px;border-radius:16px}
   .dock button{width:48px;height:54px;border-radius:10px}
   .dock .app-icon{width:30px;height:30px;border-radius:9px;font-size:15px}
+  .dock .app-icon svg{width:16px;height:16px}
+  .app-grid .app-icon svg{width:19px;height:19px}
   .dock[data-position=left],.dock[data-position=right]{top:auto;right:auto;bottom:8px;left:50%;flex-direction:row;transform:translateX(-50%)}
   .window{border-radius:12px}
   .window-title{height:42px;gap:8px;padding:0 8px}

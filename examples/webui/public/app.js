@@ -16,6 +16,34 @@ const node = (tag, props = {}, ...children) => {
   return result;
 };
 const button = (text, action, props = {}) => node('button', {type: 'button', onclick: action, ...props}, text);
+
+// One stroke-based 24x24 icon set shared by the Dock, launcher and pinned
+// entries. Icons are built as SVG DOM nodes (no innerHTML) so the strict
+// script-src 'self' CSP keeps protecting the shell.
+const SVG_NS = 'http://www.w3.org/2000/svg';
+const ICONS = {
+  plugins: [{tag:'rect',x:4,y:4,width:7,height:7,rx:1.6},{tag:'rect',x:13,y:4,width:7,height:7,rx:1.6},{tag:'rect',x:4,y:13,width:7,height:7,rx:1.6},{tag:'rect',x:13,y:13,width:7,height:7,rx:1.6}],
+  skills: [{tag:'path',d:'M13 3 6 13h5l-1 8 8-11h-5l0-7Z'}],
+  accounts: [{tag:'circle',cx:12,cy:8.4,r:3.2},{tag:'path',d:'M5.2 20c.6-3.4 3.4-5.4 6.8-5.4s6.2 2 6.8 5.4'}],
+  resources: [{tag:'path',d:'M12 3.4 20 7.8 12 12.2 4 7.8 12 3.4Z'},{tag:'path',d:'M4 12l8 4.4 8-4.4'},{tag:'path',d:'M4 16.2l8 4.4 8-4.4'}],
+  clients: [{tag:'rect',x:3.5,y:5,width:17,height:10.5,rx:1.8},{tag:'path',d:'M9 19.5h6M12 15.5v4'}],
+  contributions: [{tag:'rect',x:3.5,y:4.5,width:17,height:15,rx:1.8},{tag:'path',d:'M9.5 4.5v15'}],
+  tasks: [{tag:'path',d:'M4 7h9M4 12h9M4 17h5.5'},{tag:'path',d:'M17.4 16.4l1.7 1.7 3-3.6'}],
+  settings: [{tag:'path',d:'M4 7h4M12 7h8'},{tag:'circle',cx:10,cy:7,r:2},{tag:'path',d:'M4 12h9M17 12h3'},{tag:'circle',cx:15,cy:12,r:2},{tag:'path',d:'M4 17h2M10 17h10'},{tag:'circle',cx:8,cy:17,r:2}],
+  restore: [{tag:'path',d:'M12 19V6M6.6 11.4 12 6l5.4 5.4'}],
+  launcher: [{tag:'path',d:'M6 6h.01M12 6h.01M18 6h.01M6 12h.01M12 12h.01M18 12h.01M6 18h.01M12 18h.01M18 18h.01'}],
+};
+function icon(name) {
+  const svg = document.createElementNS(SVG_NS, 'svg');
+  for (const [key, value] of Object.entries({viewBox:'0 0 24 24', fill:'none', stroke:'currentColor', 'stroke-width':'1.7', 'stroke-linecap':'round', 'stroke-linejoin':'round', 'aria-hidden':'true', focusable:'false', class:'app-glyph'})) svg.setAttribute(key, value);
+  for (const shape of ICONS[name] || ICONS.plugins) {
+    const element = document.createElementNS(SVG_NS, shape.tag);
+    for (const [key, value] of Object.entries(shape)) if (key !== 'tag') element.setAttribute(key, value);
+    svg.append(element);
+  }
+  return svg;
+}
+const appIcon = name => node('span', {class:'app-icon', 'aria-hidden':'true'}, icon(name));
 const windows = new Map();
 const widgetViews = new Map();
 const widgetIntents = new Map();
@@ -669,41 +697,49 @@ async function tasks(win) {
   win.content.replaceChildren(toolbar(win,'任务与能力'),node('p',{},'查询核心已经接受的 Operation；结果以其持久终态为准。'),node('div',{class:'inline-field'},input,button('查询 Operation',async()=>{result.replaceChildren(state('loading','查询中…'));try{const response=await request('getOperation',{params:{operation_id:input.value.trim()},signal:win.controller.signal});result.replaceChildren(raw(response.data));}catch(error){result.replaceChildren(failure(error));}})),result,state('unavailable','Batch / Workflow / 微插件 / 知识库尚不可用','未安装或实现的后续执行系统没有可展示的运行结果。'));
 }
 const apps = [
-  {id:'plugins',title:'插件中心',icon:'◈',render:plugins},
-  {id:'skills',title:'Skill',icon:'S',render:skills},
-  {id:'accounts',title:'账户与权限',icon:'◎',render:accounts},
-  {id:'resources',title:'系统状态',icon:'▥',render:resources},
-  {id:'clients',title:'UI 客户端',icon:'⌘',render:clients},
-  {id:'contributions',title:'插件页面',icon:'▧',render:contributions},
-  {id:'tasks',title:'任务与知识库',icon:'≡',render:tasks},
-  {id:'settings',title:'设置',icon:'⚙',render:settings},
+  {id:'plugins',title:'插件中心',icon:'plugins',render:plugins},
+  {id:'skills',title:'Skill',icon:'skills',render:skills},
+  {id:'accounts',title:'账户与权限',icon:'accounts',render:accounts},
+  {id:'resources',title:'系统状态',icon:'resources',render:resources},
+  {id:'clients',title:'UI 客户端',icon:'clients',render:clients},
+  {id:'contributions',title:'插件页面',icon:'contributions',render:contributions},
+  {id:'tasks',title:'任务与知识库',icon:'tasks',render:tasks},
+  {id:'settings',title:'设置',icon:'settings',render:settings},
 ];
 function renderDock() {
   const dock=$('#dock');dock.replaceChildren();
   for (const app of apps.filter(value=>!['clients','contributions','tasks'].includes(value.id))) {
     const active=[...windows.values()].filter(win=>win.app.id===app.id);
     dock.append(button('',()=> { const minimized=active.find(win=>win.minimized||win.element.hidden);if(minimized)focus(minimized);else openWindow(app); },{'aria-label':`打开${app.title}`,'data-app-id':app.id,'data-active':String(active.length>0)}));
-    dock.lastChild.append(node('span',{class:'app-icon','aria-hidden':true},app.icon),node('span',{},app.title));
+    dock.lastChild.append(appIcon(app.icon),node('span',{},app.title));
   }
   for(const key of preview.dock.pinned){
     const entry=dockPinned.get(pinId(key)),fixed=entry?.fixed,title=fixed?.spec.title||key.contribution_id;
     const group=node('div',{class:'dock-pin'});
     const active=[...windows.values()].some(win=>win.app.id===`plugin:${key.deployment_id}:${key.contribution_id}`);
-    group.append(button(`▧ ${title}`,async()=>{
+    const pinned=button('',async()=>{
       try{await openContribution(fixed);}catch(error){dockPinned.set(pinId(key),{fixed,error});renderDock();toast(error.message);}
-    },{'aria-label':`打开固定贡献 ${title}`,disabled:!fixed||Boolean(entry.error),'data-active':String(active),title:entry?.error?'贡献不可用；取消固定后重新发现。':`固定部署 ${key.deployment_id}`}));
+    },{'aria-label':`打开固定贡献 ${title}`,disabled:!fixed||Boolean(entry.error),'data-active':String(active),title:entry?.error?'贡献不可用；取消固定后重新发现。':`固定部署 ${key.deployment_id}`});
+    pinned.append(icon('contributions'),node('span',{},title));
+    group.append(pinned);
     group.append(button('×',async()=>{try{await togglePin({deployment_id:key.deployment_id,spec:{id:key.contribution_id,title}});}catch(error){toast(error.message);}},{'aria-label':`取消固定 ${title}`,class:'dock-unpin'}));
     dock.append(group);
   }
-  for (const win of windows.values()) if(win.minimized) dock.append(button(`↥ ${win.app.title}`,()=>focus(win),{'aria-label':`恢复${win.app.title}`}));
-  dock.append(button('应用',openLauncher,{'aria-label':'打开应用启动器'}));
+  for (const win of windows.values()) if(win.minimized) {
+    const restore=button('',()=>focus(win),{'aria-label':`恢复${win.app.title}`,class:'dock-restore'});
+    restore.append(icon('restore'),node('span',{},win.app.title));
+    dock.append(restore);
+  }
+  const launcher=button('',openLauncher,{'aria-label':'打开应用启动器'});
+  launcher.append(appIcon('launcher'),node('span',{},'应用'));
+  dock.append(launcher);
 }
 function renderLauncher() {
   const search=$('#app-search').value.trim().toLowerCase();
   $('#app-grid').replaceChildren(...apps.filter(app=>app.title.toLowerCase().includes(search)||app.id.includes(search)).map(app=>button('',()=>{$('#launcher').close();openWindow(app);},{'aria-label':`启动${app.title}`})));
   for (const [index,entry] of [...$('#app-grid').children].entries()) {
     const matching=apps.filter(app=>app.title.toLowerCase().includes(search)||app.id.includes(search))[index];
-    entry.append(node('span',{class:'app-icon','aria-hidden':true},matching.icon),node('span',{},matching.title));
+    entry.append(appIcon(matching.icon),node('span',{},matching.title));
   }
   for(const[ index,win]of[...windows.values()].entries())if(win.app.title.toLowerCase().includes(search))$('#app-grid').append(button(`↥ ${win.app.title}`,()=>{$('#launcher').close();focus(win);},{'aria-label':`聚焦窗口${index+1} ${win.app.title}`}));
   if(!oauth.loggedIn)return;
