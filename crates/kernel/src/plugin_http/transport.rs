@@ -11,6 +11,7 @@ use std::{
     sync::Arc,
 };
 use uuid::Uuid;
+use xelab_plugin_sdk::transport::pinned_server_verifier;
 
 pub struct InstanceHttp {
     client: reqwest::Client,
@@ -19,55 +20,6 @@ pub struct InstanceHttp {
     address: SocketAddr,
     server_name: String,
     maximum_json_bytes: usize,
-}
-
-#[derive(Debug)]
-struct InstanceVerifier {
-    inner: Arc<rustls::client::WebPkiServerVerifier>,
-    expected_uri: String,
-}
-impl rustls::client::danger::ServerCertVerifier for InstanceVerifier {
-    fn verify_server_cert(
-        &self,
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        name: &rustls::pki_types::ServerName<'_>,
-        ocsp: &[u8],
-        now: rustls::pki_types::UnixTime,
-    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        let verified = self
-            .inner
-            .verify_server_cert(cert, intermediates, name, ocsp, now)?;
-        let identity = x509_parser::parse_x509_certificate(cert.as_ref()).ok()
-            .is_some_and(|(_,cert)| cert.subject_alternative_name().ok().flatten()
-                .is_some_and(|san| san.value.general_names.iter().any(|name|
-                    matches!(name,x509_parser::extensions::GeneralName::URI(uri) if *uri == self.expected_uri))));
-        if !identity {
-            return Err(rustls::Error::InvalidCertificate(
-                rustls::CertificateError::ApplicationVerificationFailure,
-            ));
-        }
-        Ok(verified)
-    }
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        signed: &rustls::DigitallySignedStruct,
-    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        self.inner.verify_tls12_signature(message, cert, signed)
-    }
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        signed: &rustls::DigitallySignedStruct,
-    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        self.inner.verify_tls13_signature(message, cert, signed)
-    }
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.inner.supported_verify_schemes()
-    }
 }
 
 pub struct Response {
@@ -239,11 +191,11 @@ impl InstanceHttp {
                 .add(cert.map_err(|_| Error::invalid("Invalid workload CA"))?)
                 .map_err(|_| Error::invalid("Invalid workload CA"))?;
         }
-        let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+        let verifier = pinned_server_verifier(
             Arc::new(roots),
             provider.clone(),
+            format!("spiffe://xelab.local/instance/{instance}/generation/{generation}"),
         )
-        .build()
         .map_err(|_| Error::invalid("Invalid workload CA"))?;
         let certificates = rustls_pemfile::certs(&mut Cursor::new(identity))
             .collect::<std::result::Result<Vec<_>, _>>()
@@ -255,12 +207,7 @@ impl InstanceHttp {
             .with_safe_default_protocol_versions()
             .map_err(|_| Error::unavailable("Cannot configure workload HTTP TLS"))?
             .dangerous()
-            .with_custom_certificate_verifier(Arc::new(InstanceVerifier {
-                inner: verifier,
-                expected_uri: format!(
-                    "spiffe://xelab.local/instance/{instance}/generation/{generation}"
-                ),
-            }))
+            .with_custom_certificate_verifier(verifier)
             .with_client_auth_cert(certificates, private_key)
             .map_err(|_| Error::invalid("Invalid kernel HTTP identity"))?;
         let tls = Arc::new(tls);

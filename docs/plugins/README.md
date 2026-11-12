@@ -15,6 +15,7 @@
 - [版本、能力契约与扩展](versioning.md)
 - [WebUI 插件与可信登录边界](webui.md)
 - [插件启动环境与传输绑定](bootstrap.md)
+- [Rust SDK 与 mTLS 接入](rust-sdk.md)
 
 - [插件可选iframe窗口与桌面组件](ui-contributions.md)
 

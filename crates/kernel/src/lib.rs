@@ -49,10 +49,7 @@ pub mod volumes;
 pub mod webui;
 mod workflows;
 
-#[allow(clippy::result_large_err)] // Generated Tonic service signatures use tonic::Status.
-pub mod rpc {
-    tonic::include_proto!("xelab.v1");
-}
+pub use xelab_plugin_sdk::rpc;
 
 pub const SPEC_VERSION: &str = "2.8.0";
 
