@@ -278,7 +278,14 @@ function openWindow(app, options = {}) {
   const content = node('div', {class:'window-content'});
   const element = node('section', {class:'window', role:'dialog', 'aria-labelledby':`title-${id}`, 'data-view-id':id, 'data-app':app.id}, titlebar, content);
   const win = {id, app, content, element, rect:options.rect || {x:40+windows.size*24,y:24+windows.size*20,width:680,height:520}, minimized:false,maximized:Boolean(options.maximized),ephemeral:Boolean(options.ephemeral),restoreRef:options.restoreRef,controller:null};
-  const minimize = () => { win.minimized = true; element.hidden = true; win.bridge?.setVisible(false);renderDock(); saveLayout(); };
+  const minimize = () => {
+    // Hand focus to the Dock button instead of leaving it on a now-hidden control.
+    const hadFocus = element.contains(document.activeElement);
+    win.minimized = true; element.hidden = true; win.bridge?.setVisible(false);
+    renderDock();
+    if (hadFocus) $('#dock').querySelector(`[data-app-id="${app.id}"]`)?.focus();
+    saveLayout();
+  };
   const maximize = () => { win.maximized = !win.maximized; fit(win); saveLayout(); };
   titlebar.append(node('div', {class:'window-controls'}, button('×',()=>closeWindow(win),{'aria-label':`关闭${app.title}`}),button('−',minimize,{'aria-label':`最小化${app.title}`}),button('□',maximize,{'aria-label':`最大化或恢复${app.title}`})),heading);
   titlebar.addEventListener('dblclick', event => { if (!event.target.closest('button')) maximize(); });
@@ -915,7 +922,7 @@ function renderDock() {
   const dock=$('#dock');dock.replaceChildren();
   for (const app of apps.filter(value=>!['clients','contributions','tasks'].includes(value.id))) {
     const active=[...windows.values()].filter(win=>win.app.id===app.id);
-    dock.append(button('',()=> { const minimized=active.find(win=>win.minimized||win.element.hidden);if(minimized)focus(minimized);else openWindow(app); },{'aria-label':`打开${app.title}`,'data-app-id':app.id,'data-active':String(active.length>0)}));
+    dock.append(button('',()=> { const minimized=active.find(win=>win.minimized||win.element.hidden);if(minimized){focus(minimized);minimized.element.querySelector('.window-title')?.focus();}else openWindow(app); },{'aria-label':`打开${app.title}`,'data-app-id':app.id,'data-active':String(active.length>0)}));
     dock.lastChild.append(appIcon(app.icon),node('span',{},app.title));
   }
   for(const key of preview.dock.pinned){
@@ -931,7 +938,7 @@ function renderDock() {
     dock.append(group);
   }
   for (const win of windows.values()) if(win.minimized) {
-    const restore=button('',()=>focus(win),{'aria-label':`恢复${win.app.title}`,class:'dock-restore'});
+    const restore=button('',()=>{focus(win);win.element.querySelector('.window-title')?.focus();},{'aria-label':`恢复${win.app.title}`,class:'dock-restore'});
     restore.append(icon('restore'),node('span',{},win.app.title));
     dock.append(restore);
   }
