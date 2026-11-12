@@ -80,6 +80,7 @@ enum Decision<'tx, 'db> {
     Replay(Value),
     Rejected(Error),
     Retry,
+    Enqueue,
     Wait,
     Ready(Box<Candidate<'tx, 'db>>),
 }
@@ -106,8 +107,8 @@ impl Request<'_> {
             },
         );
         let mut waiting: Option<WaitingCall> = None;
-        let mut inspect_queue =
-            self.skill_id.is_some() && self.stream.is_none() && !self.token.starts_with("host:");
+        let mut inspect_queue = self.can_enqueue_without_ledger();
+        let mut enqueue = false;
         loop {
             let background = if let Some(waiter) = waiting.as_ref() {
                 waiter.ticket.background_permit().await?
@@ -129,11 +130,12 @@ impl Request<'_> {
             let mut c = timeout_at(until, self.app.db.connect_scoped(until - now))
                 .await
                 .map_err(|_| expired())??;
-            let preview = std::mem::take(&mut inspect_queue)
-                && timeout_at(until, self.queue_busy(&*c))
-                    .await
-                    .map_err(|_| expired())?
-                    .unwrap_or(false);
+            let preview = std::mem::take(&mut enqueue)
+                || std::mem::take(&mut inspect_queue)
+                    && timeout_at(until, self.queue_busy(&*c))
+                        .await
+                        .map_err(|_| expired())?
+                        .unwrap_or(false);
             let tx = timeout_at(until, c.transaction())
                 .await
                 .map_err(|_| expired())??;
@@ -149,7 +151,8 @@ impl Request<'_> {
                     tx.commit().await?;
                     return Err(error);
                 }
-                Decision::Retry => {
+                Decision::Retry | Decision::Enqueue => {
+                    enqueue = matches!(decision, Decision::Enqueue);
                     tx.rollback().await?;
                     continue;
                 }
@@ -182,6 +185,10 @@ impl Request<'_> {
             tx.commit().await?;
             return Ok(Admission::Dispatch(Box::new(call)));
         }
+    }
+
+    fn can_enqueue_without_ledger(&self) -> bool {
+        self.skill_id.is_some() && self.stream.is_none() && !self.token.starts_with("host:")
     }
 
     /// This lookup only chooses the read-only waiting path. All selections and
@@ -633,6 +640,11 @@ impl Request<'_> {
                     limit > 0 && self.stream.is_none() && broker_queue::supports_manifest(&manifest)
                 })
                 .ok_or_else(Error::exhausted)?;
+            if waiting.is_none() && !preview && self.can_enqueue_without_ledger() {
+                // The provider became busy after the optimistic lookup. Let
+                // Call finalizers through before expanding the queued proof.
+                return Ok(Decision::Enqueue);
+            }
             if has_proxy {
                 let inputs = host_blobs::authorize_skill_blob_inputs(
                     tx,
