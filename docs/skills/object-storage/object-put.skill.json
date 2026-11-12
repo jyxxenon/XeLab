@@ -187,7 +187,7 @@
     "contract": {
       "name": "data.object.put",
       "version": "1.0.0",
-      "schema_digest": "sha256:1d6e52730bee82172976ba1f7e03929d5c1a9e36ca10c3bd4db0bc182ae152cc"
+      "schema_digest": "sha256:9d27347d98dd9589bcddb05c1b8a1f4aabd0fe3c7ab182ec55c0ab39e19e9931"
     }
   },
   "mapping": "identity",

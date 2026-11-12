@@ -60,7 +60,7 @@
     "contract": {
       "name": "data.object.delete",
       "version": "1.0.0",
-      "schema_digest": "sha256:9d7c1ffe820bf90d5221b961a56c3691cb16e4bb946d189a346d5e3eaf3f5466"
+      "schema_digest": "sha256:b4cb921fec6a9572a23570e6179d1bb3f63c74cc9d45498ccb57546a057f8471"
     }
   },
   "mapping": "identity",

@@ -90,7 +90,7 @@
     "contract": {
       "name": "data.object.export",
       "version": "1.0.0",
-      "schema_digest": "sha256:f1cf0208bbcb7eff045e1307d3d340f14f5dd908bcd99698e2b58dc352d9b57d"
+      "schema_digest": "sha256:973bd38ab2d05dc99640032e72d9c028af0f7400dd7b3c172f495334ad3a410c"
     }
   },
   "mapping": "identity",

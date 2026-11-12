@@ -148,7 +148,7 @@
     "contract": {
       "name": "data.object.list",
       "version": "1.0.0",
-      "schema_digest": "sha256:2dd1db5e881f8482d91489566c89145c65e689bcc658314443f3bcb9b6b79e19"
+      "schema_digest": "sha256:569600611e989d0c08f0cfc9c9d4a3defda875a8af8d04cb28bdef780f351b82"
     }
   },
   "mapping": "identity",

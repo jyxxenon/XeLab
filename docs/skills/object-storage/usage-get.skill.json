@@ -70,7 +70,7 @@
     "contract": {
       "name": "data.object.usage.get",
       "version": "1.0.0",
-      "schema_digest": "sha256:6343e9c3b79aa482131a4c2ed5a11b6f0b5a4acc6707b0607e3fee68cafaadd3"
+      "schema_digest": "sha256:06edd6ab369c29f57d164af5d0d8b84a7b55358c081937b79a07bec93b1baca7"
     }
   },
   "mapping": "identity",

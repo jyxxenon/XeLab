@@ -717,9 +717,11 @@ class Store:
                 conn.execute("DELETE FROM os_read_pins WHERE id=?", (pin,))
                 self._check_budget(conn)
             return result
-        except BaseException:
+        except BaseException as error:
             with suppress(OSError, sqlite3.Error, StoreError):
                 self._unwind_export(call, pin, dispatched)
+            if dispatched and isinstance(error, Exception):
+                raise StoreError("OUTCOME_UNKNOWN", "Export outcome requires verification") from None
             raise
 
     def collect_garbage(self):
