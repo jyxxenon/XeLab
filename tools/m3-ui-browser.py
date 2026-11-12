@@ -21,6 +21,7 @@ import sys
 import time
 import urllib.parse
 import uuid
+import weakref
 
 
 class CheckFailed(Exception):
@@ -76,20 +77,29 @@ def record_observer_failure(observed, phase, error):
     buckets[key] = min(buckets.get(key, 0) + 1, 65535)
 
 
-def selected_failure_category(value):
+def selected_failure_category(value, extra_codes=()):
     # Compare only exact fixed browser codes; never retain the original value.
     codes = ("net::ERR_ABORTED", "net::ERR_TIMED_OUT", "net::ERR_CONNECTION_RESET", "net::ERR_CONNECTION_CLOSED", "net::ERR_HTTP2_PROTOCOL_ERROR", "net::ERR_FAILED")
-    return value if isinstance(value, str) and value in codes else "OTHER"
+    if isinstance(value, str):
+        for code in codes + extra_codes:
+            if value == code:
+                return code
+    return "OTHER"
 
 
 class LoginBootstrapAudit:
-    """Bounded filename/status and boolean diagnostics; never a ready gate."""
+    """Bounded document, asset and DOM diagnostics for the login bootstrap."""
     files = ("app.js", "runtime-config.js", "api.js", "oauth.js", "bridge.js", "styles.css")
     stages = ("root_navigation", "welcome_login_click", "account_wait", "account_fill", "password_fill", "login_submit_click", "consent_wait", "consent_submit_click", "callback_wait", "session_wait", "connection_wait", "core_cookie_check", "plugin_cookie_check")
+    root_request_limit = 8
+    navigation_failure_codes = ("net::ERR_CONNECTION_REFUSED", "net::ERR_NAME_NOT_RESOLVED", "net::ERR_TOO_MANY_REDIRECTS",
+                                "net::ERR_CERT_AUTHORITY_INVALID", "net::ERR_CERT_COMMON_NAME_INVALID", "net::ERR_CERT_DATE_INVALID",
+                                "net::ERR_SSL_PROTOCOL_ERROR", "net::ERR_EMPTY_RESPONSE")
 
     def __init__(self, core, ui, reference, report):
         self.origins = {core: "core", ui: "ui", reference: "reference"}
-        self.ui, self.report, self.requests = ui, report, {}
+        self.core, self.ui, self.report = core, ui, report
+        self.requests, self.root_started, self.root_requests = {}, {}, {}
         self.records = report.setdefault("bootstrap", {})
 
     def entry(self, label):
@@ -98,11 +108,96 @@ class LoginBootstrapAudit:
         return self.records.setdefault(label, {"assets": {}, "snapshots": {}})
 
     def stage(self, label, stage):
-        if self.entry(label) is not None and stage in self.stages:
-            self.entry(label)["stage"] = stage
+        entry = self.entry(label)
+        if entry is not None and stage in self.stages:
+            if stage == "root_navigation" and label not in self.root_started:
+                self.root_started[label] = time.monotonic()
+                self.root_requests[label] = weakref.WeakKeyDictionary()
+                entry[stage] = {"document_requests": [], "dropped_requests": 0}
+            entry["stage"] = stage
             self.report["step"] = label + "_" + stage
 
+    def observe_root_document(self, event, value, label):
+        if label not in self.root_started:
+            return
+        entry = self.records[label]
+        observation = entry["root_navigation"]
+        requests = self.root_requests[label]
+        try:
+            request = value.request if event == "response" else value
+            state = requests.get(request)
+            if event == "request":
+                if state is None and entry["stage"] == "root_navigation":
+                    self.root_document_request(request, requests, observation, label)
+                return
+            if state is None:
+                return
+            if event == "response" and state["response_ms"] is None:
+                status = value.status
+                state["status"] = status if isinstance(status, int) and 100 <= status <= 599 else 0
+                state["response_ms"] = self.root_elapsed(label)
+            if event in ("finished", "failed") and state["finished_ms"] is None and state["failed_ms"] is None:
+                if event == "failed":
+                    state["failure_category"] = selected_failure_category(request.failure, self.navigation_failure_codes)
+                state[event + "_ms"] = self.root_elapsed(label)
+        except Exception:
+            observation["diagnostic_error"] = True
+
+    def root_document_request(self, request, requests, observation, label):
+        url = request.url
+        if url == self.core + "/":
+            role = "core_root"
+        elif url == self.ui + "/ui/org.xelab.webui/":
+            role = "ui_root"
+        else:
+            return
+        if request.method != "GET" or request.resource_type != "document" or not request.is_navigation_request():
+            return
+        documents = observation["document_requests"]
+        if len(documents) >= self.root_request_limit:
+            observation["dropped_requests"] = min(observation["dropped_requests"] + 1, 65535)
+            return
+        redirected_from = request.redirected_from
+        predecessor = requests.get(redirected_from) if redirected_from is not None else None
+        state = {"role": role, "redirect_from": predecessor["role"] if predecessor is not None else None,
+                 "start_ms": self.root_elapsed(label), "response_ms": None, "finished_ms": None,
+                 "failed_ms": None, "status": None, "failure_category": None}
+        requests[request] = state
+        documents.append(state)
+
+    def root_elapsed(self, label):
+        return min(max(int((time.monotonic() - self.root_started[label]) * 1000), 0), 300000)
+
     def request(self, request, label):
+        self.observe_root_document("request", request, label)
+        return self.observe_asset("request", request, label)
+
+    def response(self, response, label):
+        self.observe_root_document("response", response, label)
+        self.observe_asset("response", response, label)
+
+    def terminal(self, request, label, failed):
+        event = "failed" if failed else "finished"
+        self.observe_root_document(event, request, label)
+        self.observe_asset(event, request, label)
+
+    def observe_asset(self, event, value, label):
+        try:
+            request = value.request if event == "response" else value
+            state = self.asset_request(request, label)
+            if state is None or event == "request":
+                return state
+            if event == "response":
+                state["status"] = value.status if 100 <= value.status <= 599 else 0
+            else:
+                state[event] = True
+            self.publish(label)
+        except Exception:
+            entry = self.entry(label)
+            if entry is not None:
+                entry["asset_diagnostic_error"] = True
+
+    def asset_request(self, request, label):
         if self.entry(label) is None or url_origin(request.url) != self.ui:
             return None
         path = urllib.parse.urlsplit(request.url).path
@@ -116,18 +211,6 @@ class LoginBootstrapAudit:
         state = self.requests.setdefault((label, request), {"file": filename, "status": None, "finished": False, "failed": False})
         self.publish(label)
         return state
-
-    def response(self, response, label):
-        state = self.request(response.request, label)
-        if state is not None:
-            state["status"] = response.status if 100 <= response.status <= 599 else 0
-            self.publish(label)
-
-    def terminal(self, request, label, failed):
-        state = self.request(request, label)
-        if state is not None:
-            state["failed" if failed else "finished"] = True
-            self.publish(label)
 
     def publish(self, label):
         assets = {}
