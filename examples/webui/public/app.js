@@ -92,9 +92,12 @@ function failure(error) {
   if (status === 401) return state('denied', '登录已失效', '请重新进入内核可信登录页面。');
   if (status === 403) return state('denied', '无权限', `${code || 'PERMISSION_DENIED'} · 当前授权来源不允许此操作。`);
   if ([404, 501, 503].includes(status)) return state('unavailable', '当前不可用', `${code || 'UNAVAILABLE'} · 接口、资源或依赖尚不可用。`);
-  const isServer = status >= 500 || (error?.name === 'ApiError' && (status === 0 || status >= 500));
+  // ApiClient uses status 0 for both local validation and transport failures.
+  const transportFailure = status === 0 && error?.name === 'ApiError'
+    && (code === 'CONNECTION_FAILED' || code === 'DEADLINE_EXCEEDED');
+  const redactMessage = status >= 500 || transportFailure;
   const fallback = '连接中断；副作用结果可能未知，请保留原请求键。';
-  const message = (!isServer && typeof error?.message === 'string' && error.message) ? error.message : fallback;
+  const message = (!redactMessage && typeof error?.message === 'string' && error.message) ? error.message : fallback;
   return state('error', '请求失败', `${code || 'NETWORK_ERROR'} · ${message}`);
 }
 function raw(value) { return node('pre', {class:'result'}, JSON.stringify(value, null, 2)); }
