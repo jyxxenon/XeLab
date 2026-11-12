@@ -21,7 +21,7 @@ python3 tools/issues/triage_report.py --repo OWNER/NAME --json
 
 行为边界：
 
-- 自动分页读取 Open Issue 与每个 Issue 的评论；排除 PR；只发 GET，拒绝重定向，
+- 自动分页读取 Open Issue 与每个 Issue 的评论（`comments == 0` 的条目直接跳过评论请求）；排除 PR；只发 GET，拒绝重定向，
   任何 API 失败即整体停止（退出码 1），不输出部分结果。
 - `status` 取首个 `status:*` 标签，无则 `no-status`；两者都列入 `needs_triage` 待核对。
 - 认领候选匹配评论中的 `认领申请` / `切片认领` / `/claim` 标记，以及
@@ -30,7 +30,7 @@ python3 tools/issues/triage_report.py --repo OWNER/NAME --json
 - 账号按大小写不敏感比较；多个账号标记 `multiple_claimants`；同一账号有多条不同候选评论时，
   在每个 Issue 和顶层编号列表中新增 `repeated_claim_candidates`，提示共享 Bot 账号的并行会话等情况。
   后者也可能只是补充/历史认领，不等于存在多个执行者或当前冲突；`schema: 1` 其余字段含义不变。
-- 重复候选来自相同规范化标题或高重合关键词（`duplicates_are_definitive=false`）。
+- 重复候选来自相同规范化标题或高重合关键词（`duplicates_are_definitive=false`）；关键词提取保留带连字符/点号的复合标识符（如插件 ID 与契约名），并忽略通用模板前缀词与 `<redacted>` 占位符。
 - 标题中形似凭证的字符串替换为 `<redacted>`；控制/格式字符在报告文本中替换为空格；不读取也不打印 Token 值。
 
 示例输出（合成数据，非真实仓库状态）：[example-triage-report.txt](example-triage-report.txt)、
