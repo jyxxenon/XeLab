@@ -30,7 +30,7 @@ python3 tools/issues/triage_report.py --repo OWNER/NAME --json
 - 账号按大小写不敏感比较；多个账号标记 `multiple_claimants`；同一账号有多条不同候选评论时，
   在每个 Issue 和顶层编号列表中新增 `repeated_claim_candidates`，提示共享 Bot 账号的并行会话等情况。
   后者也可能只是补充/历史认领，不等于存在多个执行者或当前冲突；`schema: 1` 其余字段含义不变。
-- 重复候选来自相同规范化标题或高重合关键词（`duplicates_are_definitive=false`）；关键词提取保留带连字符/点号的复合标识符（如插件 ID 与契约名），并忽略通用模板前缀词与 `<redacted>` 占位符。
+- 重复候选使用完整脱敏标题比较规范化标题和关键词重合度（`duplicates_are_definitive=false`）。报告中的标题预览最多显示 120 个字符。关键词提取保留带连字符或点号的复合标识符（如插件 ID 与契约名），并忽略通用模板前缀词与 `<redacted>` 占位符。
 - 标题中形似凭证的字符串替换为 `<redacted>`；控制/格式字符在报告文本中替换为空格；不读取也不打印 Token 值。
 
 示例输出（合成数据，非真实仓库状态）：[example-triage-report.txt](example-triage-report.txt)、

@@ -252,6 +252,37 @@ class TriageTests(unittest.TestCase):
         self.assertNotIn((3, 5), [tuple(c["issues"]) for c in report["duplicate_candidates"]])
         self.assertIn("NOT definitive", render_text(report))
 
+    def test_shared_preview_does_not_make_distinct_long_titles_duplicates(self):
+        prefix = "diagnostic " * 12
+        report = build_report(FakeAPI(issues=[
+            issue(1, prefix + "OAuth consent"),
+            issue(2, prefix + "Workflow restart"),
+        ]))
+        self.assertEqual([item["title"] for item in report["issues"]], [prefix[:120]] * 2)
+        self.assertEqual(report["duplicate_candidates"], [])
+
+    def test_matching_normalizes_complete_titles_beyond_preview(self):
+        report = build_report(FakeAPI(issues=[
+            issue(1, "[" + "a" * 120 + "] Reconcile Workflow after restart"),
+            issue(2, "[" + "b" * 120 + "] Reconcile workflow after restart!"),
+        ]))
+        self.assertEqual(report["duplicate_candidates"], [
+            {"kind": "same-normalized-title", "issues": [1, 2]},
+        ])
+
+    def test_keyword_matching_beyond_preview_uses_redacted_text(self):
+        api = FakeAPI(issues=[
+            issue(1, "[" + "a" * 120 + "] broker\u202etimeout " + SECRET + " recovery"),
+            issue(2, "[" + "b" * 120 + "] broker\u202etimeout " + SECRET + " replay"),
+        ])
+        code, output, error = call_main(api, "--json")
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(json.loads(output)["duplicate_candidates"], [
+            {"kind": "shared-keywords", "issues": [1, 2], "shared": ["broker", "timeout"]},
+        ])
+        self.assertNotIn(SECRET, output)
+        self.assertNotIn("\u202e", output)
+
     def test_templated_plugin_titles_preserve_compound_identifiers(self):
         api = FakeAPI(issues=[
             issue(30, "[P1] 实现微插件 micro-json-validator（json.validate）"),
