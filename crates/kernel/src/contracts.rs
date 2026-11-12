@@ -10,6 +10,8 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
 };
 
+mod workflow_spec;
+
 pub const OPENAPI: &str = include_str!("../../../docs/contracts/openapi.json");
 
 pub fn openapi() -> &'static Value {
@@ -47,11 +49,13 @@ pub fn validate(name: &str, input: &Value) -> Result<()> {
         v
     };
     drop(cache);
-    if validator.is_valid(input) {
-        Ok(())
-    } else {
-        Err(Error::invalid("Value does not match the existing contract"))
+    if !validator.is_valid(input) {
+        return Err(Error::invalid("Value does not match the existing contract"));
     }
+    if name == "WorkflowSpec" {
+        workflow_spec::validate_graph(input)?;
+    }
+    Ok(())
 }
 
 /// Attach only the checked-in models reachable from this schema. Each cached
