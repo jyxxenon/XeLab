@@ -16,6 +16,35 @@ const node = (tag, props = {}, ...children) => {
   return result;
 };
 const button = (text, action, props = {}) => node('button', {type: 'button', onclick: action, ...props}, text);
+
+// One stroke-based 24x24 icon set shared by the Dock, launcher and pinned
+// entries. Icons are built as SVG DOM nodes (no innerHTML) so the strict
+// script-src 'self' CSP keeps protecting the shell.
+const SVG_NS = 'http://www.w3.org/2000/svg';
+const ICONS = {
+  overview: [{tag:'rect',x:3.5,y:4.5,width:17,height:15,rx:1.8},{tag:'path',d:'M3.5 9.5h17M9.5 9.5v10'}],
+  plugins: [{tag:'rect',x:4,y:4,width:7,height:7,rx:1.6},{tag:'rect',x:13,y:4,width:7,height:7,rx:1.6},{tag:'rect',x:4,y:13,width:7,height:7,rx:1.6},{tag:'rect',x:13,y:13,width:7,height:7,rx:1.6}],
+  skills: [{tag:'path',d:'M13 3 6 13h5l-1 8 8-11h-5l0-7Z'}],
+  accounts: [{tag:'circle',cx:12,cy:8.4,r:3.2},{tag:'path',d:'M5.2 20c.6-3.4 3.4-5.4 6.8-5.4s6.2 2 6.8 5.4'}],
+  resources: [{tag:'path',d:'M12 3.4 20 7.8 12 12.2 4 7.8 12 3.4Z'},{tag:'path',d:'M4 12l8 4.4 8-4.4'},{tag:'path',d:'M4 16.2l8 4.4 8-4.4'}],
+  clients: [{tag:'rect',x:3.5,y:5,width:17,height:10.5,rx:1.8},{tag:'path',d:'M9 19.5h6M12 15.5v4'}],
+  contributions: [{tag:'rect',x:3.5,y:4.5,width:17,height:15,rx:1.8},{tag:'path',d:'M9.5 4.5v15'}],
+  tasks: [{tag:'path',d:'M4 7h9M4 12h9M4 17h5.5'},{tag:'path',d:'M17.4 16.4l1.7 1.7 3-3.6'}],
+  settings: [{tag:'path',d:'M4 7h4M12 7h8'},{tag:'circle',cx:10,cy:7,r:2},{tag:'path',d:'M4 12h9M17 12h3'},{tag:'circle',cx:15,cy:12,r:2},{tag:'path',d:'M4 17h2M10 17h10'},{tag:'circle',cx:8,cy:17,r:2}],
+  restore: [{tag:'path',d:'M12 19V6M6.6 11.4 12 6l5.4 5.4'}],
+  launcher: [{tag:'path',d:'M6 6h.01M12 6h.01M18 6h.01M6 12h.01M12 12h.01M18 12h.01M6 18h.01M12 18h.01M18 18h.01'}],
+};
+function icon(name) {
+  const svg = document.createElementNS(SVG_NS, 'svg');
+  for (const [key, value] of Object.entries({viewBox:'0 0 24 24', fill:'none', stroke:'currentColor', 'stroke-width':'1.7', 'stroke-linecap':'round', 'stroke-linejoin':'round', 'aria-hidden':'true', focusable:'false', class:'app-glyph'})) svg.setAttribute(key, value);
+  for (const shape of ICONS[name] || ICONS.plugins) {
+    const element = document.createElementNS(SVG_NS, shape.tag);
+    for (const [key, value] of Object.entries(shape)) if (key !== 'tag') element.setAttribute(key, value);
+    svg.append(element);
+  }
+  return svg;
+}
+const appIcon = name => node('span', {class:'app-icon', 'aria-hidden':'true'}, icon(name));
 const windows = new Map();
 const widgetViews = new Map();
 const widgetIntents = new Map();
@@ -274,7 +303,17 @@ window.addEventListener('resize',()=> {
   }
 });
 
-function toolbar(win, title, ...actions) { return node('div',{class:'toolbar'},node('h2',{},title),...actions,button('刷新',()=>loadApp(win))); }
+// Built-in windows share one navigation row: a truncating title, a grouped
+// action set and the one refresh control for that window. Grouping the
+// actions keeps them together when they wrap and gives assistive technology
+// a named boundary; card-level .toolbar rows keep their existing layout.
+function toolbar(win, title, ...actions) {
+  return node('div',{class:'toolbar window-toolbar','data-window-toolbar':''},
+    node('h2',{class:'window-toolbar-title',title},title),
+    node('div',{class:'window-toolbar-actions',role:'group','aria-label':`${title}操作`},
+      ...actions,
+      button('刷新',()=>loadApp(win),{'aria-label':`刷新${title}`})));
+}
 async function loadApp(win) {
   win.controller?.abort();
   win.controller = new AbortController();
@@ -668,42 +707,188 @@ async function tasks(win) {
   const result=node('div');
   win.content.replaceChildren(toolbar(win,'任务与能力'),node('p',{},'查询核心已经接受的 Operation；结果以其持久终态为准。'),node('div',{class:'inline-field'},input,button('查询 Operation',async()=>{result.replaceChildren(state('loading','查询中…'));try{const response=await request('getOperation',{params:{operation_id:input.value.trim()},signal:win.controller.signal});result.replaceChildren(raw(response.data));}catch(error){result.replaceChildren(failure(error));}})),result,state('unavailable','Batch / Workflow / 微插件 / 知识库尚不可用','未安装或实现的后续执行系统没有可展示的运行结果。'));
 }
+// Read-only overview (issue #14). Each section calls exactly one existing
+// public API and renders only whitelisted non-sensitive scalars: plugin
+// config, host runtime identifiers, credentials and raw response objects
+// never reach the DOM. Sections load, fail and refresh independently; no
+// trends, global totals or automatic polling are invented.
+const overviewNodeFields = [
+  ['host_cpu_millis','宿主 CPU（毫核）'],
+  ['host_memory_bytes','宿主内存（字节）'],
+  ['plugin_cpu_pool_millis','插件 CPU 池（毫核）'],
+  ['plugin_memory_pool_bytes','插件内存池（字节）'],
+  ['reserved_cpu_millis','已预留 CPU（毫核）'],
+  ['reserved_memory_bytes','已预留内存（字节）'],
+  ['admission_enabled','准入控制'],
+  ['updated_at','核心更新时间'],
+];
+const overviewNodeConfigFields = [
+  ['profile','运行 Profile'],
+  ['kernel_cpu_millis','内核预留 CPU（毫核）'],
+  ['kernel_memory_bytes','内核预留内存（字节）'],
+  ['system_cpu_millis','系统预留 CPU（毫核）'],
+  ['system_memory_bytes','系统预留内存（字节）'],
+];
+function overviewScalars(value, fields) {
+  const entries = [];
+  for (const [key, label] of fields) {
+    const item = value?.[key];
+    if (item === null || typeof item === 'string' || typeof item === 'boolean' || Number.isSafeInteger(item)) entries.push([label, item]);
+  }
+  return entries;
+}
+function overviewText(value) {
+  if (value === null || value === undefined) return '—';
+  if (typeof value === 'boolean') return value ? '是' : '否';
+  return String(value);
+}
+function overviewFacts(entries) {
+  const list = node('dl', {class:'overview-facts'});
+  for (const [label, value] of entries) list.append(node('dt', {}, label), node('dd', {}, overviewText(value)));
+  return list;
+}
+function overviewNode(data) {
+  const entries = overviewScalars(data, overviewNodeFields);
+  const config = overviewScalars(data?.config, overviewNodeConfigFields);
+  if (!entries.length && !config.length) return state('empty', '没有可显示的节点字段', '核心返回中没有本视图白名单内的非敏感字段。');
+  return node('div', {class:'overview-node'},
+    ...(entries.length ? [overviewFacts(entries)] : []),
+    ...(config.length ? [node('h4', {}, '内核与系统预留'), overviewFacts(config)] : []));
+}
+function overviewBadge(value, fallback) { return node('span', {class:'badge'}, typeof value === 'string' && value ? value : fallback); }
+function overviewDeployment(item) {
+  const spec = item?.spec ?? {};
+  const conditions = (Array.isArray(item?.conditions) ? item.conditions : []).filter(value => typeof value === 'string');
+  return node('article', {class:'card overview-item'},
+    node('h3', {}, typeof spec.display_name === 'string' && spec.display_name ? spec.display_name : '未命名部署'),
+    node('p', {}, overviewBadge(item?.phase, 'phase 未知'), ` · ${spec.enabled === true ? '已启用' : spec.enabled === false ? '已停用' : '启停未知'}`, Number.isSafeInteger(spec.replicas) ? ` · 副本 ${spec.replicas}` : ''),
+    ...(conditions.length ? [node('p', {}, conditions.join(' · '))] : []),
+    ...(typeof item?.id === 'string' ? [node('p', {class:'code'}, `UUID ${item.id}`)] : []),
+    ...(typeof item?.updated_at === 'string' ? [node('p', {class:'muted'}, `核心更新 ${item.updated_at}`)] : []));
+}
+function overviewInstance(item) {
+  return node('article', {class:'card overview-item'},
+    node('h3', {}, '实例'),
+    node('p', {}, overviewBadge(item?.phase, 'phase 未知'), ' ', overviewBadge(item?.health, 'health 未知')),
+    ...(Number.isSafeInteger(item?.restart_count) ? [node('p', {}, `重启次数 ${item.restart_count}`)] : []),
+    ...(typeof item?.last_heartbeat_at === 'string' ? [node('p', {}, `最近心跳 ${item.last_heartbeat_at}`)] : []),
+    ...(typeof item?.deployment_id === 'string' ? [node('p', {class:'code'}, `部署 ${item.deployment_id}`)] : []),
+    ...(typeof item?.id === 'string' ? [node('p', {class:'code'}, `UUID ${item.id}`)] : []));
+}
+async function overviewPage(win, {operation, title, renderItem, emptyMessage}) {
+  const result = await request(operation, {query:{limit:50}, signal:win.controller.signal});
+  const list = node('div', {class:'list'});
+  for (const item of rows(result.data)) list.append(renderItem(item));
+  if (!list.childElementCount) list.append(state('empty', '暂无可见项目', emptyMessage));
+  const hint = node('p', {class:'overview-page-hint muted'}, result.data.next_cursor ? '仅显示当前已取到的项目；还有更多可加载。' : '');
+  const more = button('加载下一页', async () => {
+    more.disabled = true;
+    try {
+      const next = await request(operation, {query:{limit:50, cursor:more.dataset.cursor}, signal:win.controller.signal});
+      for (const item of rows(next.data)) list.append(renderItem(item));
+      more.dataset.cursor = next.data.next_cursor || '';
+      more.hidden = !next.data.next_cursor;
+      hint.textContent = next.data.next_cursor ? '仅显示当前已取到的项目；还有更多可加载。' : '已加载全部可见项目。';
+    } catch (error) {
+      list.append(failure(error));
+      hint.textContent = '下一页读取失败；已加载内容保持不变。';
+    } finally { more.disabled = false; }
+  }, {'aria-label':`加载下一页${title}`, hidden:!result.data.next_cursor});
+  more.dataset.cursor = result.data.next_cursor || '';
+  return node('div', {}, list, more, hint);
+}
+function overviewSection(win, {key, title, source, load}) {
+  const headingId = `overview-${key}-${win.id}`;
+  const readAt = node('span', {class:'overview-read-at'}, '尚未读取');
+  const body = node('div', {class:'overview-body', 'aria-live':'polite'});
+  const section = node('section', {class:'overview-section', 'data-section':key, 'aria-labelledby':headingId},
+    node('header', {class:'overview-head'},
+      node('h3', {id:headingId}, title),
+      node('span', {class:'overview-source'}, `来源 ${source}`),
+      readAt,
+      button('刷新', () => { run(); }, {'aria-label':`刷新${title}`, class:'overview-refresh'})),
+    body);
+  const refresh = section.querySelector('.overview-refresh');
+  let sequence = 0;
+  async function run() {
+    const current = ++sequence;
+    refresh.disabled = true;
+    body.replaceChildren(state('loading', '正在读取核心…'));
+    try {
+      const rendered = await load();
+      if (current !== sequence || !section.isConnected) return;
+      readAt.textContent = `读取于 ${new Intl.DateTimeFormat('zh-CN', {hour:'2-digit', minute:'2-digit', second:'2-digit'}).format(new Date())}`;
+      body.replaceChildren(rendered);
+    } catch (error) {
+      if (current !== sequence || !section.isConnected) return;
+      readAt.textContent = '读取失败';
+      body.replaceChildren(failure(error));
+    } finally {
+      if (current === sequence && section.isConnected) refresh.disabled = false;
+    }
+  }
+  return {section, run};
+}
+async function overview(win) {
+  const sections = [
+    overviewSection(win, {key:'node', title:'节点资源', source:'getNode',
+      load:async () => overviewNode((await request('getNode', {signal:win.controller.signal})).data)}),
+    overviewSection(win, {key:'deployments', title:'部署', source:'listDeployments',
+      load:() => overviewPage(win, {operation:'listDeployments', title:'部署', renderItem:overviewDeployment, emptyMessage:'当前账户授权范围内没有可见部署。'})}),
+    overviewSection(win, {key:'instances', title:'实例', source:'listInstances',
+      load:() => overviewPage(win, {operation:'listInstances', title:'实例', renderItem:overviewInstance, emptyMessage:'当前账户授权范围内没有可见实例。'})}),
+  ];
+  win.content.replaceChildren(
+    toolbar(win, '总览'),
+    node('p', {class:'muted overview-note'}, '只读总览：仅展示当前账户已取到的公开 API 数据；各区域独立刷新。无历史趋势、全局总数或实时监控。'),
+    node('div', {class:'overview-grid'}, ...sections.map(entry => entry.section)));
+  await Promise.all(sections.map(entry => entry.run()));
+}
 const apps = [
-  {id:'plugins',title:'插件中心',icon:'◈',render:plugins},
-  {id:'skills',title:'Skill',icon:'S',render:skills},
-  {id:'accounts',title:'账户与权限',icon:'◎',render:accounts},
-  {id:'resources',title:'系统状态',icon:'▥',render:resources},
-  {id:'clients',title:'UI 客户端',icon:'⌘',render:clients},
-  {id:'contributions',title:'插件页面',icon:'▧',render:contributions},
-  {id:'tasks',title:'任务与知识库',icon:'≡',render:tasks},
-  {id:'settings',title:'设置',icon:'⚙',render:settings},
+  {id:'overview',title:'总览',icon:'overview',render:overview},
+  {id:'plugins',title:'插件中心',icon:'plugins',render:plugins},
+  {id:'skills',title:'Skill',icon:'skills',render:skills},
+  {id:'accounts',title:'账户与权限',icon:'accounts',render:accounts},
+  {id:'resources',title:'系统状态',icon:'resources',render:resources},
+  {id:'clients',title:'UI 客户端',icon:'clients',render:clients},
+  {id:'contributions',title:'插件页面',icon:'contributions',render:contributions},
+  {id:'tasks',title:'任务与知识库',icon:'tasks',render:tasks},
+  {id:'settings',title:'设置',icon:'settings',render:settings},
 ];
 function renderDock() {
   const dock=$('#dock');dock.replaceChildren();
   for (const app of apps.filter(value=>!['clients','contributions','tasks'].includes(value.id))) {
     const active=[...windows.values()].filter(win=>win.app.id===app.id);
     dock.append(button('',()=> { const minimized=active.find(win=>win.minimized||win.element.hidden);if(minimized)focus(minimized);else openWindow(app); },{'aria-label':`打开${app.title}`,'data-app-id':app.id,'data-active':String(active.length>0)}));
-    dock.lastChild.append(node('span',{class:'app-icon','aria-hidden':true},app.icon),node('span',{},app.title));
+    dock.lastChild.append(appIcon(app.icon),node('span',{},app.title));
   }
   for(const key of preview.dock.pinned){
     const entry=dockPinned.get(pinId(key)),fixed=entry?.fixed,title=fixed?.spec.title||key.contribution_id;
     const group=node('div',{class:'dock-pin'});
     const active=[...windows.values()].some(win=>win.app.id===`plugin:${key.deployment_id}:${key.contribution_id}`);
-    group.append(button(`▧ ${title}`,async()=>{
+    const pinned=button('',async()=>{
       try{await openContribution(fixed);}catch(error){dockPinned.set(pinId(key),{fixed,error});renderDock();toast(error.message);}
-    },{'aria-label':`打开固定贡献 ${title}`,disabled:!fixed||Boolean(entry.error),'data-active':String(active),title:entry?.error?'贡献不可用；取消固定后重新发现。':`固定部署 ${key.deployment_id}`}));
+    },{'aria-label':`打开固定贡献 ${title}`,disabled:!fixed||Boolean(entry.error),'data-active':String(active),title:entry?.error?'贡献不可用；取消固定后重新发现。':`固定部署 ${key.deployment_id}`});
+    pinned.append(icon('contributions'),node('span',{},title));
+    group.append(pinned);
     group.append(button('×',async()=>{try{await togglePin({deployment_id:key.deployment_id,spec:{id:key.contribution_id,title}});}catch(error){toast(error.message);}},{'aria-label':`取消固定 ${title}`,class:'dock-unpin'}));
     dock.append(group);
   }
-  for (const win of windows.values()) if(win.minimized) dock.append(button(`↥ ${win.app.title}`,()=>focus(win),{'aria-label':`恢复${win.app.title}`}));
-  dock.append(button('应用',openLauncher,{'aria-label':'打开应用启动器'}));
+  for (const win of windows.values()) if(win.minimized) {
+    const restore=button('',()=>focus(win),{'aria-label':`恢复${win.app.title}`,class:'dock-restore'});
+    restore.append(icon('restore'),node('span',{},win.app.title));
+    dock.append(restore);
+  }
+  const launcher=button('',openLauncher,{'aria-label':'打开应用启动器'});
+  launcher.append(appIcon('launcher'),node('span',{},'应用'));
+  dock.append(launcher);
 }
 function renderLauncher() {
   const search=$('#app-search').value.trim().toLowerCase();
   $('#app-grid').replaceChildren(...apps.filter(app=>app.title.toLowerCase().includes(search)||app.id.includes(search)).map(app=>button('',()=>{$('#launcher').close();openWindow(app);},{'aria-label':`启动${app.title}`})));
   for (const [index,entry] of [...$('#app-grid').children].entries()) {
     const matching=apps.filter(app=>app.title.toLowerCase().includes(search)||app.id.includes(search))[index];
-    entry.append(node('span',{class:'app-icon','aria-hidden':true},matching.icon),node('span',{},matching.title));
+    entry.append(appIcon(matching.icon),node('span',{},matching.title));
   }
   for(const[ index,win]of[...windows.values()].entries())if(win.app.title.toLowerCase().includes(search))$('#app-grid').append(button(`↥ ${win.app.title}`,()=>{$('#launcher').close();focus(win);},{'aria-label':`聚焦窗口${index+1} ${win.app.title}`}));
   if(!oauth.loggedIn)return;

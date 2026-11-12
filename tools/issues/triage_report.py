@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Read-only open-issue triage: status, assignees, claim and duplicate candidates. Never writes."""
 import argparse
+from collections import Counter
 import json
 import os
 import re
@@ -11,7 +12,8 @@ from urllib.request import Request, build_opener, HTTPRedirectHandler
 
 SCHEMA = 1
 CREDENTIAL = re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|MERGE_TOKEN|AGENT_TOKEN", re.IGNORECASE)
-CLAIM_MARKERS = ("认领申请", "/claim")
+CLAIM_MARKERS = ("认领申请", "切片认领", "/claim")
+BRANCH_CLAIM = re.compile(r"将在独立分支[ \t]+`[^`\r\n]{1,200}`[ \t]+推进本[ \t]+Issue\b", re.IGNORECASE)
 STOPWORDS = {"a", "an", "and", "for", "of", "the", "to", "with", "in", "on", "is", "bug", "feature"}
 NOTE = ("Read-only report. Duplicate and claim matches are candidates for manual review, "
         "never definitive rulings; no issue state was changed.")
@@ -71,10 +73,14 @@ def keywords(title):
 
 def claim_candidates(api, number):
     claims = []
+    seen = set()
     for comment in pages(api, f"/issues/{number}/comments"):
         body = comment.get("body") or ""
-        if any(marker in body for marker in CLAIM_MARKERS):
-            claims.append({"user": comment["user"]["login"], "created_at": comment["created_at"], "url": comment["html_url"]})
+        url = comment["html_url"]
+        matched = any(marker in body for marker in CLAIM_MARKERS) or BRANCH_CLAIM.search(body)
+        if matched and url not in seen:
+            seen.add(url)
+            claims.append({"user": comment["user"]["login"], "created_at": comment["created_at"], "url": url})
     claims.sort(key=lambda c: (c["created_at"], c["user"], c["url"]))
     return claims
 
@@ -100,13 +106,15 @@ def duplicate_candidates(issues):
 
 
 def build_report(api):
-    items = list(pages(api, "/issues?state=open"))
+    # Page boundaries can overlap; retain one, last-seen record per repository issue number.
+    items = {item["number"]: item for item in pages(api, "/issues?state=open")}.values()
     prs = [item for item in items if "pull_request" in item]
     issues = []
     for item in sorted((i for i in items if "pull_request" not in i), key=lambda i: i["number"]):
         labels = sorted(label["name"] for label in item.get("labels", []))
         status = next((label for label in labels if label.startswith("status:")), "no-status")
         claims = claim_candidates(api, item["number"])
+        claim_counts = Counter(claim["user"].casefold() for claim in claims)
         issues.append({
             "number": item["number"],
             "title": safe_text(redact(item["title"]))[:120],
@@ -115,7 +123,8 @@ def build_report(api):
             "status": status,
             "assignees": sorted(a["login"] for a in item.get("assignees", [])),
             "claim_candidates": claims,
-            "multiple_claimants": len({c["user"] for c in claims}) > 1,
+            "multiple_claimants": len(claim_counts) > 1,
+            "repeated_claim_candidates": any(count > 1 for count in claim_counts.values()),
         })
     return {
         "schema": SCHEMA,
@@ -127,6 +136,7 @@ def build_report(api):
         "needs_triage": [i["number"] for i in issues if i["status"] in {"no-status", "status:needs-triage"}],
         "unassigned": [i["number"] for i in issues if not i["assignees"]],
         "multiple_claimants": [i["number"] for i in issues if i["multiple_claimants"]],
+        "repeated_claim_candidates": [i["number"] for i in issues if i["repeated_claim_candidates"]],
         "duplicate_candidates": duplicate_candidates(issues),
         "duplicates_are_definitive": False,
         "note": NOTE,
@@ -139,6 +149,7 @@ def render_text(report):
         f"needs triage (no-status or needs-triage): {report['needs_triage'] or 'none'}",
         f"unassigned: {report['unassigned'] or 'none'}",
         f"multiple claim candidates (manual review): {report['multiple_claimants'] or 'none'}",
+        f"repeated same-account claim candidates (manual review): {report.get('repeated_claim_candidates', []) or 'none'}",
     ]
     for issue in report["issues"]:
         lines.append(f"  #{issue['number']} {issue['status']} assignees={issue['assignees'] or 'none'} claims={len(issue['claim_candidates'])} {issue['title']}")

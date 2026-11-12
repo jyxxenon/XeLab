@@ -4,6 +4,6 @@
   "type": "module",
   "scripts": {
     "test": "node --test test_api.mjs",
-    "test:browser": "python3 test_http2.py && python3 test_browser.py && python3 test_shell.py && python3 test_bridge.py"
+    "test:browser": "python3 test_http2.py && python3 test_browser.py && python3 test_shell.py && python3 test_bridge.py && python3 test_shell_visual.py && python3 test_overview.py"
   }
 }
