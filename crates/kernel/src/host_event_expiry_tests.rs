@@ -114,9 +114,27 @@ async fn approver_expiry(subscription_row: bool) {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }).await.expect("subscription did not reach the storage fence");
-    let wait =
-        (expires - chrono::Utc::now()).to_std().unwrap_or_default() + Duration::from_millis(100);
-    tokio::time::sleep(wait).await;
+    // The expiry uses wall time, while Tokio sleeps on a monotonic clock.
+    // Keep the fence held until both the database and the authority clock see it expire.
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let expired_in_db: bool = c
+                .query_one("SELECT clock_timestamp() >= $1", &[&expires])
+                .await
+                .unwrap()
+                .get(0);
+            if expired_in_db && chrono::Utc::now() >= expires {
+                break;
+            }
+            assert!(
+                !pending.is_finished(),
+                "subscription ended before approval expiry"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("approval did not expire while the storage fence was held");
     held.rollback().await.unwrap();
     let next = tokio::time::timeout(Duration::from_secs(5), pending)
         .await
