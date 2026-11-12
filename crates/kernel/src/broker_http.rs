@@ -28,9 +28,24 @@ struct Input {
     deployment: Option<Uuid>,
     skill: Option<Uuid>,
     skill_input: Option<Value>,
-    browser_origin: Option<String>,
     started: tokio::time::Instant,
     deadline: tokio::time::Instant,
+}
+impl Input {
+    fn skill(started: tokio::time::Instant, deadline: tokio::time::Instant, key: String) -> Self {
+        Self {
+            method: Method::POST,
+            path: String::new(),
+            headers: HeaderMap::new(),
+            bytes: Vec::new(),
+            key,
+            deployment: None,
+            skill: None,
+            skill_input: None,
+            started,
+            deadline,
+        }
+    }
 }
 struct Provider {
     instance: Uuid,
@@ -62,24 +77,40 @@ pub(super) async fn execute_skill(
     stream: Option<&crate::skill_streams::Output>,
     browser_origin: Option<&str>,
 ) -> Result<Value> {
-    let value = Input {
-        method: Method::POST,
-        path: String::new(),
-        headers: HeaderMap::new(),
-        bytes: Vec::new(),
-        key: key.into(),
-        deployment: input
-            .get("provider_deployment_id")
-            .map(|_| id(input, "provider_deployment_id"))
-            .transpose()?,
-        skill: Some(skill),
-        skill_input: Some(input.clone()),
-        browser_origin: browser_origin.map(str::to_owned),
-        started,
-        deadline,
+    let mut value = Input::skill(started, deadline, key.into());
+    value.deployment = input
+        .get("provider_deployment_id")
+        .map(|_| id(input, "provider_deployment_id"))
+        .transpose()?;
+    value.skill = Some(skill);
+    value.skill_input = Some(input.clone());
+    let source = CallSource::Token {
+        token,
+        peer,
+        browser_origin,
     };
-    let result = execute(app, token, peer, request, value, None, stream).await?;
+    let result = execute(app, source, request, value, None, stream).await?;
     Ok(result.0)
+}
+
+pub(super) async fn execute_task(app: &App, lease: &Lease) -> Result<Value> {
+    let started = tokio::time::Instant::now();
+    let deadline = started + Duration::from_secs(300);
+    let input = Input::skill(started, deadline, lease.execution_id.to_string());
+    let (value, _) = tokio::time::timeout_at(
+        deadline,
+        execute_inner(
+            app,
+            CallSource::Task(lease),
+            lease.execution_id,
+            input,
+            None,
+            None,
+        ),
+    )
+    .await
+    .map_err(|_| expired())??;
+    Ok(value)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -118,18 +149,23 @@ pub async fn invoke(
         deployment,
         skill: None,
         skill_input: None,
-        browser_origin: crate::oauth_http::request_origin(headers)?.map(str::to_owned),
         started,
         deadline: started + Duration::from_millis(300000),
     };
+    let browser_origin = crate::oauth_http::request_origin(headers)?.map(str::to_owned);
     let actor = app.clone();
     let actor_token = token.to_owned();
     let producer = output.clone();
     tokio::spawn(async move {
+        let source = CallSource::Token {
+            token: &actor_token,
+            peer,
+            browser_origin: browser_origin.as_deref(),
+        };
         let result = tokio::select! {
             biased;
             _ = producer.abandoned_before_admission() => Err(Error::new("CANCELED","HTTP consumer disconnected before admission",StatusCode::CONFLICT)),
-            result=tokio::time::timeout_at(input.deadline,execute(&actor,&actor_token,peer,request,input,Some(&producer),None))=>result.unwrap_or_else(|_|Err(expired())),
+            result=tokio::time::timeout_at(input.deadline,execute(&actor,source,request,input,Some(&producer),None))=>result.unwrap_or_else(|_|Err(expired())),
         };
         match result {
             Ok((value, Some(response))) => producer.complete_json(value, response).await,
@@ -201,11 +237,9 @@ pub async fn invoke(
     Ok(response)
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn execute(
     app: &App,
-    token: &str,
-    peer: IpAddr,
+    source: CallSource<'_>,
     request: Uuid,
     mut input: Input,
     output: Option<&Output>,
@@ -266,17 +300,15 @@ async fn execute(
     }
     tokio::time::timeout_at(
         input.deadline,
-        execute_inner(app, token, peer, request, input, output, stream),
+        execute_inner(app, source, request, input, output, stream),
     )
     .await
     .unwrap_or_else(|_| Err(expired()))
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn execute_inner(
     app: &App,
-    token: &str,
-    peer: IpAddr,
+    source: CallSource<'_>,
     request: Uuid,
     mut input: Input,
     output: Option<&Output>,
@@ -292,12 +324,35 @@ async fn execute_inner(
         )
         .await?;
     let tx = c.transaction().await?;
-    let mut ctx = crate::host_calls::authenticate(&tx, app, token, peer, request).await?;
-    ctx.browser_origin = input.browser_origin.clone();
+    let task = match source {
+        CallSource::Task(lease) => Some(lease),
+        CallSource::Token { .. } => None,
+    };
+    let (ctx, task_deadline) = if let Some(lease) = task {
+        // Task preparation and its transaction-bound proof must share the
+        // physical Call admission transaction and its lock order.
+        db::call_lock(&tx).await?;
+        let (invocation, ctx) = task_engine::begin_broker(&tx, &app.auth, lease).await?;
+        input.skill = Some(invocation.skill_id);
+        input.deployment = Some(invocation.deployment_id);
+        input.skill_input = Some(json!({
+            "input":invocation.input,
+            "provider_deployment_id":invocation.deployment_id,
+            "idempotency_key":invocation.idempotency_key,
+        }));
+        let remaining = (invocation.deadline - chrono::Utc::now())
+            .to_std()
+            .map_err(|_| expired())?;
+        input.deadline = input.deadline.min(tokio::time::Instant::now() + remaining);
+        (ctx, Some(invocation.deadline))
+    } else {
+        (source.authenticate(&tx, app, request, None).await?, None)
+    };
     let mut authority = crate::auth::CurrentAuthority::new(&tx, &ctx).await?;
     let skill = if let Some(skill) = input.skill {
         match crate::skills::resolve_http_for_invoke(&tx, &ctx, skill, &authority).await {
             Ok(skill) => Some(skill),
+            Err(error) if task.is_some() => return Err(error),
             Err(error) => {
                 db::audit(
                     &tx,
@@ -322,29 +377,32 @@ async fn execute_inner(
         let invocation = input.skill_input.as_ref().ok_or_else(Error::denied)?;
         validate("SkillInvokeRequest", invocation)?;
         validate_business(&skill.definition["input_schema"], &invocation["input"])?;
-        let maximum = unsigned(&skill.definition["maximum_timeout_ms"])?;
-        let requested = invocation
-            .get("timeout_ms")
-            .map(unsigned)
-            .transpose()?
-            .unwrap_or(maximum.min(120000));
-        if requested > maximum {
-            return Err(Error::invalid(
-                "Requested deadline exceeds HTTP Skill maximum",
-            ));
+        if task.is_none() {
+            let maximum = unsigned(&skill.definition["maximum_timeout_ms"])?;
+            let requested = invocation
+                .get("timeout_ms")
+                .map(unsigned)
+                .transpose()?
+                .unwrap_or(maximum.min(120000));
+            if requested > maximum {
+                return Err(Error::invalid(
+                    "Requested deadline exceeds HTTP Skill maximum",
+                ));
+            }
+            input.deadline = input
+                .deadline
+                .min(input.started + Duration::from_millis(requested));
         }
-        input.deadline = input
-            .deadline
-            .min(input.started + Duration::from_millis(requested));
     }
     // Expensive current-policy preparation can run concurrently under the
     // shared auth fence. The physical ledger, provider rows and mutable budget
     // choices remain serialized in the established order below.
-    db::call_lock(&tx).await?;
-    let mut current = crate::host_calls::authenticate(&tx, app, token, peer, request).await?;
-    current.browser_origin = input.browser_origin.clone();
-    authority.verify(&tx, &current)?;
-    let target = resolve(&tx, &input, skill.as_ref()).await?;
+    if task.is_none() {
+        db::call_lock(&tx).await?;
+        let current = source.authenticate(&tx, app, request, None).await?;
+        authority.verify(&tx, &current)?;
+    }
+    let target = resolve(&tx, &input, skill.as_ref(), task.is_some()).await?;
     let op = target.operation()?;
     if let Some(skill) = &skill {
         let invocation = input.skill_input.as_ref().ok_or_else(Error::denied)?;
@@ -371,13 +429,15 @@ async fn execute_inner(
     if remaining.is_zero() {
         return Err(expired());
     }
-    let wall_deadline = crate::host_calls::bound_deadline(
-        &tx,
-        app,
-        token,
-        chrono::Utc::now() + chrono::Duration::from_std(remaining).map_err(|_| expired())?,
-    )
-    .await?;
+    let transport_deadline =
+        chrono::Utc::now() + chrono::Duration::from_std(remaining).map_err(|_| expired())?;
+    let wall_deadline = if let Some(token) = source.token() {
+        crate::host_calls::bound_deadline(&tx, app, token, transport_deadline).await?
+    } else {
+        task_deadline
+            .ok_or_else(Error::denied)?
+            .min(transport_deadline)
+    };
     input.deadline = input.deadline.min(
         tokio::time::Instant::now()
             + (wall_deadline - chrono::Utc::now())
@@ -388,15 +448,23 @@ async fn execute_inner(
         return Err(plugin_http::too_large());
     }
     let headers = op.request(&input.headers, &input.bytes)?;
-    crate::plugin_http_gateway::check_approval_prepared(
-        &tx,
-        app,
-        target.deployment,
-        &target.manifest,
-        &ctx,
-        &authority,
-    )
-    .await?;
+    if task.is_some() {
+        check_task_manifest(&target.manifest)?;
+        // Deployment approval retains its independent source proof, even
+        // when the approver and the Task issuer use the same credential.
+        crate::plugin_http_gateway::check_approval(&tx, app, target.deployment, &target.manifest)
+            .await?;
+    } else {
+        crate::plugin_http_gateway::check_approval_prepared(
+            &tx,
+            app,
+            target.deployment,
+            &target.manifest,
+            &ctx,
+            &authority,
+        )
+        .await?;
+    }
     if target.manifest["business_entry"] == "skill_required" && skill.is_none() {
         return Err(Error::denied());
     }
@@ -407,6 +475,9 @@ async fn execute_inner(
     );
     authority.bind_plugin(&tx, &ctx, &resource)?;
     if let Err(error) = authority.require(&tx, &ctx, &op.route.action, &resource) {
+        if task.is_some() {
+            return Err(error);
+        }
         db::audit(
             &tx,
             ctx.subject,
@@ -455,22 +526,24 @@ async fn execute_inner(
     let fingerprint = crate::skills::definition_digest(
         &json!({"installation":target.installation,"deployment":target.deployment,"operation":op.id,"digest":op.contract_digest,"input":body,"headers":header_fingerprint,"skill_input":input.skill_input}),
     )?;
-    let path = skill
-        .as_ref()
-        .map(|s| {
-            format!(
-                "/api/platform/v1/skills/{}/calls{}",
-                s.id,
-                if stream.is_some() { ":stream" } else { "" }
-            )
-        })
-        .unwrap_or_else(|| input.path.clone());
+    let path = if let Some(lease) = task {
+        task_call_path(lease)
+    } else if let Some(skill) = &skill {
+        format!(
+            "/api/platform/v1/skills/{}/calls{}",
+            skill.id,
+            if stream.is_some() { ":stream" } else { "" }
+        )
+    } else {
+        input.path.clone()
+    };
     let method = if skill.is_some() {
         "POST"
     } else {
         input.method.as_str()
     };
     if let Some(prior)=tx.query_opt("SELECT fingerprint,resource_id,safe_response,response_status FROM idempotency_records WHERE subject_id=$1 AND credential_id=$2 AND method=$3 AND path=$4 AND key=$5 AND expires_at>now() FOR UPDATE",&[&ctx.subject,&ctx.credential,&method,&path,&key]).await?{
+        if task.is_some(){return Err(Error::conflict("Task attempt already has a Broker record"));}
         if prior.get::<_,String>("fingerprint")!=fingerprint{return Err(Error::new("IDEMPOTENCY_CONFLICT","HTTP key was already bound to different input",StatusCode::CONFLICT));}
         let call=prior.get::<_,Option<String>>("resource_id").and_then(|s|s.parse::<Uuid>().ok()).ok_or_else(Error::denied)?;
         check_skill_authority(&tx,&ctx,call).await?;
@@ -482,7 +555,7 @@ async fn execute_inner(
         let saved:Value=prior.get::<_,Option<Value>>("safe_response").ok_or_else(||Error::conflict("Generation streams cannot be replayed; inspect Call").with_resource(call))?;
         let status=StatusCode::from_u16(prior.get::<_,Option<i32>>("response_status").ok_or_else(Error::denied)? as u16).map_err(|_|Error::denied())?;
         let mut headers=HeaderMap::new();for (name,value) in saved["headers"].as_object().ok_or_else(Error::denied)?{headers.insert(axum::http::HeaderName::from_bytes(name.as_bytes()).map_err(|_|Error::denied())?,string(&json!({"v":value}),"v")?.parse().map_err(|_|Error::denied())?);}
-        if let Some(output)=output {output.bind_origin(call,wall_deadline,input.browser_origin.as_deref());}
+        if let Some(output)=output {output.bind_origin(call,wall_deadline,ctx.browser_origin.as_deref());}
         return Ok((value,Some(plugin_http::transport::Response{status,headers,bytes:serde_json::to_vec(&saved["body"])?})));
     }
     let (accounts, charged) = reserve_business(
@@ -496,7 +569,11 @@ async fn execute_inner(
         Some(&authority),
     )
     .await?;
-    let call = crate::host_calls::new_call(&tx, app, token).await?;
+    let call = if let Some(token) = source.token() {
+        crate::host_calls::new_call(&tx, app, token).await?
+    } else {
+        Uuid::new_v4()
+    };
     tx.execute("INSERT INTO calls(id,owner_id,credential_id,provider_instance_id,contract,input_digest,idempotency_key,state,deadline_at,created_at,http_binding,skill_id,skill_definition_digest) VALUES($1,$2,$3,$4,$5,$6,$7,'running',$8,now(),$9,$10,$11)",&[&call,&ctx.subject,&ctx.credential,&target.instance,&contract,&digest(&input.bytes),&business_key,&wall_deadline,&binding,&skill.as_ref().map(|s|s.id),&skill.as_ref().map(|s|s.definition_digest.as_str())]).await?;
     for credential in charged {
         tx.execute(
@@ -506,7 +583,9 @@ async fn execute_inner(
         .await?;
     }
     tx.execute("INSERT INTO reservations(id,account_id,kind,expires_at,status,created_at) VALUES($1,$2,'call',$3,'active',now())",&[&call,&ctx.subject,&wall_deadline]).await?;
-    crate::host_calls::bind_child(&tx, app, token, call, target.instance).await?;
+    if let Some(token) = source.token() {
+        crate::host_calls::bind_child(&tx, app, token, call, target.instance).await?;
+    }
     let delegation = app
         .auth
         .issue_rpc(
@@ -534,11 +613,15 @@ async fn execute_inner(
         &authority,
     )
     .await?;
+    if let Some(lease) = task {
+        task_engine::record_broker_call(&tx, lease, call).await?;
+        crate::skill_streams::ensure_active(app)?;
+    }
     tx.execute("DELETE FROM idempotency_records WHERE subject_id=$1 AND credential_id=$2 AND method=$3 AND path=$4 AND key=$5 AND expires_at<=now()",&[&ctx.subject,&ctx.credential,&method,&path,&key]).await?;
     tx.execute("INSERT INTO idempotency_records(subject_id,credential_id,method,path,key,fingerprint,resource_id,expires_at,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,now()+interval '24 hours',now())",&[&ctx.subject,&ctx.credential,&method,&path,&key,&fingerprint,&call.to_string()]).await?;
     if let Some(output) = output {
         output.ensure_open()?;
-        output.bind_origin(call, wall_deadline, input.browser_origin.as_deref());
+        output.bind_origin(call, wall_deadline, ctx.browser_origin.as_deref());
     }
     if let Some(stream) = stream {
         stream.ensure_open()?;
@@ -555,16 +638,14 @@ async fn execute_inner(
             )?;
             stream.ensure_open()?;
         }
-        check_live_call(
+        check_live_call_for_source(
             app,
-            token,
-            peer,
+            source,
             request,
             call,
             target.instance,
             target.generation,
             wall_deadline,
-            input.browser_origin.as_deref(),
         )
         .await?;
         if let Some(output) = output {
@@ -606,8 +687,7 @@ async fn execute_inner(
             }
             let terminal = read_events(
                 app,
-                token,
-                peer,
+                source,
                 request,
                 call,
                 &target,
@@ -616,7 +696,6 @@ async fn execute_inner(
                 stream.zip(skill.as_ref()),
                 (status, safe_headers),
                 wall_deadline,
-                input.browser_origin.as_deref(),
             )
             .await?;
             let value = terminal["payload"].clone();
@@ -651,21 +730,26 @@ async fn execute_inner(
             }
             return Ok((value, None));
         }
-        let bytes = plugin_http::transport::collect(
-            response,
-            app.config.json_limit(plugin_http::MAXIMUM_RESPONSE_BYTES),
-        )
-        .await?
-        .bytes;
+        let maximum_output_bytes = app.config.json_limit(if task.is_some() {
+            task_engine::MAX_STEP_JSON_BYTES
+        } else {
+            plugin_http::MAXIMUM_RESPONSE_BYTES
+        });
+        let bytes = plugin_http::transport::collect(response, maximum_output_bytes)
+            .await?
+            .bytes;
         let safe_headers = op.response(status, &safe_headers, &bytes)?;
         let body = if bytes.is_empty() {
             Value::Null
         } else {
-            strict_json(
-                &bytes,
-                app.config.json_limit(plugin_http::MAXIMUM_RESPONSE_BYTES),
-            )?
+            strict_json(&bytes, maximum_output_bytes)?
         };
+        if task.is_some() {
+            crate::contracts::reject_jsonb_nul(&body)?;
+            if serde_json::to_vec(&body)?.len() > maximum_output_bytes {
+                return Err(plugin_http::too_large());
+            }
+        }
         if let Some(skill) = &skill {
             if !status.is_success() {
                 return Err(Error::unavailable(
@@ -695,16 +779,14 @@ async fn execute_inner(
         let authority = async {
             loop {
                 tokio::time::sleep(Duration::from_millis(100)).await;
-                if let Err(error) = check_live_call(
+                if let Err(error) = check_live_call_for_source(
                     app,
-                    token,
-                    peer,
+                    source,
                     request,
                     call,
                     target.instance,
                     target.generation,
                     wall_deadline,
-                    input.browser_origin.as_deref(),
                 )
                 .await
                 {
@@ -733,8 +815,7 @@ async fn execute_inner(
     let tx = c.transaction().await?;
     db::call_lock(&tx).await?;
     let authority = async {
-        let mut current = crate::host_calls::authenticate(&tx, app, token, peer, request).await?;
-        current.browser_origin = input.browser_origin.clone();
+        let current = source.authenticate(&tx, app, request, Some(call)).await?;
         check_skill_authority(&tx, &current, call).await?;
         check_route_approval(&tx, app, call).await
     }
@@ -777,6 +858,7 @@ async fn resolve(
     c: &(impl GenericClient + Sync),
     input: &Input,
     skill: Option<&crate::skills::ResolvedSkill>,
+    task: bool,
 ) -> Result<Provider> {
     let plugin = if let Some(skill) = skill {
         string(&skill.definition["target"], "plugin_id")?
@@ -790,7 +872,7 @@ async fn resolve(
             .ok_or_else(Error::not_found)?
     };
     let installation = skill.map(|s| s.installation_id);
-    let rows=c.query("SELECT i.id,i.generation,d.id AS deployment,d.owner_id,d.installation_id,n.manifest FROM instances i JOIN deployments d ON d.id=i.deployment_id JOIN installations n ON n.id=d.installation_id JOIN publishers p ON p.id=n.publisher_id WHERE n.plugin_id=$1 AND n.state='installed' AND p.status='trusted' AND i.phase='ready' AND i.generation=d.observed_generation AND d.phase='ready' AND i.health='alive' AND i.last_heartbeat_at>now()-interval '1 millisecond'*((n.manifest->'health'->>'interval_ms')::bigint*(n.manifest->'health'->>'failure_threshold')::bigint+(n.manifest->'health'->>'timeout_ms')::bigint) AND d.spec->>'enabled'='true' AND d.archived_at IS NULL AND d.approval ? 'rules' AND ($2::uuid IS NULL OR n.id=$2) AND ($3::uuid IS NULL OR d.id=$3) ORDER BY i.id FOR UPDATE OF i",&[&plugin,&installation,&input.deployment]).await?;
+    let rows=c.query("SELECT i.id,i.generation,d.id AS deployment,d.owner_id,d.installation_id,n.manifest FROM instances i JOIN deployments d ON d.id=i.deployment_id JOIN installations n ON n.id=d.installation_id JOIN publishers p ON p.id=n.publisher_id WHERE n.plugin_id=$1 AND n.state='installed' AND p.status='trusted' AND i.phase='ready' AND i.generation=d.observed_generation AND d.phase='ready' AND i.health='alive' AND i.last_heartbeat_at>(CASE WHEN $4 THEN clock_timestamp() ELSE now() END)-interval '1 millisecond'*((n.manifest->'health'->>'interval_ms')::bigint*(n.manifest->'health'->>'failure_threshold')::bigint+(n.manifest->'health'->>'timeout_ms')::bigint) AND d.spec->>'enabled'='true' AND d.archived_at IS NULL AND d.approval ? 'rules' AND ($2::uuid IS NULL OR n.id=$2) AND ($3::uuid IS NULL OR d.id=$3) ORDER BY i.id FOR UPDATE OF i",&[&plugin,&installation,&input.deployment,&task]).await?;
     if rows.len() > 1 {
         return Err(Error::conflict(
             "HTTP route has ambiguous approved deployment bindings",
@@ -1138,8 +1220,7 @@ fn expired() -> Error {
 #[allow(clippy::too_many_arguments)]
 async fn read_events(
     app: &App,
-    token: &str,
-    peer: IpAddr,
+    call_source: CallSource<'_>,
     request: Uuid,
     call: Uuid,
     target: &Provider,
@@ -1148,7 +1229,6 @@ async fn read_events(
     stream: Option<(&crate::skill_streams::Output, &crate::skills::ResolvedSkill)>,
     head: (StatusCode, HeaderMap),
     deadline: chrono::DateTime<chrono::Utc>,
-    browser_origin: Option<&str>,
 ) -> Result<Value> {
     let mut pending_head = Some(head);
     let mut source = response.bytes_stream();
@@ -1238,16 +1318,14 @@ async fn read_events(
             drop(fields);
             drop(frame);
             drop(bytes);
-            check_live_call(
+            check_live_call_for_source(
                 app,
-                token,
-                peer,
+                call_source,
                 request,
                 call,
                 target.instance,
                 target.generation,
                 deadline,
-                browser_origin,
             )
             .await?;
             // Do not commit SSE headers until a signed, authorized first

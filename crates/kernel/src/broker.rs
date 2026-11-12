@@ -5,6 +5,7 @@ use crate::{
     controller, db,
     error::{Error, Result},
     rpc::{self, capability_service_client::CapabilityServiceClient},
+    task_engine::{self, Lease},
     tls,
 };
 use futures_util::future::BoxFuture;
@@ -16,6 +17,136 @@ mod http;
 pub(crate) use http::check_route_approval as check_http_approval;
 pub use http::invoke as invoke_http;
 pub(crate) use http::target_resource as business_target;
+
+#[derive(Clone, Copy)]
+enum CallRequest<'a> {
+    Token {
+        token: &'a str,
+        peer: IpAddr,
+        browser_origin: Option<&'a str>,
+        input: &'a Value,
+        skill: Option<Uuid>,
+    },
+    Task(&'a Lease),
+}
+
+impl<'a> CallRequest<'a> {
+    fn source(self) -> CallSource<'a> {
+        match self {
+            Self::Token {
+                token,
+                peer,
+                browser_origin,
+                ..
+            } => CallSource::Token {
+                token,
+                peer,
+                browser_origin,
+            },
+            Self::Task(lease) => CallSource::Task(lease),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CallSource<'a> {
+    Token {
+        token: &'a str,
+        peer: IpAddr,
+        browser_origin: Option<&'a str>,
+    },
+    Task(&'a Lease),
+}
+
+impl<'a> CallSource<'a> {
+    fn token(self) -> Option<&'a str> {
+        match self {
+            Self::Token { token, .. } => Some(token),
+            Self::Task(_) => None,
+        }
+    }
+
+    async fn authenticate(
+        self,
+        tx: &tokio_postgres::Transaction<'_>,
+        app: &App,
+        request: Uuid,
+        call: Option<Uuid>,
+    ) -> Result<crate::auth::Context> {
+        match self {
+            Self::Token {
+                token,
+                peer,
+                browser_origin,
+                ..
+            } => {
+                let mut ctx =
+                    crate::host_calls::authenticate(tx, app, token, peer, request).await?;
+                ctx.browser_origin = browser_origin.map(str::to_owned);
+                Ok(ctx)
+            }
+            Self::Task(lease) => {
+                task_engine::authorize_broker_call(
+                    tx,
+                    &app.auth,
+                    lease,
+                    call.ok_or_else(Error::denied)?,
+                )
+                .await
+            }
+        }
+    }
+}
+
+pub(crate) async fn invoke_task(app: &App, lease: &Lease) -> Result<Value> {
+    crate::skill_streams::ensure_active(app)?;
+    if lease.is_http() {
+        return http::execute_task(app, lease).await;
+    }
+    let until = tokio::time::Instant::now() + Duration::from_secs(300);
+    let key = lease.execution_id.to_string();
+    tokio::time::timeout_at(
+        until,
+        invoke_inner(
+            app,
+            CallRequest::Task(lease),
+            lease.execution_id,
+            &key,
+            None,
+            chrono::Utc::now(),
+            until,
+        ),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Err(Error::new(
+            "DEADLINE_EXCEEDED",
+            "Task call deadline elapsed; inspect its attempt journal",
+            axum::http::StatusCode::GATEWAY_TIMEOUT,
+        ))
+    })
+}
+
+fn task_call_path(lease: &Lease) -> String {
+    format!("/internal/task-attempts/{}/skill", lease.attempt_id)
+}
+
+fn check_task_manifest(manifest: &Value) -> Result<()> {
+    if manifest["requested_rules"].as_array().is_some_and(|rules| {
+        rules.iter().any(|rule| {
+            rule["required"] == true
+                && crate::host_blobs::proxy_action(
+                    rule["rule"]["action"].as_str().unwrap_or(""),
+                    rule["rule"]["resource"]["kind"].as_str().unwrap_or(""),
+                )
+        })
+    }) {
+        return Err(Error::invalid(
+            "Task Skill requires HostService authority beyond its frozen targets",
+        ));
+    }
+    Ok(())
+}
 
 pub async fn invoke(
     app: &App,
@@ -186,16 +317,18 @@ fn invoke_bounded<'a>(
                 started + Duration::from_millis(effective),
                 invoke_inner(
                     app,
-                    token,
-                    peer,
+                    CallRequest::Token {
+                        token,
+                        peer,
+                        browser_origin,
+                        input,
+                        skill,
+                    },
                     request_id,
-                    input,
                     key,
-                    skill,
                     stream,
                     wall_started,
                     started + Duration::from_millis(effective),
-                    browser_origin,
                 ),
             )
             .await
@@ -219,43 +352,71 @@ fn invoke_bounded<'a>(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn invoke_inner<'a>(
     app: &'a App,
-    token: &'a str,
-    peer: IpAddr,
+    request: CallRequest<'a>,
     request_id: Uuid,
-    input: &'a Value,
     key: &'a str,
-    skill_id: Option<Uuid>,
     stream: Option<&'a crate::skill_streams::Output>,
     started: chrono::DateTime<chrono::Utc>,
     deadline_bound: tokio::time::Instant,
-    browser_origin: Option<&'a str>,
 ) -> BoxFuture<'a, Result<Value>> {
     Box::pin(async move {
-        validate(
-            if skill_id.is_some() {
-                "SkillInvokeRequest"
-            } else {
-                "InvokeRequest"
-            },
-            input,
-        )?;
-        // HTTP replay scope and the plugin's stable business key are distinct.
-        let business_key = input["idempotency_key"].as_str().unwrap_or(key);
+        if let CallRequest::Token { input, skill, .. } = request {
+            validate(
+                if skill.is_some() {
+                    "SkillInvokeRequest"
+                } else {
+                    "InvokeRequest"
+                },
+                input,
+            )?;
+        }
+        let origin = request.source();
         let mut c = app
             .db
             .connect_scoped(deadline_bound.saturating_duration_since(tokio::time::Instant::now()))
             .await?;
         let tx = c.transaction().await?;
         db::call_lock(&tx).await?;
-        let mut ctx = crate::host_calls::authenticate(&tx, app, token, peer, request_id).await?;
-        ctx.browser_origin = browser_origin.map(str::to_owned);
+        let task_input;
+        let (ctx, input, skill_id, task_deadline) = match request {
+            CallRequest::Token { input, skill, .. } => (
+                origin.authenticate(&tx, app, request_id, None).await?,
+                input,
+                skill,
+                None,
+            ),
+            CallRequest::Task(lease) => {
+                let (invocation, ctx) = task_engine::begin_broker(&tx, &app.auth, lease).await?;
+                let deadline = invocation
+                    .deadline
+                    .min(started + chrono::Duration::seconds(300));
+                let now = chrono::Utc::now();
+                if deadline <= now {
+                    return Err(Error::new(
+                        "DEADLINE_EXCEEDED",
+                        "Task deadline elapsed before Broker admission",
+                        axum::http::StatusCode::GATEWAY_TIMEOUT,
+                    ));
+                }
+                // The public request schema has a minimum timeout. The actual
+                // Task deadline still governs reservation and dispatch below.
+                task_input = json!({"input":invocation.input,"provider_deployment_id":invocation.deployment_id,
+                    "timeout_ms":(deadline - now).num_milliseconds().max(100),"idempotency_key":invocation.idempotency_key});
+                validate("SkillInvokeRequest", &task_input)?;
+                (ctx, &task_input, Some(invocation.skill_id), Some(deadline))
+            }
+        };
+        // The replay scope and the plugin's stable business key are distinct.
+        let business_key = input["idempotency_key"].as_str().unwrap_or(key);
         let skill = if let Some(id) = skill_id {
             match crate::skills::resolve_for_invoke(&tx, &ctx, id).await {
                 Ok(skill) => Some(skill),
                 Err(error) => {
+                    if matches!(origin, CallSource::Task(_)) {
+                        return Err(error);
+                    }
                     db::audit(
                         &tx,
                         ctx.subject,
@@ -309,6 +470,9 @@ fn invoke_inner<'a>(
         )
         .await;
         if let Err(e) = authorization {
+            if matches!(origin, CallSource::Task(_)) {
+                return Err(e);
+            }
             db::audit(
                 &tx,
                 ctx.subject,
@@ -347,18 +511,25 @@ fn invoke_inner<'a>(
                 "Capability does not declare a streaming item schema",
             ));
         }
-        let mut protected =
-            skill.is_some() || definition["side_effect"] != "none" || token.starts_with("host:");
+        let mut protected = skill.is_some()
+            || definition["side_effect"] != "none"
+            || origin
+                .token()
+                .is_some_and(|token| token.starts_with("host:"));
         let fingerprint = digest(&serde_json::to_vec(original)?);
-        let path = skill_id.map_or_else(
-            || "/api/platform/v1/calls".to_owned(),
-            |id| {
-                format!(
-                    "/api/platform/v1/skills/{id}/calls{}",
-                    if stream.is_some() { ":stream" } else { "" }
-                )
-            },
-        );
+        let path = if let CallSource::Task(lease) = origin {
+            task_call_path(lease)
+        } else {
+            skill_id.map_or_else(
+                || "/api/platform/v1/calls".to_owned(),
+                |id| {
+                    format!(
+                        "/api/platform/v1/skills/{id}/calls{}",
+                        if stream.is_some() { ":stream" } else { "" }
+                    )
+                },
+            )
+        };
         let lock = format!("call:{}:{}:{path}:{key}", ctx.subject, ctx.credential);
         tx.query_one(
             "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
@@ -366,6 +537,7 @@ fn invoke_inner<'a>(
         )
         .await?;
         if let Some(r)=tx.query_opt("SELECT * FROM idempotency_records WHERE subject_id=$1 AND credential_id=$2 AND method='POST' AND path=$4 AND key=$3 AND expires_at>now() FOR UPDATE",&[&ctx.subject,&ctx.credential,&key,&path]).await?{
+        if matches!(origin, CallSource::Task(_)) { return Err(Error::conflict("Task attempt already has a Broker record")); }
         if r.get::<_,String>("fingerprint")!=fingerprint{return Err(Error::new("IDEMPOTENCY_CONFLICT","The key was already used for different input",axum::http::StatusCode::CONFLICT));}
         let call_id=r.get::<_,Option<String>>("resource_id").and_then(|s|s.parse::<Uuid>().ok()).ok_or_else(||Error::conflict("Missing prior call"))?;
         if stream.is_some() { return Err(Error::conflict("Generation streams cannot be replayed; inspect the admitted Call").with_resource(call_id)); }
@@ -387,7 +559,22 @@ fn invoke_inner<'a>(
             .map(|_| id(input, "provider_deployment_id"))
             .transpose()?;
         let installation = skill.as_ref().map(|s| s.installation_id);
-        let providers=tx.query("SELECT i.id,i.generation,d.id AS deployment_id,d.owner_id,n.manifest FROM provider_records p JOIN instances i ON i.id=p.instance_id JOIN deployments d ON d.id=i.deployment_id JOIN installations n ON n.id=d.installation_id WHERE p.name=$1 AND p.version=$2 AND p.availability='ready' AND p.observed_at>now()-interval '1 millisecond'*((n.manifest->'health'->>'interval_ms')::bigint*(n.manifest->'health'->>'failure_threshold')::bigint+(n.manifest->'health'->>'timeout_ms')::bigint) AND i.phase='ready' AND d.spec->>'enabled'='true' AND d.archived_at IS NULL AND ($3::uuid IS NULL OR d.id=$3) AND ($4::uuid IS NULL OR n.id=$4) ORDER BY i.id FOR UPDATE OF i",&[&name,&version,&fixed,&installation]).await?;
+        let task = matches!(origin, CallSource::Task(_));
+        let providers = tx.query(
+            "SELECT i.id,i.generation,d.id AS deployment_id,d.owner_id,n.manifest
+             FROM provider_records p JOIN instances i ON i.id=p.instance_id
+             JOIN deployments d ON d.id=i.deployment_id JOIN installations n ON n.id=d.installation_id
+             WHERE p.name=$1 AND p.version=$2 AND p.availability='ready'
+               AND p.observed_at>(CASE WHEN $5 THEN clock_timestamp() ELSE now() END)-interval '1 millisecond'*
+                   ((n.manifest->'health'->>'interval_ms')::bigint*
+                    (n.manifest->'health'->>'failure_threshold')::bigint+
+                    (n.manifest->'health'->>'timeout_ms')::bigint)
+               AND i.phase='ready' AND d.spec->>'enabled'='true' AND d.archived_at IS NULL
+               AND ($3::uuid IS NULL OR d.id=$3) AND ($4::uuid IS NULL OR n.id=$4)
+               AND (NOT $5::boolean OR p.observed_generation=i.generation)
+             ORDER BY i.id FOR UPDATE OF i",
+            &[&name, &version, &fixed, &installation, &task],
+        ).await?;
         let row = providers
             .first()
             .ok_or_else(|| Error::unavailable("No healthy fixed provider is available"))?;
@@ -395,6 +582,9 @@ fn invoke_inner<'a>(
         let instance: Uuid = row.get("id");
         let generation: i64 = row.get("generation");
         let manifest: Value = row.get("manifest");
+        if task {
+            check_task_manifest(&manifest)?;
+        }
         protected |= manifest["dependencies"]
             .as_array()
             .is_some_and(|d| !d.is_empty());
@@ -445,19 +635,27 @@ fn invoke_inner<'a>(
             None,
         )
         .await?;
-        let call = crate::host_calls::new_call(&tx, app, token).await?;
+        let call = if let Some(token) = origin.token() {
+            crate::host_calls::new_call(&tx, app, token).await?
+        } else {
+            Uuid::new_v4()
+        };
         let timeout = input
             .get("timeout_ms")
             .map(unsigned)
             .transpose()?
             .unwrap_or(30000);
-        let deadline = crate::host_calls::bound_deadline(
-            &tx,
-            app,
-            token,
-            started + chrono::Duration::milliseconds(timeout as i64),
-        )
-        .await?;
+        let deadline = if let Some(token) = origin.token() {
+            crate::host_calls::bound_deadline(
+                &tx,
+                app,
+                token,
+                started + chrono::Duration::milliseconds(timeout as i64),
+            )
+            .await?
+        } else {
+            task_deadline.ok_or_else(Error::denied)?
+        };
         if deadline <= chrono::Utc::now() {
             return Err(Error::new(
                 "DEADLINE_EXCEEDED",
@@ -481,7 +679,9 @@ fn invoke_inner<'a>(
             .await?;
         }
         tx.execute("INSERT INTO reservations(id,account_id,kind,expires_at,status,created_at) VALUES($1,$2,'call',$3,'active',now())", &[&call,&ctx.subject,&deadline]).await?;
-        crate::host_calls::bind_child(&tx, app, token, call, instance).await?;
+        if let Some(token) = origin.token() {
+            crate::host_calls::bind_child(&tx, app, token, call, instance).await?;
+        }
         let delegation = app
             .auth
             .issue_rpc(&tx, &ctx, call, instance, generation, deadline)
@@ -502,6 +702,10 @@ fn invoke_inner<'a>(
         .await?;
         if protected {
             crate::host_blobs::check_call_sources(&tx, &ctx, call).await?;
+        }
+        if let CallSource::Task(lease) = origin {
+            task_engine::record_broker_call(&tx, lease, call).await?;
+            crate::skill_streams::ensure_active(app)?;
         }
         tx.execute("DELETE FROM idempotency_records WHERE subject_id=$1 AND credential_id=$2 AND method='POST' AND path=$4 AND key=$3 AND expires_at<=now()",&[&ctx.subject,&ctx.credential,&key,&path]).await?;
         tx.execute("INSERT INTO idempotency_records(subject_id,credential_id,method,path,key,fingerprint,resource_id,expires_at,created_at) VALUES($1,$2,'POST',$6,$3,$4,$5,now()+interval '24 hours',now())",&[&ctx.subject,&ctx.credential,&key,&fingerprint,&call.to_string(),&path]).await?;
@@ -553,16 +757,8 @@ fn invoke_inner<'a>(
                 binding_id: String::new(),
             });
             if protected {
-                check_live_call(
-                    app,
-                    token,
-                    peer,
-                    request_id,
-                    call,
-                    instance,
-                    generation,
-                    deadline,
-                    browser_origin,
+                check_live_call_for_source(
+                    app, origin, request_id, call, instance, generation, deadline,
                 )
                 .await?;
             }
@@ -591,16 +787,8 @@ fn invoke_inner<'a>(
                             if let Some(skill) = skill.as_ref() {
                                 validate_business(&skill.definition["stream_item_schema"], &item)?;
                             }
-                            check_live_call(
-                                app,
-                                token,
-                                peer,
-                                request_id,
-                                call,
-                                instance,
-                                generation,
-                                deadline,
-                                browser_origin,
+                            check_live_call_for_source(
+                                app, origin, request_id, call, instance, generation, deadline,
                             )
                             .await?;
                             output.emit("item", item).await?;
@@ -666,16 +854,8 @@ fn invoke_inner<'a>(
                 // for RPC timeouts. This guard must be polled alongside execution:
                 // execution may own a short shared authorization transaction when
                 // a revocation writer queues ahead of this next reader.
-                check_live_call(
-                    app,
-                    token,
-                    peer,
-                    request_id,
-                    call,
-                    instance,
-                    generation,
-                    deadline,
-                    browser_origin,
+                check_live_call_for_source(
+                    app, origin, request_id, call, instance, generation, deadline,
                 )
                 .await?;
             }
@@ -707,9 +887,9 @@ fn invoke_inner<'a>(
         let tx = c.transaction().await?;
         db::call_lock(&tx).await?;
         let check = async {
-            let mut current =
-                crate::host_calls::authenticate(&tx, app, token, peer, request_id).await?;
-            current.browser_origin = browser_origin.map(str::to_owned);
+            let current = origin
+                .authenticate(&tx, app, request_id, Some(call))
+                .await?;
             crate::dependencies::check_call(&tx, call).await?;
             crate::dependencies::check_ready(&tx, app, row.get("deployment_id")).await?;
             if protected {
@@ -769,17 +949,14 @@ async fn race_live_call<T>(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn check_live_call(
+async fn check_live_call_for_source(
     app: &App,
-    token: &str,
-    peer: IpAddr,
+    origin: CallSource<'_>,
     request_id: Uuid,
     call: Uuid,
     instance: Uuid,
     generation: i64,
     deadline: chrono::DateTime<chrono::Utc>,
-    browser_origin: Option<&str>,
 ) -> Result<()> {
     crate::skill_streams::ensure_active(app)?;
     let mut connection = app
@@ -791,8 +968,13 @@ async fn check_live_call(
         )
         .await?;
     let check = connection.transaction().await?;
-    let mut current = crate::host_calls::authenticate(&check, app, token, peer, request_id).await?;
-    current.browser_origin = browser_origin.map(str::to_owned);
+    if matches!(origin, CallSource::Task(_)) {
+        db::call_lock(&check).await?;
+    }
+    let capability_task = matches!(origin, CallSource::Task(lease) if !lease.is_http());
+    let current = origin
+        .authenticate(&check, app, request_id, Some(call))
+        .await?;
     check_skill_authority(&check, &current, call).await?;
     http::check_route_approval(&check, app, call).await?;
     let status = check
@@ -812,7 +994,25 @@ async fn check_live_call(
     if status.get::<_, String>("state") != "running" {
         return Err(Error::conflict("Admitted call is no longer running"));
     }
-    let live: bool = check.query_one("SELECT EXISTS(SELECT 1 FROM instances i JOIN deployments d ON d.id=i.deployment_id WHERE i.id=$1 AND i.generation=$2 AND i.phase='ready' AND d.archived_at IS NULL AND d.spec->>'enabled'='true')", &[&instance,&generation]).await?.get(0);
+    let live: bool = check.query_one(
+        "SELECT EXISTS(
+             SELECT 1 FROM instances i JOIN deployments d ON d.id=i.deployment_id
+             WHERE i.id=$1 AND i.generation=$2 AND i.phase='ready'
+               AND d.archived_at IS NULL AND d.spec->>'enabled'='true'
+               AND (NOT $3::boolean OR EXISTS(
+                   SELECT 1 FROM provider_records p
+                   JOIN calls c ON c.id=$4 AND c.provider_instance_id=p.instance_id
+                   JOIN installations n ON n.id=d.installation_id
+                   WHERE p.instance_id=i.id AND p.name=c.contract->>'name' AND p.version=c.contract->>'version'
+                     AND p.availability='ready' AND p.observed_generation=i.generation
+                     AND p.observed_at>clock_timestamp()-interval '1 millisecond'*
+                         ((n.manifest->'health'->>'interval_ms')::bigint*
+                          (n.manifest->'health'->>'failure_threshold')::bigint+
+                          (n.manifest->'health'->>'timeout_ms')::bigint)
+               ))
+         )",
+        &[&instance, &generation, &capability_task, &call],
+    ).await?.get(0);
     if !live {
         return Err(Error::unavailable("Fixed Skill deployment is unavailable"));
     }
