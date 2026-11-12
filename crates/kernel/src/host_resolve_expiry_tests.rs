@@ -101,11 +101,27 @@ async fn postgres_host_resolve_rechecks_parent_clock_after_binding_insert_wait()
                 chrono::Utc::now() < expires,
                 "the initial authority check and actual FK wait must precede parent expiration"
             );
-            tokio::time::sleep(
-                (expires - chrono::Utc::now()).to_std().unwrap() + Duration::from_millis(30),
-            )
-            .await;
-            assert!(chrono::Utc::now() >= expires);
+            // Tokio's monotonic timer can wake before the wall clocks reach
+            // the deadline. Release the FK lock only after both see expiry.
+            tokio::time::timeout(Duration::from_secs(25), async {
+                loop {
+                    let expired_in_db: bool = observer
+                        .query_one("SELECT clock_timestamp() >= $1", &[&expires])
+                        .await
+                        .unwrap()
+                        .get(0);
+                    assert!(
+                        !operation.is_finished(),
+                        "Resolve ended while the child-binding FK lock was still held"
+                    );
+                    if expired_in_db && chrono::Utc::now() >= expires {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            })
+            .await
+            .expect("parent did not expire while the child-binding FK lock was held");
         }
         locked.commit().await.unwrap();
         let result = tokio::time::timeout(Duration::from_secs(10), operation)
