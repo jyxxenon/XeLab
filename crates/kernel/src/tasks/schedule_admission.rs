@@ -6,6 +6,7 @@ use super::{
 use crate::{
     auth::{Auth, Context, Resource},
     contracts::{digest, id},
+    db,
     error::{Error, Result},
     plugin_catalog::reserve_authority_bytes,
     policy::{self, Path, Policy},
@@ -295,7 +296,7 @@ pub(crate) async fn enqueue_scheduled_task(
     }
     let admission = serde_json::to_value(saved.task)?;
     reserve_authority_bytes(&mut 0, serde_json::to_vec(&admission)?.len())?;
-    insert_task(
+    let task = insert_task(
         c,
         &ctx,
         NewTask {
@@ -309,7 +310,19 @@ pub(crate) async fn enqueue_scheduled_task(
             maximum_rules: Value::Array(rules.into_values().collect()),
         },
     )
-    .await
+    .await?;
+    db::audit(
+        c,
+        ctx.subject,
+        Some(ctx.credential),
+        ctx.request,
+        "createTask",
+        &Resource::new("task", task, Some(ctx.subject)).json(),
+        "succeeded",
+        "COMMITTED",
+    )
+    .await?;
+    Ok(task)
 }
 
 async fn revalidate(

@@ -1,7 +1,8 @@
 //! Schedule control-plane, durable fires, and loopback Task execution.
 use super::*;
-use chrono::TimeDelta;
-use tokio_postgres::Client;
+use crate::auth::Resource;
+use chrono::{TimeDelta, Timelike};
+use tokio_postgres::{Client, GenericClient};
 
 fn spec(f: &TaskFixture) -> Value {
     json!({
@@ -131,6 +132,269 @@ async fn task_count(c: &Client) -> i64 {
         .await
         .unwrap()
         .get(0)
+}
+
+async fn task_create_audit_count(c: &impl GenericClient) -> i64 {
+    c.query_one(
+        "SELECT count(*) FROM audit_events WHERE action='createTask'",
+        &[],
+    )
+    .await
+    .unwrap()
+    .get(0)
+}
+
+#[tokio::test]
+async fn postgres_task_schedule_pending_survives_transient_dispatch_failure_and_restart() {
+    let Some(f) = TaskFixture::new("none", false).await else {
+        return;
+    };
+    let mut body = spec(&f);
+    body["cron"] = json!("0 9 * * *");
+    body["timezone"] = json!("UTC");
+    let schedule = create(&f, body, "schedule-durable-fire").await;
+    assert_eq!(schedule["spec"]["misfire"], "skip");
+    let id = contracts::id(&schedule, "id").unwrap();
+    let at = next(&schedule);
+    let cutoff = at - TimeDelta::seconds(1);
+    let mut c = f.host.app.db.connect().await.unwrap();
+    assert_eq!(task_create_audit_count(&c).await, 1);
+    assert_eq!(
+        c.execute(
+            "UPDATE deployments SET spec=jsonb_set(spec,'{enabled}','false'),phase='disabled'
+             WHERE id=(SELECT deployment_id FROM instances WHERE id=$1)",
+            &[&f.instance],
+        )
+        .await
+        .unwrap(),
+        1
+    );
+
+    let tx = c.transaction().await.unwrap();
+    let pending = crate::schedules::stage_tick(&tx, at + TimeDelta::seconds(5), cutoff)
+        .await
+        .unwrap()
+        .unwrap();
+    tx.commit().await.unwrap();
+    let observed = [(at, "pending".to_owned(), None)];
+    assert_eq!(fires(&c, id).await, observed);
+    assert_eq!(next(&get(&f, id).await), at + TimeDelta::days(1));
+
+    let auth = &f.host.app.auth;
+    let tx = c.transaction().await.unwrap();
+    let error = crate::schedules::dispatch_tick(&tx, auth, pending)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "NOT_READY");
+    tx.rollback().await.unwrap();
+    assert_eq!(fires(&c, id).await, observed);
+    assert_eq!(task_count(&c).await, 1);
+    assert_eq!(task_create_audit_count(&c).await, 1);
+
+    assert_eq!(
+        c.execute(
+            "UPDATE deployments SET spec=jsonb_set(spec,'{enabled}','true'),phase='ready'
+             WHERE id=(SELECT deployment_id FROM instances WHERE id=$1)",
+            &[&f.instance],
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    // Restart after the live minute. Default misfire=skip must not reclassify
+    // the occurrence already recorded by the first scheduler.
+    let restarted_at = at + TimeDelta::minutes(2);
+    let tx = c.transaction().await.unwrap();
+    let pending = crate::schedules::stage_tick(&tx, restarted_at, restarted_at)
+        .await
+        .unwrap()
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    // Loss of the dispatch transaction rolls back both Task and link, while
+    // the separately committed pending fire remains available for retry.
+    let tx = c.transaction().await.unwrap();
+    crate::schedules::dispatch_tick(&tx, auth, pending)
+        .await
+        .unwrap();
+    let linked = tx
+        .query_one(
+            "SELECT task_id FROM schedule_fires
+             WHERE schedule_id=$1 AND scheduled_at=$2 AND outcome='created'",
+            &[&id, &at],
+        )
+        .await
+        .unwrap()
+        .get::<_, Option<Uuid>>(0);
+    assert!(linked.is_some());
+    assert_eq!(task_create_audit_count(&tx).await, 2);
+    tx.rollback().await.unwrap();
+    assert_eq!(fires(&c, id).await, observed);
+    assert_eq!(task_count(&c).await, 1);
+    assert_eq!(task_create_audit_count(&c).await, 1);
+
+    let tx = c.transaction().await.unwrap();
+    crate::schedules::dispatch_tick(&tx, auth, pending)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let committed = fires(&c, id).await;
+    let task = committed[0].2.unwrap();
+    assert_eq!(committed, [(at, "created".to_owned(), Some(task))]);
+    assert_eq!(
+        read_task(&f, task).await["input"],
+        schedule["spec"]["input"]
+    );
+    assert_eq!(task_count(&c).await, 2);
+    assert_eq!(task_create_audit_count(&c).await, 2);
+
+    let tx = c.transaction().await.unwrap();
+    crate::schedules::dispatch_tick(&tx, auth, pending)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(fires(&c, id).await, committed);
+    assert_eq!(task_count(&c).await, 2);
+    assert_eq!(task_create_audit_count(&c).await, 2);
+    let owner = contracts::id(&schedule, "owner_id").unwrap();
+    let audit = c
+        .query_one(
+            "SELECT subject_id,credential_id,outcome,reason_code FROM audit_events
+             WHERE action='createTask' AND resource=$1",
+            &[&Resource::new("task", task, Some(owner)).json()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(audit.get::<_, Uuid>("subject_id"), owner);
+    assert_eq!(audit.get::<_, Uuid>("credential_id"), f.issuer);
+    assert_eq!(audit.get::<_, String>("outcome"), "succeeded");
+    assert_eq!(audit.get::<_, String>("reason_code"), "COMMITTED");
+}
+
+#[tokio::test]
+async fn postgres_task_schedule_update_invalidates_committed_pending_fire() {
+    let Some(f) = TaskFixture::new("none", false).await else {
+        return;
+    };
+    let mut body = spec(&f);
+    let schedule = create(&f, body.clone(), "schedule-update-pending").await;
+    let id = contracts::id(&schedule, "id").unwrap();
+    let at = next(&schedule);
+    let mut c = f.host.app.db.connect().await.unwrap();
+    let tx = c.transaction().await.unwrap();
+    let pending = crate::schedules::stage_tick(&tx, at, at - TimeDelta::seconds(1))
+        .await
+        .unwrap()
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(fires(&c, id).await, [(at, "pending".to_owned(), None)]);
+
+    body["input"] = json!({"message": "changed after staging"});
+    let revision = get(&f, id).await["revision"].as_i64().unwrap();
+    let (status, updated) = schedule_call(
+        &f,
+        "updateSchedule",
+        id,
+        body,
+        Some(revision),
+        "schedule-update-staged",
+    )
+    .await;
+    assert_eq!(status, 200, "{updated}");
+    assert_eq!(fires(&c, id).await, [(at, "skipped".to_owned(), None)]);
+
+    let tx = c.transaction().await.unwrap();
+    crate::schedules::dispatch_tick(&tx, &f.host.app.auth, pending)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(fires(&c, id).await, [(at, "skipped".to_owned(), None)]);
+    assert_eq!(task_count(&c).await, 1);
+}
+
+async fn wait_for_fire(
+    c: &Client,
+    schedule: Uuid,
+    at: DateTime<Utc>,
+    outcome: &str,
+) -> Option<Uuid> {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(row) = c
+                .query_opt(
+                    "SELECT task_id FROM schedule_fires
+                     WHERE schedule_id=$1 AND scheduled_at=$2 AND outcome=$3",
+                    &[&schedule, &at, &outcome],
+                )
+                .await
+                .unwrap()
+            {
+                return row.get(0);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("Schedule fire did not reach {outcome}"))
+}
+
+#[tokio::test]
+async fn postgres_task_schedule_worker_retries_pending_after_restart() {
+    let Some(f) = TaskFixture::new("none", false).await else {
+        return;
+    };
+    let c = f.host.app.db.connect().await.unwrap();
+    let at: DateTime<Utc> = c
+        .query_one(
+            "SELECT date_trunc('minute',clock_timestamp())-interval '2 minutes'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let mut body = spec(&f);
+    body["timezone"] = json!("UTC");
+    body["cron"] = json!(format!("{} {} * * *", at.minute(), at.hour()));
+    body["misfire"] = json!("run_once");
+    let schedule = create(&f, body, "schedule-worker-restart").await;
+    let id = contracts::id(&schedule, "id").unwrap();
+    c.execute(
+        "UPDATE schedules SET next_fire_at=$2 WHERE id=$1",
+        &[&id, &at],
+    )
+    .await
+    .unwrap();
+    c.execute(
+        "UPDATE deployments SET spec=jsonb_set(spec,'{enabled}','false'),phase='disabled'
+         WHERE id=(SELECT deployment_id FROM instances WHERE id=$1)",
+        &[&f.instance],
+    )
+    .await
+    .unwrap();
+    let worker = tokio::spawn(crate::schedules::run(f.host.app.clone()));
+    assert_eq!(wait_for_fire(&c, id, at, "pending").await, None);
+    worker.abort();
+    assert!(worker.await.unwrap_err().is_cancelled());
+    assert_eq!(fires(&c, id).await, [(at, "pending".to_owned(), None)]);
+    assert_eq!(task_count(&c).await, 1);
+
+    c.execute(
+        "UPDATE deployments SET spec=jsonb_set(spec,'{enabled}','true'),phase='ready'
+         WHERE id=(SELECT deployment_id FROM instances WHERE id=$1)",
+        &[&f.instance],
+    )
+    .await
+    .unwrap();
+    let restarted = tokio::spawn(crate::schedules::run(f.host.app.clone()));
+    let task = wait_for_fire(&c, id, at, "created").await.unwrap();
+    restarted.abort();
+    assert!(restarted.await.unwrap_err().is_cancelled());
+    assert_eq!(
+        fires(&c, id).await,
+        [(at, "created".to_owned(), Some(task))]
+    );
+    assert_eq!(read_task(&f, task).await["state"], "queued");
+    assert_eq!(task_count(&c).await, 2);
 }
 
 #[tokio::test]
@@ -512,5 +776,19 @@ async fn postgres_task_schedule_revoked_issuer_pauses_without_enqueuing() {
         .unwrap();
     assert_eq!(saved.get::<_, Option<DateTime<Utc>>>(0), None);
     assert_eq!(task_count(&c).await, 1);
+    assert_eq!(task_create_audit_count(&c).await, 1);
     assert!(!tick(&f, at + TimeDelta::minutes(1), cutoff).await);
+    let owner = contracts::id(&schedule, "owner_id").unwrap();
+    let audit = c
+        .query_one(
+            "SELECT subject_id,credential_id,outcome,reason_code FROM audit_events
+             WHERE action='schedule.fire' AND resource=$1",
+            &[&Resource::new("schedule", id, Some(owner)).json()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(audit.get::<_, Uuid>("subject_id"), owner);
+    assert_eq!(audit.get::<_, Uuid>("credential_id"), f.issuer);
+    assert_eq!(audit.get::<_, String>("outcome"), "denied");
+    assert_eq!(audit.get::<_, String>("reason_code"), "INVALID_CREDENTIAL");
 }

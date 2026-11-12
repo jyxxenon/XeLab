@@ -17,7 +17,7 @@ mod cron;
 mod worker;
 pub(crate) use worker::run;
 #[cfg(test)]
-pub(crate) use worker::tick;
+pub(crate) use worker::{dispatch_tick, stage_tick, tick};
 
 pub(crate) fn handles(name: &str) -> bool {
     matches!(

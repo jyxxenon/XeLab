@@ -2,7 +2,7 @@
 use super::cron::Cron;
 use crate::{
     api::App,
-    auth::Auth,
+    auth::{Auth, Resource},
     db,
     error::{Error, Result},
     tasks,
@@ -24,6 +24,18 @@ const CATCH_UP_WINDOW: TimeDelta = TimeDelta::hours(24);
 
 const ACTIVE_TASK: &str = "SELECT 1 FROM schedule_fires f JOIN tasks t ON t.id=f.task_id
     WHERE f.schedule_id=$1 AND t.state NOT IN ('succeeded','failed','canceled')";
+
+#[derive(Clone, Copy)]
+pub(crate) struct PendingFire {
+    schedule: Uuid,
+    at: DateTime<Utc>,
+}
+
+enum Scan {
+    Empty,
+    Recorded,
+    Pending(PendingFire),
+}
 
 pub(crate) async fn run(app: Arc<App>) {
     let mut startup_cutoff = None;
@@ -84,12 +96,31 @@ async fn run_one(
     db::auth_lock(&tx, false).await?;
     let now: DateTime<Utc> = tx.query_one("SELECT clock_timestamp()", &[]).await?.get(0);
     let cutoff = *startup_cutoff.get_or_insert(now);
-    let worked = tick_after(&tx, &app.auth, now, cutoff, cursor).await?;
+    let scan = stage_after(&tx, now, cutoff, cursor).await?;
     if !ready(app) {
         return Ok(false);
     }
     tx.commit().await?;
-    Ok(worked)
+
+    // The fire is durable before Task admission, including if the deadline
+    // cancels this attempt or the connection disappears during admission.
+    match scan {
+        Scan::Empty => Ok(false),
+        Scan::Recorded => Ok(true),
+        Scan::Pending(fire) => {
+            let tx = connection.transaction().await?;
+            db::auth_lock(&tx, false).await?;
+            if !ready(app) {
+                return Ok(false);
+            }
+            dispatch_pending(&tx, &app.auth, fire).await?;
+            if !ready(app) {
+                return Ok(false);
+            }
+            tx.commit().await?;
+            Ok(true)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -100,16 +131,45 @@ pub(crate) async fn tick(
     startup_cutoff: DateTime<Utc>,
 ) -> Result<bool> {
     db::auth_lock(tx, false).await?;
-    tick_after(tx, auth, now, startup_cutoff, &mut None).await
+    match stage_after(tx, now, startup_cutoff, &mut None).await? {
+        Scan::Empty => Ok(false),
+        Scan::Recorded => Ok(true),
+        Scan::Pending(fire) => {
+            dispatch_pending(tx, auth, fire).await?;
+            Ok(true)
+        }
+    }
 }
 
-async fn tick_after(
+#[cfg(test)]
+pub(crate) async fn stage_tick(
+    tx: &Transaction<'_>,
+    now: DateTime<Utc>,
+    startup_cutoff: DateTime<Utc>,
+) -> Result<Option<PendingFire>> {
+    db::auth_lock(tx, false).await?;
+    match stage_after(tx, now, startup_cutoff, &mut None).await? {
+        Scan::Pending(fire) => Ok(Some(fire)),
+        Scan::Empty | Scan::Recorded => Ok(None),
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn dispatch_tick(
     tx: &Transaction<'_>,
     auth: &Auth,
+    fire: PendingFire,
+) -> Result<()> {
+    db::auth_lock(tx, false).await?;
+    dispatch_pending(tx, auth, fire).await
+}
+
+async fn stage_after(
+    tx: &Transaction<'_>,
     now: DateTime<Utc>,
     startup_cutoff: DateTime<Utc>,
     cursor: &mut Option<Uuid>,
-) -> Result<bool> {
+) -> Result<Scan> {
     let schedule = tx
         .query_opt(
             "SELECT s.* FROM schedules s
@@ -129,7 +189,7 @@ async fn tick_after(
         .await?;
     let Some(schedule) = schedule else {
         *cursor = None;
-        return Ok(false);
+        return Ok(Scan::Empty);
     };
     let id: Uuid = schedule.try_get("id")?;
     // Advance before any expensive work. A temporary failure on one Schedule
@@ -148,10 +208,7 @@ async fn tick_after(
         &[&id],
     )
     .await?;
-    let active: bool = tx
-        .query_one(&format!("SELECT EXISTS({ACTIVE_TASK})"), &[&id])
-        .await?
-        .get(0);
+    let active = has_active_task(tx, id).await?;
     let queue_one = spec["overlap"] == "queue_one";
     if previous_next <= now {
         let cron = Cron::parse(
@@ -188,6 +245,7 @@ async fn tick_after(
         )
         .await?
         .map(|row| row.get(0));
+    let mut scan = Scan::Recorded;
     if let Some(at) = pending {
         tx.execute(
             "UPDATE schedule_fires SET outcome='skipped' WHERE schedule_id=$1
@@ -196,32 +254,7 @@ async fn tick_after(
         )
         .await?;
         if !active {
-            match tasks::enqueue_scheduled_task(tx, auth, &schedule).await {
-                Ok(task) => {
-                    let linked = tx
-                        .execute(
-                            "UPDATE schedule_fires SET task_id=$3,outcome='created'
-                             WHERE schedule_id=$1 AND scheduled_at=$2 AND outcome='pending' AND task_id IS NULL",
-                            &[&id, &at, &task],
-                        )
-                        .await?;
-                    if linked != 1 {
-                        return Err(Error::conflict("Schedule fire changed before Task linkage"));
-                    }
-                }
-                // Enqueue checks definitive authority and pinned identities
-                // before inserting any Task rows.
-                Err(error) if is_paused(&error) => {
-                    tx.execute(
-                        "UPDATE schedule_fires SET outcome='paused'
-                         WHERE schedule_id=$1 AND scheduled_at=$2 AND outcome='pending' AND task_id IS NULL",
-                        &[&id, &at],
-                    )
-                    .await?;
-                    next = None;
-                }
-                Err(error) => return Err(error),
-            }
+            scan = Scan::Pending(PendingFire { schedule: id, at });
         }
     }
     if next != Some(previous_next) {
@@ -231,14 +264,116 @@ async fn tick_after(
         )
         .await?;
     }
-    Ok(true)
+    Ok(scan)
 }
 
-fn is_paused(error: &Error) -> bool {
-    matches!(
-        error.code,
-        "PERMISSION_DENIED" | "INVALID_CREDENTIAL" | "RESOURCE_NOT_FOUND" | "STATE_CONFLICT"
+async fn has_active_task(tx: &Transaction<'_>, schedule: Uuid) -> Result<bool> {
+    Ok(tx
+        .query_one(&format!("SELECT EXISTS({ACTIVE_TASK})"), &[&schedule])
+        .await?
+        .get(0))
+}
+
+async fn dispatch_pending(tx: &Transaction<'_>, auth: &Auth, fire: PendingFire) -> Result<()> {
+    let id = fire.schedule;
+    let at = fire.at;
+    let Some(schedule) = tx
+        .query_opt(
+            "SELECT s.* FROM schedules s WHERE id=$1 AND deleted_at IS NULL
+               AND admission IS NOT NULL AND next_fire_at IS NOT NULL AND spec->>'enabled'='true'
+             FOR UPDATE OF s SKIP LOCKED",
+            &[&id],
+        )
+        .await?
+    else {
+        return Ok(());
+    };
+    // Take a fresh snapshot after acquiring the Schedule lock. A concurrent
+    // scan, update, or dispatcher may already have settled this exact fire.
+    let pending = tx
+        .query_opt(
+            "SELECT 1 FROM schedule_fires WHERE schedule_id=$1 AND scheduled_at=$2
+               AND outcome='pending' AND task_id IS NULL",
+            &[&id, &at],
+        )
+        .await?;
+    if pending.is_none() {
+        return Ok(());
+    }
+    if has_active_task(tx, id).await? {
+        let spec: Value = schedule.try_get("spec")?;
+        if spec["overlap"] != "queue_one" {
+            settle_unlinked(tx, fire, "skipped").await?;
+        }
+        return Ok(());
+    }
+    match tasks::enqueue_scheduled_task(tx, auth, &schedule).await {
+        Ok(task) => {
+            let linked = tx
+                .execute(
+                    "UPDATE schedule_fires SET task_id=$3,outcome='created'
+                     WHERE schedule_id=$1 AND scheduled_at=$2 AND outcome='pending' AND task_id IS NULL",
+                    &[&id, &at, &task],
+                )
+                .await?;
+            if linked != 1 {
+                return Err(Error::conflict("Schedule fire changed before Task linkage"));
+            }
+        }
+        // Enqueue checks definitive authority and pinned identities before
+        // inserting any Task rows. Other errors roll back only this attempt.
+        Err(error) => {
+            let Some(outcome) = pause_outcome(&error) else {
+                return Err(error);
+            };
+            settle_unlinked(tx, fire, "paused").await?;
+            tx.execute(
+                "UPDATE schedules SET next_fire_at=NULL,revision=revision+1,updated_at=clock_timestamp()
+                 WHERE id=$1",
+                &[&id],
+            )
+            .await?;
+            let owner: Uuid = schedule.try_get("owner_id")?;
+            let delegation: Uuid = schedule.try_get("delegation_id")?;
+            let issuer = tx
+                .query_opt(
+                    "SELECT issuer_credential_id FROM execution_delegations WHERE id=$1",
+                    &[&delegation],
+                )
+                .await?
+                .and_then(|row| row.get::<_, Option<Uuid>>(0));
+            db::audit(
+                tx,
+                owner,
+                issuer,
+                Uuid::new_v4(),
+                "schedule.fire",
+                &Resource::new("schedule", id, Some(owner)).json(),
+                outcome,
+                error.code,
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn settle_unlinked(tx: &Transaction<'_>, fire: PendingFire, outcome: &str) -> Result<()> {
+    tx.execute(
+        "UPDATE schedule_fires SET outcome=$3 WHERE schedule_id=$1 AND scheduled_at=$2
+           AND outcome='pending' AND task_id IS NULL",
+        &[&fire.schedule, &fire.at, &outcome],
     )
+    .await?;
+    Ok(())
+}
+
+fn pause_outcome(error: &Error) -> Option<&'static str> {
+    match error.code {
+        "PERMISSION_DENIED" | "INVALID_CREDENTIAL" => Some("denied"),
+        "RESOURCE_NOT_FOUND" | "STATE_CONFLICT" => Some("failed"),
+        _ => None,
+    }
 }
 
 async fn record_fire(
