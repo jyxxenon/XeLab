@@ -756,6 +756,20 @@ function overviewNode(data) {
     ...(config.length ? [node('h4', {}, '内核与系统预留'), overviewFacts(config)] : []));
 }
 function overviewBadge(value, fallback) { return node('span', {class:'badge'}, typeof value === 'string' && value ? value : fallback); }
+function overviewFailure(error) {
+  // Core error bodies may contain request data or upstream diagnostics. The
+  // overview keeps only a stable machine code and a fixed explanation instead
+  // of echoing the server-provided message into the DOM.
+  const status = error?.status ?? error?.http_status;
+  const code = typeof error?.code === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(error.code) ? error.code : null;
+  if (error?.name === 'AbortError' || error?.code === 'CANCELED') {
+    return state('unavailable', '等待已停止', '刷新或关闭视图不会回滚已经接受的操作。');
+  }
+  if (status === 401) return state('denied', '登录已失效', '请重新进入内核可信登录页面。');
+  if (status === 403) return state('denied', '无权限', `${code || 'PERMISSION_DENIED'} · 当前授权来源不允许此操作。`);
+  if ([404, 501, 503].includes(status)) return state('unavailable', '当前不可用', `${code || 'UNAVAILABLE'} · 接口、资源或依赖尚不可用。`);
+  return state('error', '请求失败', `${code || 'NETWORK_ERROR'} · 连接中断；副作用结果可能未知，请保留原请求键。`);
+}
 function overviewDeployment(item) {
   const spec = item?.spec ?? {};
   const conditions = (Array.isArray(item?.conditions) ? item.conditions : []).filter(value => typeof value === 'string');
@@ -785,14 +799,16 @@ async function overviewPage(win, {operation, title, renderItem, emptyMessage}) {
     more.disabled = true;
     try {
       const next = await request(operation, {query:{limit:50, cursor:more.dataset.cursor}, signal:win.controller.signal});
+      if (!more.isConnected) return;
       for (const item of rows(next.data)) list.append(renderItem(item));
       more.dataset.cursor = next.data.next_cursor || '';
       more.hidden = !next.data.next_cursor;
       hint.textContent = next.data.next_cursor ? '仅显示当前已取到的项目；还有更多可加载。' : '已加载全部可见项目。';
     } catch (error) {
-      list.append(failure(error));
+      if (!more.isConnected) return;
+      list.append(overviewFailure(error));
       hint.textContent = '下一页读取失败；已加载内容保持不变。';
-    } finally { more.disabled = false; }
+    } finally { if (more.isConnected) more.disabled = false; }
   }, {'aria-label':`加载下一页${title}`, hidden:!result.data.next_cursor});
   more.dataset.cursor = result.data.next_cursor || '';
   return node('div', {}, list, more, hint);
@@ -822,7 +838,7 @@ function overviewSection(win, {key, title, source, load}) {
     } catch (error) {
       if (current !== sequence || !section.isConnected) return;
       readAt.textContent = '读取失败';
-      body.replaceChildren(failure(error));
+      body.replaceChildren(overviewFailure(error));
     } finally {
       if (current === sequence && section.isConnected) refresh.disabled = false;
     }
