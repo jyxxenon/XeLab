@@ -114,6 +114,14 @@ fn proxy_rules() -> Vec<Value> {
     ]
 }
 async fn skill(f: &Fixture, deployment: Uuid) -> (Uuid, Value) {
+    skill_with_health_updates(f, deployment, true).await
+}
+
+async fn skill_with_health_updates(
+    f: &Fixture,
+    deployment: Uuid,
+    refresh_health: bool,
+) -> (Uuid, Value) {
     let c = f.app.db.connect().await.unwrap();
     let row = c
         .query_one(
@@ -163,7 +171,9 @@ async fn skill(f: &Fixture, deployment: Uuid) -> (Uuid, Value) {
     .await
     .unwrap();
     c.execute("INSERT INTO provider_records(instance_id,name,version,availability,features,observed_generation,observed_at) VALUES($1,$2,$3,'ready','[]',7,now())",&[&instance,&target["name"].as_str().unwrap(),&target["version"].as_str().unwrap()]).await.unwrap();
-    fixture_health(f, instance);
+    if refresh_health {
+        fixture_health(f, instance);
+    }
     (id, definition)
 }
 

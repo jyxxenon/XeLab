@@ -14,6 +14,14 @@ struct TaskFixture {
 
 impl TaskFixture {
     async fn new(side_effect: &str, use_blob: bool) -> Option<Self> {
+        Self::with_health_updates(side_effect, use_blob, true).await
+    }
+
+    async fn with_health_updates(
+        side_effect: &str,
+        use_blob: bool,
+        refresh_health: bool,
+    ) -> Option<Self> {
         let host = Fixture::new().await?;
         let (deployment, instance) = host.workload().await;
         let c = host.app.db.connect().await.unwrap();
@@ -48,7 +56,7 @@ impl TaskFixture {
         )
         .await
         .unwrap();
-        let (skill, _) = skill(&host, deployment).await;
+        let (skill, _) = skill_with_health_updates(&host, deployment, refresh_health).await;
 
         let (field, input) = if use_blob {
             let source = host.source(b"task fixture Blob".to_vec()).await;
@@ -379,7 +387,9 @@ async fn postgres_task_broker_requires_current_provider_generation_at_admission(
 
 #[tokio::test]
 async fn postgres_task_broker_provider_freshness_expires_during_admission_lock_wait() {
-    let Some(f) = TaskFixture::new("none", false).await else {
+    // The fixture starts with a fresh observation, then this test owns its
+    // clock. A concurrent heartbeat would legitimately make admission safe.
+    let Some(f) = TaskFixture::with_health_updates("none", false, false).await else {
         return;
     };
     let (plugin, server) = echo(&f.host, f.instance).await;
@@ -419,30 +429,43 @@ async fn postgres_task_broker_provider_freshness_expires_during_admission_lock_w
     // Position the health expiry after the waiting transaction's fixed now().
     // Holding the lock through expiry tests wall-clock freshness at admission.
     let expires = started + chrono::Duration::milliseconds(100);
-    assert_eq!(
-        lock.execute(
+    let observed_at: DateTime<Utc> = lock
+        .query_one(
             "UPDATE provider_records p SET observed_at=$2::timestamptz-interval '1 millisecond'*
                 ((n.manifest->'health'->>'interval_ms')::bigint*
                  (n.manifest->'health'->>'failure_threshold')::bigint+
                  (n.manifest->'health'->>'timeout_ms')::bigint)
              FROM instances i JOIN deployments d ON d.id=i.deployment_id
              JOIN installations n ON n.id=d.installation_id
-             WHERE p.instance_id=i.id AND i.id=$1",
+             WHERE p.instance_id=i.id AND i.id=$1 RETURNING p.observed_at",
             &[&f.instance, &expires],
         )
         .await
-        .unwrap(),
-        1
-    );
-    while !lock
-        .query_one("SELECT clock_timestamp()>=$1", &[&expires])
+        .unwrap()
+        .get(0);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !lock
+            .query_one("SELECT clock_timestamp()>=$1", &[&expires])
+            .await
+            .unwrap()
+            .get::<_, bool>(0)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("provider observation must expire while the call ledger lock is held");
+    lock.commit().await.unwrap();
+    let stale: bool = observer
+        .query_one(
+            "SELECT observed_at=$2 AND clock_timestamp()>=$3
+             FROM provider_records WHERE instance_id=$1",
+            &[&f.instance, &observed_at, &expires],
+        )
         .await
         .unwrap()
-        .get::<_, bool>(0)
-    {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    lock.commit().await.unwrap();
+        .get(0);
+    assert!(stale, "the expired observation must remain committed");
 
     let error = pending.await.unwrap().unwrap_err();
     assert_eq!(error.code, "NOT_READY");
