@@ -303,7 +303,17 @@ window.addEventListener('resize',()=> {
   }
 });
 
-function toolbar(win, title, ...actions) { return node('div',{class:'toolbar'},node('h2',{},title),...actions,button('刷新',()=>loadApp(win))); }
+// Built-in windows share one navigation row: a truncating title, a grouped
+// action set and the one refresh control for that window. Grouping the
+// actions keeps them together when they wrap and gives assistive technology
+// a named boundary; card-level .toolbar rows keep their existing layout.
+function toolbar(win, title, ...actions) {
+  return node('div',{class:'toolbar window-toolbar','data-window-toolbar':''},
+    node('h2',{class:'window-toolbar-title',title},title),
+    node('div',{class:'window-toolbar-actions',role:'group','aria-label':`${title}操作`},
+      ...actions,
+      button('刷新',()=>loadApp(win),{'aria-label':`刷新${title}`})));
+}
 async function loadApp(win) {
   win.controller?.abort();
   win.controller = new AbortController();
