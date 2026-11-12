@@ -81,12 +81,21 @@ function state(kind, title, message = '') {
   return node('div', {class:'state', 'data-kind':kind, role:kind === 'loading' ? 'status' : 'note'}, node('h3', {}, title), node('p', {}, message));
 }
 function failure(error) {
-  if (error?.name === 'AbortError') return state('unavailable', '等待已停止', '关闭或刷新视图不会回滚已经接受的操作。请使用原请求键核实结果。');
-  const status = error.status ?? error.http_status;
+  // Core error bodies may contain request data or upstream diagnostics.
+  // Standard window failure states keep only a stable machine code and a
+  // fixed explanation for server errors, while displaying safe local validation messages.
+  const status = error?.status ?? error?.http_status;
+  const code = typeof error?.code === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(error.code) ? error.code : null;
+  if (error?.name === 'AbortError' || error?.code === 'CANCELED') {
+    return state('unavailable', '等待已停止', '关闭或刷新视图不会回滚已经接受的操作。请使用原请求键核实结果。');
+  }
   if (status === 401) return state('denied', '登录已失效', '请重新进入内核可信登录页面。');
-  if (status === 403) return state('denied', '无权限', `${error.code || 'PERMISSION_DENIED'} · 当前授权来源不允许此操作。`);
-  if ([404, 501, 503].includes(status)) return state('unavailable', '当前不可用', `${error.code || 'UNAVAILABLE'} · ${error.message || '接口、资源或依赖尚不可用。'}`);
-  return state('error', '请求失败', `${error.code || 'NETWORK_ERROR'} · ${error.message || '连接中断；副作用结果可能未知，请保留原请求键。'}`);
+  if (status === 403) return state('denied', '无权限', `${code || 'PERMISSION_DENIED'} · 当前授权来源不允许此操作。`);
+  if ([404, 501, 503].includes(status)) return state('unavailable', '当前不可用', `${code || 'UNAVAILABLE'} · 接口、资源或依赖尚不可用。`);
+  const isServer = status >= 500 || (error?.name === 'ApiError' && (status === 0 || status >= 500));
+  const fallback = '连接中断；副作用结果可能未知，请保留原请求键。';
+  const message = (!isServer && typeof error?.message === 'string' && error.message) ? error.message : fallback;
+  return state('error', '请求失败', `${code || 'NETWORK_ERROR'} · ${message}`);
 }
 function raw(value) { return node('pre', {class:'result'}, JSON.stringify(value, null, 2)); }
 function rows(value) { return Array.isArray(value?.items) ? value.items : Array.isArray(value) ? value : []; }
