@@ -502,6 +502,13 @@ async fn issuing_key(c: &impl GenericClient, ctx: &Context) -> Result<Option<Uui
         .get(0);
     Ok(matches!(kind.as_str(), "api_key" | "oauth_access").then_some(ctx.credential))
 }
+
+fn persisted_expiry(value: &Value) -> Result<DateTime<Utc>> {
+    // PostgreSQL timestamps have microsecond precision. Evaluate and store the
+    // same instant, truncating so the persisted deadline cannot be later.
+    Ok(policy::timestamp(value)?.trunc_subsecs(6))
+}
+
 async fn bounded_expiry(
     c: &impl GenericClient,
     ctx: &Context,
@@ -650,7 +657,7 @@ pub async fn execute(
                     return Err(denied_quota());
                 }
             }
-            let expiry = body.get("expires_at").map(policy::timestamp).transpose()?;
+            let expiry = body.get("expires_at").map(persisted_expiry).transpose()?;
             bounded_expiry(c, ctx, parent, expiry).await?;
             let mut policy = Policy::for_context(c, ctx);
             let mut paths = policy.select(ctx, &body["inheritance"]).await?;
@@ -722,7 +729,7 @@ pub async fn execute(
                 if v.is_null() {
                     None
                 } else {
-                    Some(policy::timestamp(v)?)
+                    Some(persisted_expiry(v)?)
                 }
             } else {
                 row.get("expires_at")
@@ -1204,13 +1211,10 @@ async fn issue_key(
         return Err(Error::denied());
     }
     lock_tree(c, owner).await?;
-    let expiry = policy::timestamp(&body["conditions"]["expires_at"])?;
+    let expiry = persisted_expiry(&body["conditions"]["expires_at"])?;
     if expiry > Utc::now() + chrono::Duration::days(365) {
         return Err(Error::invalid("API Key lifetime exceeds 365 days"));
     }
-    // PostgreSQL stores timestamps to microsecond precision. Truncate before
-    // checking the issuer's bound so the stored key cannot expire later.
-    let expiry = expiry.trunc_subsecs(6);
     let mut conditions = body["conditions"].clone();
     conditions["expires_at"] = json!(expiry);
     policy::validate_conditions(&conditions)?;
@@ -1353,7 +1357,7 @@ async fn create_grant(
             "Grant has no action for the selected resource kind",
         ));
     }
-    let expires = body.get("expires_at").map(policy::timestamp).transpose()?;
+    let expires = body.get("expires_at").map(persisted_expiry).transpose()?;
     if let Some(expiry) = expires {
         if expiry <= Utc::now() {
             return Err(Error::invalid("Grant is already expired"));
