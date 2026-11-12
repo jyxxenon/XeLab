@@ -5,6 +5,7 @@ use tokio_postgres::Row;
 
 struct TaskFixture {
     host: Fixture,
+    workflow: Uuid,
     task: Uuid,
     skill: Uuid,
     instance: Uuid,
@@ -100,6 +101,7 @@ impl TaskFixture {
             .credential;
         Some(Self {
             host,
+            workflow: contracts::id(&workflow, "id").unwrap(),
             task: contracts::id(&task, "id").unwrap(),
             skill,
             instance,
@@ -216,6 +218,99 @@ async fn postgres_task_broker_success_is_journaled_and_charged_once() {
     assert!(!crate::task_worker::run_once(&f.host.app).await.unwrap());
     assert_eq!(plugin.calls.load(Ordering::SeqCst), 1);
     server.abort();
+}
+
+#[tokio::test]
+async fn postgres_task_deadline_reconciles_while_another_call_is_held() {
+    let Some(f) = TaskFixture::new("none", false).await else {
+        return;
+    };
+    let gate = Arc::new(EchoGate::default());
+    let (plugin, server) = echo_with_gate(&f.host, f.instance, Some(gate.clone())).await;
+    let scenario = async {
+        gate.entered.notified().await;
+        let (status, task) = f
+            .host
+            .call(
+                "createTask",
+                &[],
+                json!({"workflow_id":f.workflow,"input":{"message":"due while another call is held"}}),
+                None,
+                "task-broker-submit-due",
+                None,
+            )
+            .await;
+        assert_eq!(status, 201, "{task}");
+        let due = contracts::id(&task, "id").unwrap();
+        let c = f.host.app.db.connect().await.unwrap();
+        assert_eq!(
+            c.execute(
+                "UPDATE tasks SET deadline_at=clock_timestamp()-interval '1 second' WHERE id=$1",
+                &[&due],
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        let expired = wait_for_task(&f.host, due, "failed").await;
+        assert_eq!(expired["error"]["code"], "DEADLINE_EXCEEDED");
+        assert_eq!(
+            c.query_one(
+                "SELECT count(*) FROM attempts a JOIN task_steps s ON s.id=a.step_id WHERE s.task_id=$1",
+                &[&due],
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+            0
+        );
+
+        let held = f.journal().await;
+        assert_eq!(held.get::<_, String>("call_state"), "running");
+        assert_eq!(held.get::<_, String>("attempt_state"), "running");
+        assert_eq!(held.get::<_, String>("reservation_status"), "active");
+        assert_eq!(plugin.calls.load(Ordering::SeqCst), 1);
+
+        gate.release.notify_one();
+        let completed = wait_for_task(&f.host, f.task, "succeeded").await;
+        assert_eq!(completed["output"], json!({"echo":{"message":"proxied"}}));
+        let settled = f.journal().await;
+        assert_eq!(settled.get::<_, String>("call_state"), "succeeded");
+        assert_eq!(settled.get::<_, String>("reservation_status"), "released");
+        assert_eq!(plugin.calls.load(Ordering::SeqCst), 1);
+    };
+    let result = tokio::time::timeout(Duration::from_secs(15), async {
+        tokio::select! {
+            () = crate::task_worker::run(f.host.app.clone()) => panic!("Task worker stopped early"),
+            () = scenario => (),
+        }
+    })
+    .await;
+    server.abort();
+    let _ = server.await;
+    result.expect("A held capability Call must not block Task deadline reconciliation");
+}
+
+async fn wait_for_task(fixture: &Fixture, task: Uuid, expected: &str) -> Value {
+    loop {
+        let (status, value) = fixture
+            .call(
+                "getTask",
+                &[("task_id", task)],
+                Value::Null,
+                None,
+                "task-broker-poll",
+                None,
+            )
+            .await;
+        assert_eq!(status, 200, "{value}");
+        match value["state"].as_str() {
+            Some(state) if state == expected => return value,
+            Some("queued" | "running") => (),
+            _ => panic!("Unexpected Task state while waiting for {expected}: {value}"),
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 #[tokio::test]

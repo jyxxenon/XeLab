@@ -23,6 +23,15 @@ const STEP_QUERY: &str = "SELECT t.*,w.spec,w.owner_id AS workflow_owner_id,
     e.expires_at AS delegation_expires_at,e.run_as AS delegation_run_as,e.maximum_rules
     FROM tasks t JOIN task_steps s ON s.task_id=t.id JOIN workflows w ON w.id=t.workflow_id
     JOIN execution_delegations e ON e.id=t.delegation_id";
+const IDLE_DEADLINE_DUE: &str = "t.admission IS NOT NULL
+    AND t.state IN ('queued','running','waiting_dependency') AND t.deadline_at<=statement_timestamp()
+    AND NOT EXISTS (
+        SELECT 1 FROM task_steps s WHERE s.task_id=t.id AND (
+            s.state IN ('running','unknown') OR EXISTS (
+                SELECT 1 FROM attempts a WHERE a.step_id=s.id AND a.state IN ('leased','running')
+            )
+        )
+    )";
 
 #[derive(Debug, Clone)]
 pub struct Lease {
@@ -677,7 +686,7 @@ pub async fn expire(tx: &Transaction<'_>) -> Result<bool> {
                 a.id AS attempt_id,a.state AS attempt_state,a.lease_expires_at,a.broker_call_id
          FROM attempts a JOIN task_steps s ON s.id=a.step_id JOIN tasks t ON t.id=s.task_id
          JOIN workflows w ON w.id=t.workflow_id
-         WHERE a.state IN ('leased','running') AND a.lease_expires_at<=clock_timestamp()
+         WHERE a.state IN ('leased','running') AND a.lease_expires_at<=statement_timestamp()
            AND s.state='running' AND s.fence=a.fence
          ORDER BY a.lease_expires_at,a.id LIMIT 1 FOR UPDATE OF t,s,a SKIP LOCKED",
             &[],
@@ -736,6 +745,38 @@ pub async fn expire(tx: &Transaction<'_>) -> Result<bool> {
         }
     }
     Ok(true)
+}
+
+/// Close a bounded batch of Tasks whose deadline elapsed without active or
+/// uncertain work. The existing step results and Broker ledger stay intact.
+pub async fn expire_idle(tx: &Transaction<'_>) -> Result<u64> {
+    db::auth_lock(tx, false).await?;
+    let select = format!(
+        "SELECT t.id FROM tasks t WHERE {IDLE_DEADLINE_DUE}
+         ORDER BY t.deadline_at,t.id LIMIT 16 FOR UPDATE OF t SKIP LOCKED"
+    );
+    let tasks: Vec<Uuid> = tx
+        .query(&select, &[])
+        .await?
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect();
+    if tasks.is_empty() {
+        return Ok(0);
+    }
+
+    // A claim or completion may have committed after selection took its
+    // snapshot. Recheck the Task and its steps under the acquired Task locks.
+    let update = format!(
+        "UPDATE tasks t SET state='failed',error=$2,revision=revision+1,updated_at=clock_timestamp()
+         WHERE t.id=ANY($1) AND {IDLE_DEADLINE_DUE}"
+    );
+    let error = Error::new(
+        "DEADLINE_EXCEEDED",
+        "Task deadline elapsed with no active step",
+        axum::http::StatusCode::GATEWAY_TIMEOUT,
+    );
+    Ok(tx.execute(&update, &[&tasks, &error.detail()]).await?)
 }
 
 async fn set_attempt(

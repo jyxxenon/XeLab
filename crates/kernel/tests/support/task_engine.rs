@@ -1,4 +1,4 @@
-use super::{request, Fixture};
+use super::{request, Fixture, WORKFLOWS};
 use axum::http::Method;
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
@@ -8,17 +8,33 @@ use uuid::Uuid;
 use xelab_kernel::{
     auth::{self, Auth, Resource},
     contracts,
-    task_engine::{begin, claim, complete, expire, renew, Lease, Outcome},
+    task_engine::{begin, claim, complete, expire, expire_idle, renew, Lease, Outcome},
 };
 
 struct EngineFixture {
     base: Fixture,
     auth: Auth,
+    workflow: Uuid,
     task: Uuid,
     skill: Uuid,
     deployment: Uuid,
     root: Uuid,
     follow_up: Uuid,
+}
+
+async fn submit_task(base: &Fixture, workflow: Uuid, key: &str) -> Uuid {
+    let task = request(
+        &base.router,
+        Method::POST,
+        "/api/platform/v1/tasks",
+        Some(&base.token),
+        Some(&json!({"workflow_id":workflow,"input":{"text":"hello"}})),
+        &[("idempotency-key", key)],
+    )
+    .await
+    .expect(201)
+    .body;
+    contracts::id(&task, "id").unwrap()
 }
 
 impl EngineFixture {
@@ -81,18 +97,8 @@ impl EngineFixture {
             .await
             .expect(201)
             .body;
-        let task = request(
-            &base.router,
-            Method::POST,
-            "/api/platform/v1/tasks",
-            Some(&base.token),
-            Some(&json!({"workflow_id": workflow["id"], "input": {"text": "hello"}})),
-            &[("idempotency-key", "engine-submit-task")],
-        )
-        .await
-        .expect(201)
-        .body;
-        let task = contracts::id(&task, "id").unwrap();
+        let workflow = contracts::id(&workflow, "id").unwrap();
+        let task = submit_task(&base, workflow, "engine-submit-task").await;
         let rows = conn
             .query(
                 "SELECT step_key,id FROM task_steps WHERE task_id=$1 ORDER BY step_key",
@@ -106,6 +112,7 @@ impl EngineFixture {
         Some(Self {
             base,
             auth: Auth::new(vec![55; 32]).unwrap(),
+            workflow,
             task,
             skill: contracts::id(&skill, "id").unwrap(),
             deployment,
@@ -169,6 +176,249 @@ async fn state(c: &impl GenericClient, fixture: &EngineFixture) -> (String, Stri
         .await
         .unwrap();
     (row.get(0), row.get(1), row.get(2))
+}
+
+async fn task_snapshots(c: &impl GenericClient) -> Vec<Value> {
+    c.query("SELECT to_jsonb(t) FROM tasks t ORDER BY id", &[])
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get(0))
+        .collect()
+}
+
+async fn deadline_history(c: &impl GenericClient) -> Value {
+    c.query_one(
+        "SELECT jsonb_build_object(
+            'steps',(SELECT jsonb_agg(to_jsonb(s) ORDER BY id) FROM task_steps s),
+            'attempts',(SELECT jsonb_agg(to_jsonb(a) ORDER BY id) FROM attempts a),
+            'outbox',(SELECT jsonb_agg(to_jsonb(o) ORDER BY id) FROM outbox o),
+            'calls',(SELECT count(*) FROM calls),
+            'reservations',(SELECT count(*) FROM reservations WHERE kind='call'))",
+        &[],
+    )
+    .await
+    .unwrap()
+    .get(0)
+}
+
+async fn reconcile_idle(c: &mut Client) -> u64 {
+    let tx = c.transaction().await.unwrap();
+    let updated = tokio::time::timeout(Duration::from_secs(3), expire_idle(&tx))
+        .await
+        .expect("Task deadline reconciliation must skip a locked candidate")
+        .unwrap();
+    tx.commit().await.unwrap();
+    updated
+}
+
+#[tokio::test]
+async fn postgres_task_deadline_fails_idle_parents_and_preserves_execution_history() {
+    let Some(fixture) = EngineFixture::new().await else {
+        return;
+    };
+    let lease = fixture.claim_one().await;
+    let mut conn = fixture.connect().await;
+    let tx = conn.transaction().await.unwrap();
+    begin(&tx, &fixture.auth, &lease).await.unwrap();
+    tx.commit().await.unwrap();
+    let tx = conn.transaction().await.unwrap();
+    complete(
+        &tx,
+        &fixture.auth,
+        &lease,
+        Outcome::Succeeded(json!({"message":"completed before overall deadline"})),
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(
+        state(&conn, &fixture).await,
+        ("running".into(), "succeeded".into(), "ready".into())
+    );
+    assert_eq!(outbox_count(&conn, fixture.root).await, 1);
+
+    let queued = submit_task(&fixture.base, fixture.workflow, "idle-queued").await;
+    let waiting = submit_task(&fixture.base, fixture.workflow, "idle-waiting").await;
+    conn.execute(
+        "UPDATE tasks SET state='waiting_dependency' WHERE id=$1",
+        &[&waiting],
+    )
+    .await
+    .unwrap();
+    let uri = format!("{WORKFLOWS}/{}", fixture.workflow);
+    let workflow = fixture
+        .base
+        .read(&fixture.base.token, &uri)
+        .await
+        .expect(200);
+    fixture
+        .base
+        .archive(&uri, "idle-archive-workflow", workflow.etag.as_deref())
+        .await
+        .expect(204);
+    assert_eq!(
+        conn.execute(
+            "UPDATE tasks SET deadline_at=clock_timestamp()-interval '1 second' WHERE id=ANY($1)",
+            &[&[fixture.task, queued, waiting].as_slice()],
+        )
+        .await
+        .unwrap(),
+        3
+    );
+    let before = task_snapshots(&conn).await;
+    let history = deadline_history(&conn).await;
+    let tx = conn.transaction().await.unwrap();
+    assert_eq!(expire_idle(&tx).await.unwrap(), 3);
+    assert_eq!(
+        state(&tx, &fixture).await,
+        ("failed".into(), "succeeded".into(), "ready".into())
+    );
+    assert_eq!(deadline_history(&tx).await, history);
+    tx.rollback().await.unwrap();
+    assert_eq!(task_snapshots(&conn).await, before);
+    assert_eq!(deadline_history(&conn).await, history);
+
+    assert_eq!(reconcile_idle(&mut conn).await, 3);
+    for old in &before {
+        let uri = format!(
+            "/api/platform/v1/tasks/{}",
+            contracts::id(old, "id").unwrap()
+        );
+        let task = fixture
+            .base
+            .read(&fixture.base.token, &uri)
+            .await
+            .expect(200)
+            .body;
+        assert_eq!(task["state"], "failed");
+        assert_eq!(task["error"]["code"], "DEADLINE_EXCEEDED");
+        assert_eq!(task["revision"], old["revision"].as_i64().unwrap() + 1);
+        for field in ["workflow_id", "delegation_id", "input", "output"] {
+            assert_eq!(task[field], old[field], "{field}");
+        }
+    }
+    assert_eq!(deadline_history(&conn).await, history);
+    let settled = task_snapshots(&conn).await;
+    assert_eq!(reconcile_idle(&mut conn).await, 0);
+    assert_eq!(task_snapshots(&conn).await, settled);
+    fixture.assert_no_claim().await;
+}
+
+#[tokio::test]
+async fn postgres_task_deadline_leaves_live_and_noneligible_work_untouched() {
+    let Some(fixture) = EngineFixture::new().await else {
+        return;
+    };
+    let lease = fixture.claim_one().await;
+    let mut conn = fixture.connect().await;
+    for (key, state, step_state) in [
+        ("future", "queued", None),
+        ("legacy", "queued", None),
+        ("paused", "paused_authorization", None),
+        ("cancel-requested", "cancel_requested", None),
+        ("unknown", "unknown", Some("unknown")),
+        ("canceled", "canceled", Some("canceled")),
+        ("running-step", "running", Some("running")),
+        ("unknown-step", "running", Some("unknown")),
+    ] {
+        let task = submit_task(&fixture.base, fixture.workflow, key).await;
+        conn.execute(
+            "UPDATE tasks SET state=$2,admission=CASE WHEN $3 THEN NULL ELSE admission END,
+                deadline_at=clock_timestamp()+CASE WHEN $4 THEN interval '1 hour' ELSE interval '-1 second' END
+             WHERE id=$1",
+            &[&task, &state, &(key == "legacy"), &(key == "future")],
+        )
+        .await
+        .unwrap();
+        if let Some(step_state) = step_state {
+            conn.execute(
+                "UPDATE task_steps SET state=$2 WHERE task_id=$1 AND step_key='echo'",
+                &[&task, &step_state],
+            )
+            .await
+            .unwrap();
+        }
+    }
+    conn.execute(
+        "UPDATE tasks SET deadline_at=clock_timestamp()-interval '1 second' WHERE id=$1",
+        &[&lease.task_id],
+    )
+    .await
+    .unwrap();
+    conn.execute(
+        "UPDATE attempts SET lease_expires_at=clock_timestamp()+interval '1 hour' WHERE id=$1",
+        &[&lease.attempt_id],
+    )
+    .await
+    .unwrap();
+    let before = task_snapshots(&conn).await;
+    let history = deadline_history(&conn).await;
+    assert_eq!(reconcile_idle(&mut conn).await, 0);
+    assert_eq!(task_snapshots(&conn).await, before);
+    assert_eq!(deadline_history(&conn).await, history);
+
+    // Exercise the active-attempt guard independently of the running-step guard.
+    conn.execute(
+        "UPDATE task_steps SET state='ready' WHERE id=$1",
+        &[&lease.step_id],
+    )
+    .await
+    .unwrap();
+    let history = deadline_history(&conn).await;
+    assert_eq!(reconcile_idle(&mut conn).await, 0);
+    assert_eq!(task_snapshots(&conn).await, before);
+    assert_eq!(deadline_history(&conn).await, history);
+}
+
+#[tokio::test]
+async fn postgres_task_deadline_reconciliation_bounds_batch_and_skips_locked_task() {
+    let Some(fixture) = EngineFixture::new().await else {
+        return;
+    };
+    for index in 0..17 {
+        submit_task(
+            &fixture.base,
+            fixture.workflow,
+            &format!("idle-batch-{index}"),
+        )
+        .await;
+    }
+    let mut holder = fixture.connect().await;
+    let mut conn = fixture.connect().await;
+    assert_eq!(
+        conn.execute(
+            "UPDATE tasks SET deadline_at=clock_timestamp()-CASE
+                WHEN id=$1 THEN interval '2 seconds' ELSE interval '1 second' END",
+            &[&fixture.task],
+        )
+        .await
+        .unwrap(),
+        18
+    );
+    let lock = holder.transaction().await.unwrap();
+    lock.query_one(
+        "SELECT id FROM tasks WHERE id=$1 FOR UPDATE",
+        &[&fixture.task],
+    )
+    .await
+    .unwrap();
+    let history = deadline_history(&conn).await;
+
+    assert_eq!(reconcile_idle(&mut conn).await, 16);
+    assert_eq!(reconcile_idle(&mut conn).await, 1);
+    assert_eq!(reconcile_idle(&mut conn).await, 0);
+    assert_eq!(state(&conn, &fixture).await.0, "queued");
+    lock.rollback().await.unwrap();
+    assert_eq!(reconcile_idle(&mut conn).await, 1);
+    assert_eq!(reconcile_idle(&mut conn).await, 0);
+
+    let tasks = task_snapshots(&conn).await;
+    assert_eq!(tasks.len(), 18);
+    assert!(tasks.iter().all(|task| task["state"] == "failed"
+        && task["revision"] == 2
+        && task["error"]["code"] == "DEADLINE_EXCEEDED"));
+    assert_eq!(deadline_history(&conn).await, history);
 }
 
 #[tokio::test]
