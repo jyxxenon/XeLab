@@ -25,6 +25,17 @@ xelab-artifact-v1
 
 先验证镜像摘要，再在不执行镜像的情况下读取清单并验证签名，之后才可批准安装。清单中的发布者、插件与版本必须与签名信封一致。
 
+## 本地制品检查
+
+开发者可用 `xelabctl validate-artifact` 检查已准备好的目录、签名安装请求与发布者公钥。目录应包含与镜像一致的 `xelab/plugin.json` 及相应契约文件，公钥由独立渠道取得。打包和签名步骤见[内核运行指南](../../crates/kernel/README.md)。
+
+```sh
+xelabctl validate-artifact --artifact-root examples/generated \
+  --install-request ./install.json --publisher-key ./publisher.pub.pem
+```
+
+命令复用内核的安装请求、签名、普通插件清单和 RPC／HTTP 契约校验，可由普通用户离线运行。成功时输出清单原始字节的摘要和签名绑定的镜像摘要。输出中的 `image_content_verified` 为 `false`，安装时仍由内核核对 OCI 内容及发布者信任状态。
+
 ## 信任变更
 
 撤销发布者阻止后续安装及升级；已有容器不会自动销毁，产生告警并等待明确处置。安装前进行恶意内容扫描、契约检查和配置安全检查；签名仅证明来源和完整性。

@@ -1,11 +1,14 @@
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 use std::{
+    fs::OpenOptions,
     io::{self, Read, Seek, SeekFrom},
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     time::Duration,
 };
 use xelab_kernel::{
+    artifact::Artifact,
     auth,
     config::{read_private, require_host_admin, Config},
     contracts::{openapi, strict_json},
@@ -40,6 +43,18 @@ enum Cmd {
     ValidateConfig {
         #[arg(long)]
         config: PathBuf,
+    },
+    /// Check staged manifest and contracts against a signed install request.
+    ValidateArtifact {
+        /// Local directory containing xelab/plugin.json and contract members.
+        #[arg(long)]
+        artifact_root: PathBuf,
+        /// The signed InstallRequest JSON from the artifact producer.
+        #[arg(long)]
+        install_request: PathBuf,
+        /// An independently obtained Ed25519 publisher public key in PEM format.
+        #[arg(long)]
+        publisher_key: PathBuf,
     },
     /// Read-only XFS project quota preflight; does not enable Volume APIs.
     StorageCheck {
@@ -129,19 +144,33 @@ async fn main() {
     }
 }
 fn read_body(path: &str, limit: usize) -> Result<Vec<u8>> {
-    let mut bytes = Vec::new();
     if path == "-" {
-        io::stdin().take(limit as u64 + 1).read_to_end(&mut bytes)?;
+        read_bounded(io::stdin(), limit)
     } else {
-        std::fs::File::open(path)?
-            .take(limit as u64 + 1)
-            .read_to_end(&mut bytes)?;
+        read_bounded(std::fs::File::open(path)?, limit)
     }
+}
+
+fn read_bounded(input: impl Read, limit: usize) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    input.take(limit as u64 + 1).read_to_end(&mut bytes)?;
     if bytes.len() > limit {
         return Err(Error::invalid("Input exceeds its limit"));
     }
     Ok(bytes)
 }
+
+fn read_artifact_input(path: &Path, limit: usize) -> Result<Vec<u8>> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(Error::invalid("Artifact inputs must be regular files"));
+    }
+    read_bounded(file, limit)
+}
+
 async fn run(args: Args) -> Result<()> {
     match args.command {
         Cmd::RecoverAccount {
@@ -175,6 +204,32 @@ async fn run(args: Args) -> Result<()> {
             println!(
                 "{}",
                 json!({"configuration":"valid","runtime_checked":false})
+            );
+        }
+        Cmd::ValidateArtifact {
+            artifact_root,
+            install_request,
+            publisher_key,
+        } => {
+            const MAX_REQUEST: usize = 1024 * 1024;
+            let request = strict_json(
+                &read_artifact_input(&install_request, MAX_REQUEST)?,
+                MAX_REQUEST,
+            )?;
+            let key = String::from_utf8(read_artifact_input(&publisher_key, 64 * 1024)?)
+                .map_err(|_| Error::invalid("Publisher public key is not UTF-8"))?;
+            let artifact = Artifact::inspect_files(&artifact_root, &request, &key)?;
+            println!(
+                "{}",
+                json!({
+                    "artifact_files": "valid",
+                    "publisher_id": artifact.manifest["publisher_id"],
+                    "plugin_id": artifact.manifest["plugin_id"],
+                    "version": artifact.manifest["version"],
+                    "manifest_digest": artifact.manifest_digest,
+                    "signed_image_digest": artifact.image_digest,
+                    "image_content_verified": false,
+                })
             );
         }
         Cmd::StorageCheck { config } => {

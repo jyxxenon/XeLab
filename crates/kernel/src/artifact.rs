@@ -68,7 +68,7 @@ pub fn read_image_file(root: &Path, relative: &str, maximum: usize) -> Result<Ve
     }
     let f = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(path)?;
     if !f.metadata()?.is_file() {
         return Err(Error::invalid("Artifact member must be a regular file"));
@@ -276,13 +276,29 @@ fn validate_profile_inner(manifest: &Value, allow_versioned: bool) -> Result<()>
 
 impl Artifact {
     pub async fn inspect(runtime: &Runtime, request: &Value, key: &str) -> Result<Self> {
-        validate("InstallRequest", request)?;
-        let image = string(request, "image")?;
-        let image_digest = image_ref(image)?.to_owned();
+        let (image, image_digest) = installation_image(request)?;
         // Host administrators import images into the dedicated namespace. No unbounded registry pull runs in the daemon.
-        runtime.verify_image(image, &image_digest).await?;
-        let root = runtime.mount_image(image, &image_digest).await?;
-        let raw = read_image_file(&root, "xelab/plugin.json", 1048576)?;
+        runtime.verify_image(image, image_digest).await?;
+        let root = runtime.mount_image(image, image_digest).await?;
+        Self::inspect_members(&root, request, key, image, image_digest)
+    }
+
+    /// Check staged files with the installation verifier. The caller supplies
+    /// the publisher key and the directory, so this establishes file and
+    /// signature consistency with the declared image digest only.
+    pub fn inspect_files(root: &Path, request: &Value, key: &str) -> Result<Self> {
+        let (image, image_digest) = installation_image(request)?;
+        Self::inspect_members(root, request, key, image, image_digest)
+    }
+
+    fn inspect_members(
+        root: &Path,
+        request: &Value,
+        key: &str,
+        image: &str,
+        image_digest: &str,
+    ) -> Result<Self> {
+        let raw = read_image_file(root, "xelab/plugin.json", 1048576)?;
         let manifest = strict_json(&raw, 1048576)?;
         if manifest["publisher_id"] != request["publisher_id"] {
             return Err(Error::invalid(
@@ -293,7 +309,7 @@ impl Artifact {
             key,
             string(request, "signature")?,
             &manifest,
-            &image_digest,
+            image_digest,
             &raw,
         )?;
         validate_profile(&manifest)?;
@@ -302,7 +318,7 @@ impl Artifact {
             .is_some_and(|routes| routes.iter().any(|route| route["kind"] == "http"))
         {
             Some(read_image_file(
-                &root,
+                root,
                 "xelab/http/openapi.json",
                 crate::plugin_http::MAXIMUM_CONTRACT_BYTES,
             )?)
@@ -321,7 +337,7 @@ impl Artifact {
                 ("semantics.json", ""),
             ] {
                 let bytes = read_image_file(
-                    &root,
+                    root,
                     &format!("xelab/contracts/{name}/{version}/{file}"),
                     1048576,
                 )?;
@@ -345,7 +361,7 @@ impl Artifact {
             manifest_digest: digest(&raw),
             manifest,
             raw,
-            image_digest,
+            image_digest: image_digest.to_owned(),
             http_contract,
         })
     }
@@ -363,6 +379,12 @@ impl Artifact {
         }
         validate_business(&self.manifest["config_schema"], &spec["config"])
     }
+}
+
+fn installation_image(request: &Value) -> Result<(&str, &str)> {
+    validate("InstallRequest", request)?;
+    let image = string(request, "image")?;
+    Ok((image, image_ref(image)?))
 }
 
 #[cfg(test)]
