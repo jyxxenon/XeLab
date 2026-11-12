@@ -178,21 +178,20 @@ class LoginBootstrapAudit:
         self.snapshot(page, label, "failure")
 
 
-class WindowOpenAudit:
-    """Read-only, bounded window.open diagnostics; never an acceptance gate."""
+class RequestTimeline:
+    """Bounded request lifecycle facts without URLs, payloads or headers."""
     limit = 32
 
-    def __init__(self, core, deployment, report):
-        self.core, self.report = core, report
-        self.paths = {f"/api/platform/v1/ui/contributions/{deployment}/echo_widget": "source",
-                      f"/api/platform/v1/ui/contributions/{deployment}/echo_window": "target"}
+    def __init__(self, core):
+        self.core = core
         self.requests, self.started, self.active = {}, None, False
 
-    def start(self):
+    def begin(self, observation, field):
         self.started, self.active = time.monotonic(), True
         self.requests.clear()
-        self.observation = {"stage": "window_open_click", "metadata_requests": [], "dropped_requests": 0}
-        self.report["window_open_observation"] = self.observation
+        self.observation = observation
+        self.records = observation[field] = []
+        observation["dropped_requests"] = 0
 
     def observe(self, event, value):
         try:
@@ -213,8 +212,10 @@ class WindowOpenAudit:
         if not self.active or request in self.requests:
             return
         parsed = urllib.parse.urlsplit(request.url)
-        role = self.paths.get(parsed.path)
-        if request.method != "GET" or url_origin(request.url) != self.core or role is None or parsed.query:
+        if f"{parsed.scheme}://{parsed.netloc}" != self.core or parsed.query or parsed.fragment:
+            return
+        role = self.request_role(request.method, parsed.path)
+        if role is None:
             return
         if len(self.requests) >= self.limit:
             self.observation["dropped_requests"] = min(self.observation["dropped_requests"] + 1, 65535)
@@ -222,7 +223,7 @@ class WindowOpenAudit:
         state = {"role": role, "start_ms": self.elapsed(), "response_ms": None, "finished_ms": None,
                  "failed_ms": None, "status": None, "failure_category": None}
         self.requests[request] = state
-        self.observation["metadata_requests"].append(state)
+        self.records.append(state)
 
     def response(self, response):
         state = self.requests.get(response.request) if self.active else None
@@ -237,6 +238,27 @@ class WindowOpenAudit:
             state[key] = self.elapsed()
             if failed:
                 state["failure_category"] = selected_failure_category(request.failure)
+
+    def end(self):
+        self.observation["elapsed_ms"] = self.elapsed()
+        self.active = False
+
+
+class WindowOpenAudit(RequestTimeline):
+    """Read-only, bounded window.open diagnostics; never an acceptance gate."""
+    def __init__(self, core, deployment, report):
+        super().__init__(core)
+        self.report = report
+        self.paths = {f"/api/platform/v1/ui/contributions/{deployment}/echo_widget": "source",
+                      f"/api/platform/v1/ui/contributions/{deployment}/echo_window": "target"}
+
+    def start(self):
+        observation = {"stage": "window_open_click"}
+        self.begin(observation, "metadata_requests")
+        self.report["window_open_observation"] = observation
+
+    def request_role(self, method, path):
+        return self.paths.get(path) if method == "GET" else None
 
     def snapshot(self, widget):
         snapshot = {"dom_available": False}
@@ -277,9 +299,81 @@ class WindowOpenAudit:
         except Exception as error:
             snapshot["diagnostic_error_bucket"] = error_bucket(error)
 
-    def end(self):
-        self.observation["elapsed_ms"] = self.elapsed()
-        self.active = False
+
+class SkillDeliveryAudit(RequestTimeline):
+    """Observe iframe delivery without changing the selected business call."""
+    labels = ("window_bridge_calls_real_http_skill", "valid_call_after_replay_rejection",
+              "widget_bridge_calls_real_http_skill", "limited_child_bridge_call_before_withdrawal")
+    stages = ("fill", "click", "wait_for_result", "verify_result", "settle_observers", "complete")
+
+    def __init__(self, core, deployment, skill, report):
+        super().__init__(core)
+        self.report = report
+        self.invoke_path = f"/api/platform/v1/skills/{skill}/calls"
+        contribution_prefix = f"/api/platform/v1/ui/contributions/{deployment}/"
+        self.contribution_paths = {contribution_prefix + "echo_window", contribution_prefix + "echo_widget"}
+
+    def start(self, label):
+        observation = {"label": label if label in self.labels else "other",
+                       "stage": "fill", "stages_ms": {"fill": 0}}
+        self.begin(observation, "network_requests")
+        records = self.report.setdefault("skill_delivery", [])
+        records.append(observation)
+        del records[:-len(self.labels)]
+
+    def mark(self, stage):
+        if self.active and stage in self.stages:
+            self.observation["stage"] = stage
+            self.observation["stages_ms"][stage] = self.elapsed()
+
+    def request_role(self, method, path):
+        if method == "POST" and path == self.invoke_path:
+            return "invoke_skill"
+        if method != "GET":
+            return None
+        if path in self.contribution_paths:
+            return "contribution"
+        prefix = "/api/platform/v1/calls/"
+        if path.startswith(prefix):
+            identifier = path.removeprefix(prefix)
+            try:
+                if str(uuid.UUID(identifier)) == identifier:
+                    return "get_call"
+            except ValueError:
+                pass
+        return None
+
+    def failure(self, frame, error):
+        self.observation["error_bucket"] = error_bucket(error)
+        snapshot = {"dom_available": False}
+        self.observation["frame_snapshot"] = snapshot
+        try:
+            snapshot["detached"] = frame.is_detached() is True
+            if snapshot["detached"]:
+                return
+            value = frame.locator("html").evaluate("""() => {
+              const state=document.querySelector('#skill-state') ?? document.querySelector('#state');
+              const text=state?.textContent || '';
+              const codes=['DEADLINE_EXCEEDED','CHANNEL_CLOSED','BACKEND_ERROR','PROTOCOL_ERROR',
+                'PERMISSION_DENIED','BINDING_UNAVAILABLE','RATE_LIMITED','UNAVAILABLE'];
+              const code=codes.find(code=>text.startsWith(code+':'));
+              const channel=document.querySelector('#state')?.textContent;
+              return {state_class:text==='Skill call completed.'?'completed':
+                  text==='Waiting for the actual Skill result…'?'waiting':!text?'empty':code||'other',
+                channel_ready:channel==='Approved channel ready.',
+                state_exists:!!state, call_disabled:document.querySelector('#call')?.disabled,
+                result_present:!!document.querySelector('#result')?.textContent,
+                document_visible:document.visibilityState==='visible'};
+            }""", timeout=1000)
+            labels = ("completed", "waiting", "empty", "DEADLINE_EXCEEDED", "CHANNEL_CLOSED",
+                      "BACKEND_ERROR", "PROTOCOL_ERROR", "PERMISSION_DENIED", "BINDING_UNAVAILABLE",
+                      "RATE_LIMITED", "UNAVAILABLE")
+            snapshot["dom_available"] = True
+            snapshot["state_class"] = value.get("state_class") if value.get("state_class") in labels else "other"
+            for key in ("channel_ready", "state_exists", "call_disabled", "result_present", "document_visible"):
+                snapshot[key] = value.get(key) if isinstance(value.get(key), bool) else None
+        except Exception as snapshot_error:
+            snapshot["diagnostic_error_bucket"] = error_bucket(snapshot_error)
 
 
 class SkillBodyAudit:
@@ -609,6 +703,11 @@ def run(config, report):
     calls = bodies.calls
     bootstrap = LoginBootstrapAudit(core, ui, reference, report)
     window_open = WindowOpenAudit(core, config["reference_deployment_id"], report)
+    skill_delivery = SkillDeliveryAudit(core, config["reference_deployment_id"], config["skill_id"], report)
+
+    def observe_delivery(event, value):
+        window_open.observe(event, value)
+        skill_delivery.observe(event, value)
 
     def observe_request(request, context_label=None):
         observed["active_request_observers"] += 1
@@ -677,10 +776,10 @@ def run(config, report):
         result.on("requestfailed", lambda request: bootstrap.terminal(request, label, True))
         result.on("requestfinished", bodies.finished)
         result.on("requestfailed", bodies.failed)
-        result.on("request", lambda request: window_open.observe("request", request))
-        result.on("response", lambda response: window_open.observe("response", response))
-        result.on("requestfinished", lambda request: window_open.observe("finished", request))
-        result.on("requestfailed", lambda request: window_open.observe("failed", request))
+        result.on("request", lambda request: observe_delivery("request", request))
+        result.on("response", lambda response: observe_delivery("response", response))
+        result.on("requestfinished", lambda request: observe_delivery("finished", request))
+        result.on("requestfailed", lambda request: observe_delivery("failed", request))
         result.on("page", lambda page: page.on("pageerror", lambda _: observed.__setitem__("page_errors", observed["page_errors"] + 1)))
         return result
 
@@ -761,12 +860,24 @@ def run(config, report):
     def echo(frame, message, label, expected_successes):
         report["step"] = label
         bodies.expect(expected_successes)
-        frame.locator("#message").fill(message)
-        frame.locator("#call").click()
-        wait_for_reference_skill(frame)
-        require(frame.locator("#result").inner_text() == message, label)
-        require(frame.locator("img").count() == 0, label + "_text_not_html")
-        wait_for_observers(page, observed, bodies)
+        skill_delivery.start(label)
+        try:
+            frame.locator("#message").fill(message)
+            skill_delivery.mark("click")
+            frame.locator("#call").click()
+            skill_delivery.mark("wait_for_result")
+            wait_for_reference_skill(frame)
+            skill_delivery.mark("verify_result")
+            require(frame.locator("#result").inner_text() == message, label)
+            require(frame.locator("img").count() == 0, label + "_text_not_html")
+            skill_delivery.mark("settle_observers")
+            wait_for_observers(page, observed, bodies)
+            skill_delivery.mark("complete")
+        except Exception as error:
+            skill_delivery.failure(frame, error)
+            raise
+        finally:
+            skill_delivery.end()
 
     def fetch(page, path, method="GET", body=None):
         return page.evaluate(FETCH, {"core": core, "client": config["client_id"], "path": path, "method": method, "body": body, "key": str(uuid.uuid4())})
