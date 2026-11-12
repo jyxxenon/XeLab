@@ -280,19 +280,36 @@ class OverviewWindow(unittest.TestCase):
         self.assertEqual(self.count(INSTANCES_PATH), 2)
         self.assertEqual(self.count(NODE_PATH), 1)
 
-    def test_pagination_failure_keeps_loaded_items(self):
+    def test_pagination_retry_preserves_items_and_clears_the_page_error(self):
         self.deployment_pages = [{"items": [deployment_item()]},
                                  {"items": [deployment_item(identifier=DEPLOYMENT_2, name="second page")]}]
         self.open()
         window = self.open_overview()
         deployments = self.section(window, "deployments")
+        more = deployments.get_by_role("button", name="加载下一页部署")
+        errors = deployments.locator(".state")
         self.overview_status[DEPLOYMENTS_PATH] = (403, "PERMISSION_DENIED")
-        deployments.get_by_role("button", name="加载下一页部署").click()
+        more.click()
         expect(deployments.locator(".state[data-kind=denied]")).to_be_visible()
         self.assertEqual(deployments.locator(".card").count(), 1)
         self.assertIn("fixture deployment", deployments.inner_text())
         self.assertIn("下一页读取失败；已加载内容保持不变。", deployments.locator(".overview-page-hint").inner_text())
-        expect(deployments.get_by_role("button", name="加载下一页部署")).to_be_enabled()
+        expect(more).to_be_enabled()
+
+        self.overview_status[DEPLOYMENTS_PATH] = (503, "NOT_READY")
+        more.click()
+        expect(deployments.locator(".state[data-kind=unavailable]")).to_be_visible()
+        expect(more).to_be_enabled()
+        failed_states = errors.count()
+
+        del self.overview_status[DEPLOYMENTS_PATH]
+        more.click()
+        expect(deployments.locator(".card h3")).to_have_text(["fixture deployment", "second page"])
+        expect(more).to_be_hidden()
+        expect(deployments.locator(".overview-page-hint")).to_have_text("已加载全部可见项目。")
+        expect(errors).to_have_count(0)
+        self.assertEqual(failed_states, 1, "Only the most recent page failure should remain")
+        self.assertEqual(self.count(DEPLOYMENTS_PATH), 4)
 
     def test_section_and_window_refresh_isolation(self):
         self.open()
