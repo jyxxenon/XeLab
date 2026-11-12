@@ -106,31 +106,31 @@
     {
       "name": "data.object.put",
       "version": "1.0.0",
-      "digest": "sha256:9d27347d98dd9589bcddb05c1b8a1f4aabd0fe3c7ab182ec55c0ab39e19e9931",
+      "digest": "sha256:efbe1b0c1188f1d2c0bdbda74c32c314ade6476467ff0c858a392fba4fa26fbc",
       "folder": "../object-storage/contracts/object-put"
     },
     {
       "name": "data.object.list",
       "version": "1.0.0",
-      "digest": "sha256:569600611e989d0c08f0cfc9c9d4a3defda875a8af8d04cb28bdef780f351b82",
+      "digest": "sha256:4ae27364cfd7b9b51323224af5e50277cd42d24ea43df09837c77e60fab5bb39",
       "folder": "../object-storage/contracts/object-list"
     },
     {
       "name": "data.object.stat",
       "version": "1.0.0",
-      "digest": "sha256:636466d362b1c7c0651af1011d18f3a742481d6749626dfc240584d13b4d9646",
+      "digest": "sha256:c63590fb048ffc6c4fb0c35bf7203d9f7da600286bfc092eafb62feaa3a28d92",
       "folder": "../object-storage/contracts/object-stat"
     },
     {
       "name": "data.object.export",
       "version": "1.0.0",
-      "digest": "sha256:973bd38ab2d05dc99640032e72d9c028af0f7400dd7b3c172f495334ad3a410c",
+      "digest": "sha256:19277fe085b821081727a4202c98ea151102ccfdde7e448d79cfeb2b46046538",
       "folder": "../object-storage/contracts/object-export"
     },
     {
       "name": "data.object.delete",
       "version": "1.0.0",
-      "digest": "sha256:b4cb921fec6a9572a23570e6179d1bb3f63c74cc9d45498ccb57546a057f8471",
+      "digest": "sha256:3e7f59a85c14c1e25546d79b3eabcf80d5b348b7988d522567a5d8f0b31a697b",
       "folder": "../object-storage/contracts/object-delete"
     },
     {

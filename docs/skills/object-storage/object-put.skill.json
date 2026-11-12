@@ -12,7 +12,7 @@
         "minLength": 1,
         "maxLength": 1024,
         "description": "NFC逻辑key，UTF8<=1024字节；拒绝首尾斜线/空段/dot段/控制符/反斜线，不作URL decode",
-        "pattern": "^[^\u0000-\u001f\\\\]+$",
+        "pattern": "^[^\\x00-\\x1F\\x7F\\\\]+$",
         "example": "reports/example.txt"
       },
       "blob_id": {
@@ -118,7 +118,7 @@
             "minLength": 1,
             "maxLength": 1024,
             "description": "NFC逻辑key，UTF8<=1024字节；拒绝首尾斜线/空段/dot段/控制符/反斜线，不作URL decode",
-            "pattern": "^[^\u0000-\u001f\\\\]+$",
+            "pattern": "^[^\\x00-\\x1F\\x7F\\\\]+$",
             "example": "reports/example.txt"
           },
           "revision": {
@@ -187,7 +187,7 @@
     "contract": {
       "name": "data.object.put",
       "version": "1.0.0",
-      "schema_digest": "sha256:9d27347d98dd9589bcddb05c1b8a1f4aabd0fe3c7ab182ec55c0ab39e19e9931"
+      "schema_digest": "sha256:efbe1b0c1188f1d2c0bdbda74c32c314ade6476467ff0c858a392fba4fa26fbc"
     }
   },
   "mapping": "identity",

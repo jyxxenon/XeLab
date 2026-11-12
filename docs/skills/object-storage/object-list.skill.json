@@ -62,7 +62,7 @@
               "minLength": 1,
               "maxLength": 1024,
               "description": "NFC逻辑key，UTF8<=1024字节；拒绝首尾斜线/空段/dot段/控制符/反斜线，不作URL decode",
-              "pattern": "^[^\u0000-\u001f\\\\]+$",
+              "pattern": "^[^\\x00-\\x1F\\x7F\\\\]+$",
               "example": "reports/example.txt"
             },
             "revision": {
@@ -148,7 +148,7 @@
     "contract": {
       "name": "data.object.list",
       "version": "1.0.0",
-      "schema_digest": "sha256:569600611e989d0c08f0cfc9c9d4a3defda875a8af8d04cb28bdef780f351b82"
+      "schema_digest": "sha256:4ae27364cfd7b9b51323224af5e50277cd42d24ea43df09837c77e60fab5bb39"
     }
   },
   "mapping": "identity",

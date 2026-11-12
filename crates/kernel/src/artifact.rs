@@ -602,6 +602,17 @@ mod tests {
         );
         manifest["concurrency"]["max_queue_requests"] = json!(0);
         validate_runtime_profile(&manifest).unwrap();
+        let key_schema = &manifest["capabilities"][0]["input_schema"]["properties"]["key"];
+        assert!(!key_schema["pattern"].as_str().unwrap().contains('\0'));
+        validate_business(key_schema, &json!("reports/报告.txt")).unwrap();
+        for key in [
+            "reports\0/file",
+            "reports/\u{1f}",
+            "reports/\u{7f}",
+            "reports\\file",
+        ] {
+            assert!(validate_business(key_schema, &json!(key)).is_err());
+        }
         assert_eq!(
             validate_profile(&manifest).unwrap_err().message,
             "Unsupported plugin profile"

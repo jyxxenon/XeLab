@@ -26,7 +26,7 @@
           "minLength": 1,
           "maxLength": 1024,
           "description": "NFC逻辑key，UTF8<=1024字节；拒绝首尾斜线/空段/dot段/控制符/反斜线，不作URL decode",
-          "pattern": "^[^\u0000-\u001f\\\\]+$",
+          "pattern": "^[^\\x00-\\x1F\\x7F\\\\]+$",
           "example": "reports/example.txt"
         },
         "revision": {
