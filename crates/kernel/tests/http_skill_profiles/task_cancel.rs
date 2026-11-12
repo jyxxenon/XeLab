@@ -1,9 +1,40 @@
 use super::{api, process_identity, process_start, register, wait_ready, HOLD};
 use axum::Router;
 use serde_json::{json, Value};
-use std::time::Duration;
+use std::{
+    fs::OpenOptions,
+    io::{self, Read},
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    path::{Path, PathBuf},
+    time::Duration,
+};
 use uuid::Uuid;
 use xelab_kernel::{api::App, contracts};
+
+fn hold_received(path: &Path, call: Uuid) -> io::Result<bool> {
+    let mut receipt = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(receipt) => receipt,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let mut bytes = [0; 36];
+    let meta = receipt.metadata()?;
+    if !meta.is_file()
+        || meta.len() != bytes.len() as u64
+        || meta.permissions().mode() & 0o777 != 0o600
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid HTTP hold receipt",
+        ));
+    }
+    receipt.read_exact(&mut bytes)?;
+    Ok(bytes.as_slice() == call.hyphenated().encode_lower(&mut [0; 36]).as_bytes())
+}
 
 pub(crate) async fn cancel_hold_task(
     router: &Router,
@@ -54,6 +85,7 @@ pub(crate) async fn cancel_hold_task(
         .unwrap()
         .get(0);
     let (pid, process_started) = process_identity(app, instance).await;
+    let receipt = PathBuf::from(format!("/proc/{pid}/root/tmp/xelab-http-hold-receipt"));
     let calls_before: i64 = c
         .query_one("SELECT count(*) FROM calls", &[])
         .await
@@ -91,13 +123,19 @@ pub(crate) async fn cancel_hold_task(
                 assert_eq!(row.get::<_, Uuid>("provider_instance_id"), instance);
                 assert_eq!(row.get::<_, Uuid>("skill_id"), skill);
                 assert_eq!(row.get::<_, Value>("http_binding")["path"], HOLD);
-                break (row.get::<_, Uuid>("id"), row.get::<_, i64>("revision"));
+                let call: Uuid = row.get("id");
+                assert_eq!(process_start(pid).as_ref(), Some(&process_started));
+                if hold_received(&receipt, call)
+                    .expect("Read the HTTP fixture's private hold receipt")
+                {
+                    break (call, row.get::<_, i64>("revision"));
+                }
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .expect("The HTTP hold Task did not admit a Call with a physical reservation");
+    .expect("The real HTTP workload did not receive the Task's admitted hold Call");
     assert_eq!(process_start(pid).as_ref(), Some(&process_started));
     let (status, pending) = api(
         router,
