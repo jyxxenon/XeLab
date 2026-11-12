@@ -270,7 +270,7 @@ class OverviewWindow(unittest.TestCase):
         self.section(window, "deployments").get_by_role("button", name="刷新部署").click()
         self.page.wait_for_function("document.querySelectorAll('.overview-section[data-section=deployments] .card').length > 0")
         self.assertEqual((self.count(NODE_PATH), self.count(DEPLOYMENTS_PATH), self.count(INSTANCES_PATH)), (2, 2, 1))
-        window.locator(".toolbar").get_by_role("button", name="刷新", exact=True).click()
+        window.locator(".window-toolbar").get_by_role("button", name="刷新总览", exact=True).click()
         self.page.wait_for_function("document.querySelectorAll('.overview-section[data-section=instances] .card').length > 0")
         self.assertEqual((self.count(NODE_PATH), self.count(DEPLOYMENTS_PATH), self.count(INSTANCES_PATH)), (3, 3, 2))
 
