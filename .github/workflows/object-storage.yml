@@ -52,11 +52,6 @@ jobs:
             -f examples/object-storage/Dockerfile -t docker.io/xelab-ci/object-storage:acceptance .
           docker build --platform linux/amd64 --target conformance \
             -f examples/object-storage/Dockerfile -t xelab-object-storage-rpc:acceptance .
-          fixture=examples/object-storage/generated/kernel
-          python3 examples/object-storage/build_artifact.py --disable-queue --output "$fixture" \
-            --publisher-id 00000000-0000-4000-8000-000000000001
-          docker build --platform linux/amd64 --target release --build-arg "ARTIFACT_DIR=$fixture" \
-            -f examples/object-storage/Dockerfile -t docker.io/xelab-ci/object-storage:kernel-fixture .
       - name: Test mutual TLS and delegated Blob transport without external networking
         run: |
           docker run --rm --pull never --network none --read-only --cap-drop ALL \
@@ -73,23 +68,19 @@ jobs:
             rm -rf -- "$private"
           }
           trap cleanup EXIT
-          import_image() {
-            local tag=$1 record media digest
-            docker save "$tag" -o "$private/image.tar"
-            sudo ctr -n xelab-ci images import "$private/image.tar"
-            rm -- "$private/image.tar"
-            record=$(sudo ctr -n xelab-ci images list | awk -v tag="$tag" '$1 == tag {print $2,$3}')
-            read -r media digest <<< "$record"
-            if [[ ! "$digest" =~ ^sha256:[a-f0-9]{64}$ || ( "$media" != application/vnd.oci.image.manifest.v1+json && "$media" != application/vnd.docker.distribution.manifest.v2+json ) ]]; then
-              echo 'Expected a platform-specific OCI manifest' >&2
-              exit 1
-            fi
-            image="${tag%:*}@$digest"
-            sudo ctr -n xelab-ci images tag "$tag" "$image"
-          }
-          import_image docker.io/xelab-ci/object-storage:kernel-fixture
+          tag=docker.io/xelab-ci/object-storage:acceptance
+          docker save "$tag" -o "$private/image.tar"
+          sudo ctr -n xelab-ci images import "$private/image.tar"
+          rm -- "$private/image.tar"
+          record=$(sudo ctr -n xelab-ci images list | awk -v tag="$tag" '$1 == tag {print $2,$3}')
+          read -r media digest <<< "$record"
+          if [[ ! "$digest" =~ ^sha256:[a-f0-9]{64}$ || ( "$media" != application/vnd.oci.image.manifest.v1+json && "$media" != application/vnd.docker.distribution.manifest.v2+json ) ]]; then
+            echo 'Expected a platform-specific OCI manifest' >&2
+            exit 1
+          fi
+          image="${tag%:*}@$digest"
+          sudo ctr -n xelab-ci images tag "$tag" "$image"
           echo "XELAB_TEST_OBJECT_STORAGE_IMAGE=$image" >> "$GITHUB_ENV"
-          import_image docker.io/xelab-ci/object-storage:acceptance
           sudo ctr -n xelab-ci images mount "$image" "$private/rootfs"
           manifest="$private/rootfs/xelab/plugin.json"
           cmp "$manifest" examples/object-storage/generated/xelab/plugin.json
