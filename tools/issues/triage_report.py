@@ -14,7 +14,10 @@ SCHEMA = 1
 CREDENTIAL = re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|MERGE_TOKEN|AGENT_TOKEN", re.IGNORECASE)
 CLAIM_MARKERS = ("认领申请", "切片认领", "/claim")
 BRANCH_CLAIM = re.compile(r"将在独立分支[ \t]+`[^`\r\n]{1,200}`[ \t]+推进本[ \t]+Issue\b", re.IGNORECASE)
-STOPWORDS = {"a", "an", "and", "for", "of", "the", "to", "with", "in", "on", "is", "bug", "feature"}
+STOPWORDS = {
+    "a", "an", "and", "for", "of", "the", "to", "with", "in", "on", "is", "bug", "feature", "redacted",
+    "实现", "实现微插件", "实现普通", "微插件", "插件",
+}
 NOTE = ("Read-only report. Duplicate and claim matches are candidates for manual review, "
         "never definitive rulings; no issue state was changed.")
 
@@ -63,12 +66,13 @@ def safe_text(value):
 
 
 def normalize_title(title):
-    title = re.sub(r"^\[[^\]]*\]\s*", "", title)
+    title = re.sub(r"^(?:\[[^\]]*\]\s*)+", "", title)
     return " ".join(re.sub(r"[^\w]+", " ", title.casefold()).split())
 
 
 def keywords(title):
-    return {word for word in normalize_title(title).split() if word not in STOPWORDS and len(word) > 1}
+    cleaned = re.sub(r"^(?:\[[^\]]*\]\s*)+", "", title.casefold()).replace("<redacted>", " ")
+    return {word for word in re.findall(r"\w+(?:[.-]\w+)*", cleaned) if word not in STOPWORDS and len(word) > 1}
 
 
 def claim_candidates(api, number):
@@ -113,7 +117,7 @@ def build_report(api):
     for item in sorted((i for i in items if "pull_request" not in i), key=lambda i: i["number"]):
         labels = sorted(label["name"] for label in item.get("labels", []))
         status = next((label for label in labels if label.startswith("status:")), "no-status")
-        claims = claim_candidates(api, item["number"])
+        claims = [] if item.get("comments") == 0 else claim_candidates(api, item["number"])
         claim_counts = Counter(claim["user"].casefold() for claim in claims)
         issues.append({
             "number": item["number"],
