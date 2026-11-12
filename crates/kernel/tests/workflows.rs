@@ -5,6 +5,8 @@
 mod http_host;
 #[path = "support/task_admission.rs"]
 mod task_admission;
+#[path = "support/task_engine.rs"]
+mod task_engine;
 #[path = "support/workflow_authority_wait.rs"]
 mod workflow_authority_wait;
 

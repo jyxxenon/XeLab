@@ -139,6 +139,19 @@ pub(crate) async fn reset_rows(
         &[&unknown],
     )
     .await?;
+    crate::task_engine::reconcile_stopped(c).await?;
+    let paused = Error::new(
+        "PERMISSION_DENIED",
+        "Task execution authority was revoked during platform recovery",
+        axum::http::StatusCode::FORBIDDEN,
+    )
+    .detail();
+    c.execute(
+        "UPDATE tasks SET state='paused_authorization',error=$1,revision=revision+1,
+                updated_at=clock_timestamp() WHERE state IN ('queued','running','waiting_dependency')",
+        &[&paused],
+    )
+    .await?;
     c.execute("UPDATE operations SET state='failed',error=$1,revision=revision+1,updated_at=now() WHERE state IN ('pending','running','cancel_requested')",&[&unknown]).await?;
     c.execute("UPDATE reservations SET status='released'", &[])
         .await?;
@@ -210,6 +223,25 @@ pub(crate) async fn ensure_m4_authority_reset(c: &(impl GenericClient + Sync)) -
     if unsafe_state {
         return Err(Error::conflict(
             "Historical Host ticket or request binding survived recovery",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) async fn ensure_task_authority_reset(c: &(impl GenericClient + Sync)) -> Result<()> {
+    let active: bool = c
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM attempts WHERE state IN ('leased','running'))
+               OR EXISTS(SELECT 1 FROM tasks WHERE state IN ('queued','running','waiting_dependency'))
+               OR EXISTS(SELECT 1 FROM tasks t JOIN execution_delegations e ON e.id=t.delegation_id
+                         WHERE e.status='active')",
+            &[],
+        )
+        .await?
+        .get(0);
+    if active {
+        return Err(Error::conflict(
+            "Historical Task execution survived recovery",
         ));
     }
     Ok(())
