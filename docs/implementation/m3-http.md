@@ -139,6 +139,7 @@ PostgreSQL 组件需要隔离的 XELAB_TEST_DATABASE_URL。
 真实内核 OCI 入口为 [tests/http.rs](../../crates/kernel/tests/http.rs) 与
 [Kernel 工作流](../../.github/workflows/kernel.yml)，要求独占 containerd/runc、
 cgroups v2、网络及显式 XELAB_HTTP_OCI_TEST=1；不能用 Docker 组件探针代替。
+混合 OCI 测试镜像中由 `--include-rpc` 生成的签名 `hold` Skill 用于验收 Task 取消与工作负载停止。
 
 记录时，6 项不可变契约 PostgreSQL 测试（含缓存/篡改）、16 项 HTTP/网关、
 4 项元数据快照（含完整 4 MiB 原始契约）、3 项 Broker 监控/Schema 与 2 项 API 回归通过。

@@ -49,6 +49,9 @@ mod selectors;
 #[path = "broker_http_skill_stream_tests.rs"]
 mod skill_streams;
 
+#[path = "broker_http_task_tests.rs"]
+mod task_engine;
+
 async fn raw(
     router: &Router,
     method: &str,

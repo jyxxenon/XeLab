@@ -209,7 +209,7 @@ pub async fn initialize(
     Ok(())
 }
 
-// Caller must use a transaction. All writers lock budget before instance/reservation.
+// Caller must use a transaction. Lock the budget before deployment, instance and reservation.
 pub async fn reserve(c: &impl GenericClient, instance: Uuid) -> Result<()> {
     let budget = c
         .query_one("SELECT * FROM node_budget FOR UPDATE", &[])
@@ -219,13 +219,27 @@ pub async fn reserve(c: &impl GenericClient, instance: Uuid) -> Result<()> {
             "Admission is disabled during reconciliation",
         ));
     }
-    let row=c.query_one("SELECT i.*,d.spec,d.archived_at FROM instances i JOIN deployments d ON d.id=i.deployment_id WHERE i.id=$1 FOR UPDATE OF i,d",&[&instance]).await?;
-    let limits: Value = row.get("limits");
+    // Task Broker admission can hold the deployment while waiting for the instance.
+    let deployment = c
+        .query_one(
+            "SELECT id,spec,archived_at FROM deployments
+             WHERE id=(SELECT deployment_id FROM instances WHERE id=$1) FOR SHARE",
+            &[&instance],
+        )
+        .await?;
+    let deployment_id: Uuid = deployment.get("id");
+    let limits: Value = c
+        .query_one(
+            "SELECT limits FROM instances WHERE id=$1 AND deployment_id=$2 FOR UPDATE",
+            &[&instance, &deployment_id],
+        )
+        .await?
+        .get("limits");
     validate("ResourceLimits", &limits)?;
-    let spec: Value = row.get("spec");
+    let spec: Value = deployment.get("spec");
     if spec["limits"] != limits
         || spec["enabled"] != true
-        || row
+        || deployment
             .get::<_, Option<chrono::DateTime<chrono::Utc>>>("archived_at")
             .is_some()
     {

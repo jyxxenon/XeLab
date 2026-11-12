@@ -21,6 +21,8 @@ resolveUnknownStep 只在 unknown 状态允许。confirmed_succeeded 必须提�
 
 未确认的“认为失败”不是 confirmed_not_executed。不能通过修改 task.state 跳过核实。补偿动作是新的获授权步骤，也可能失败，不能宣称自动恢复原世界状态。
 
+同步 Broker 在发送业务请求前持久化派发标记。内核可以用已释放预留的关联 Call 核实标记仍为未派发的步骤。标记已经推进或旧账本缺少标记时，保持未知，等待可信结果。核实未执行后保留历史 Attempt，步骤进入失败状态，由 `retryTask` 显式复核原授权、依赖、整体期限和次数上限后再重新排队。
+
 ## 检查点
 
 插件先完整上传 Blob，再报告 checkpoint；记录 blob_id、data_schema_version、plugin_version、契约及提供者绑定。内核事务提交后 checkpoint 才有效。已引用 checkpoint 必须 pin，不因默认 Blob TTL 删除。
