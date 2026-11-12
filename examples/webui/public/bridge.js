@@ -276,7 +276,13 @@ export class BridgeHost {
     // This public narrowing constraint comes only from the core-attested UI
     // contribution. The frame cannot choose or overwrite another deployment.
     const body={input:message.params.input,idempotency_key:key,provider_deployment_id:this.#fixed.deployment_id};if(message.params.timeout_ms!==undefined)body.timeout_ms=message.params.timeout_ms;
-    const response=await this.#api.invoke('invokeSkill',{params:{skill_id:binding.skill_id},body,idempotencyKey:key,signal:this.#controller.signal});
+    // The kernel answers this request only after its own authorization reads
+    // and the business deadline, and the host still reads the original Call
+    // and rechecks the contribution afterwards. The HTTP wait must outlive
+    // the business deadline in the body; aborting there breaks the bridge
+    // exactly at body.timeout_ms whenever the pipeline is slower (#82).
+    const businessMs=(Number.isInteger(body.timeout_ms)&&body.timeout_ms>=100&&body.timeout_ms<=300000)?body.timeout_ms:120000;
+    const response=await this.#api.invoke('invokeSkill',{params:{skill_id:binding.skill_id},body,idempotencyKey:key,signal:this.#controller.signal,waitBudgetMs:businessMs+3*10000+2000});
     const result=response.data;
     const declaration=this.#fixed.spec.skill_bindings.find(value=>value.alias===binding.alias);
     if(!fields(result,['skill_id','skill_version','definition_digest','call'])||result.skill_id!==binding.skill_id||result.definition_digest!==binding.definition_digest||result.skill_version!==declaration.version||!plain(result.call)||result.call.skill_id!==binding.skill_id||result.call.skill_definition_digest!==binding.definition_digest)throw problem('BINDING_UNAVAILABLE','核心结果的固定 Skill 身份不匹配。');

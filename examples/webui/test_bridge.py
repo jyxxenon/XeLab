@@ -439,6 +439,27 @@ window.bridge=new BridgeHost({{iframe:frame,api,contribution,subjectId:{json.dum
         self.assertEqual(len(self.posts()), 1, "a denied cached result never becomes a repeated business POST")
         self.assertEqual(self.page.locator("#frames iframe").count(), 0)
 
+    def test_bridge_call_outlives_a_post_past_the_business_deadline(self):
+        frame = self.launch()
+        self.hold = True
+        self.send(frame, params={"binding_alias": "echo", "input": {"message": "late kernel pipeline"}, "idempotency_key": "stable-intent", "timeout_ms": 10000})
+        deadline = time.monotonic() + 5
+        while not self.pending and time.monotonic() < deadline:
+            self.page.wait_for_timeout(10)
+        self.assertTrue(self.pending, "expected a held bridge Skill Call POST")
+        route, headers, body = self.pending[0]
+        self.assertEqual(body["timeout_ms"], 10000)
+        # The kernel call pipeline legitimately answers inside one HTTP request
+        # past the business deadline (#82); the shell must not abort the
+        # forwarded call at body.timeout_ms while the frame waits for a result.
+        self.page.wait_for_timeout(11000)
+        self.assertEqual(frame.evaluate("responses().length"), 0)
+        self.hold = False
+        self.result(route, headers, body)
+        response = self.responses(frame, 1)[0]
+        self.assertTrue(response["ok"], "a POST past the business deadline still delivers the result")
+        self.assertEqual(response["result"]["call"]["output"], {"message": "late kernel pipeline"})
+
     def test_per_view_rate_limit_rejects_the_121st_request(self):
         frame = self.launch()
         for identifier in range(1, 121):
