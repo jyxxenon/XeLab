@@ -70,6 +70,43 @@ class TriageTests(unittest.TestCase):
         self.assertEqual([i["number"] for i in report["issues"]], list(range(1, 102)))
         self.assertIn(("GET", "/issues?state=open&per_page=100&page=2"), api.calls)
 
+    def test_repeated_page_issue_is_counted_and_loaded_once(self):
+        items = [issue(n, f"task {n}") for n in range(100, 0, -1)] + [issue(1, "task 1")]
+        first = comment("agent-a", "/claim")
+        second = comment("agent-a", "/claim", "2026-11-10T01:00:00Z")
+        second["html_url"] += "-second"
+        api = FakeAPI(issues=items, comments={1: [first, second, comment("agent-b", "/claim")]})
+        report = build_report(api)
+        self.assertEqual((report["open_issues"], report["excluded_prs"]), (100, 0))
+        self.assertEqual([i["number"] for i in report["issues"]], list(range(1, 101)))
+        self.assertEqual(report["needs_triage"], list(range(1, 101)))
+        self.assertEqual(report["unassigned"], list(range(1, 101)))
+        self.assertEqual(report["multiple_claimants"], [1])
+        self.assertEqual(report["repeated_claim_candidates"], [1])
+        self.assertEqual(report["duplicate_candidates"], [])
+        self.assertEqual(api.calls.count(("GET", "/issues/1/comments?per_page=100&page=1")), 1)
+
+    def test_repeated_page_pr_is_excluded_once(self):
+        items = [issue(n, f"PR {n}", pr=True) for n in range(100, 0, -1)] + [issue(1, "PR 1", pr=True)]
+        api = FakeAPI(issues=items)
+        report = build_report(api)
+        self.assertEqual((report["open_issues"], report["excluded_prs"]), (0, 100))
+        self.assertEqual(report["issues"], [])
+        self.assertEqual(api.calls, [("GET", "/issues?state=open&per_page=100&page=1"),
+                                     ("GET", "/issues?state=open&per_page=100&page=2")])
+
+    def test_later_page_issue_metadata_is_used_once(self):
+        items = [issue(n, f"task {n}") for n in range(100, 0, -1)]
+        items.append(issue(1, "updated entry", labels=["status:ready"], assignees=["agent-a"]))
+        report = build_report(FakeAPI(issues=items))
+        self.assertEqual(report["open_issues"], 100)
+        self.assertEqual(report["issues"][0]["number"], 1)
+        self.assertEqual(report["issues"][0]["title"], "updated entry")
+        self.assertEqual(report["issues"][0]["status"], "status:ready")
+        self.assertEqual(report["issues"][0]["assignees"], ["agent-a"])
+        self.assertEqual(report["needs_triage"], list(range(2, 101)))
+        self.assertEqual(report["unassigned"], list(range(2, 101)))
+
     def test_status_buckets_and_empty_labels(self):
         api = FakeAPI(issues=[issue(1, "no labels"), issue(2, "triage", labels=["status:needs-triage", "area:docs"]),
                               issue(3, "ready", labels=["status:ready"]), issue(4, "blocked", labels=["status:blocked"])])

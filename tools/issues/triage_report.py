@@ -106,7 +106,8 @@ def duplicate_candidates(issues):
 
 
 def build_report(api):
-    items = list(pages(api, "/issues?state=open"))
+    # Page boundaries can overlap; retain one, last-seen record per repository issue number.
+    items = {item["number"]: item for item in pages(api, "/issues?state=open")}.values()
     prs = [item for item in items if "pull_request" in item]
     issues = []
     for item in sorted((i for i in items if "pull_request" not in i), key=lambda i: i["number"]):
