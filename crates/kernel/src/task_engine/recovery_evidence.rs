@@ -1,4 +1,4 @@
-//! Match a completed Call to the evidence frozen at Task admission.
+//! Match a settled Call to the evidence frozen at Task admission.
 use super::MAX_STEP_JSON_BYTES;
 use crate::{
     auth::Resource,
@@ -21,7 +21,7 @@ pub(super) struct RecordedAttempt<'a> {
 }
 
 fn conflict() -> Error {
-    Error::conflict("Linked Broker Call does not prove a successful Task result")
+    Error::conflict("Linked Broker Call does not prove the requested Task outcome")
 }
 
 fn invalid_proof(error: Error) -> Error {
@@ -37,7 +37,57 @@ pub(super) async fn verified_output(
     tx: &Transaction<'_>,
     attempt: RecordedAttempt<'_>,
 ) -> Result<Value> {
-    let frozen = frozen_step(&attempt)?;
+    let call = attempt.call;
+    let proof = verified_call(tx, &attempt, true).await?;
+    let mut result: Value = proof
+        .row
+        .get::<_, Option<Value>>("result")
+        .ok_or_else(conflict)?;
+    validate("CallResult", &result).map_err(invalid_proof)?;
+    if id(&result, "call_id").map_err(invalid_proof)? != call
+        || id(&result, "provider_instance_id").map_err(invalid_proof)?
+            != proof.row.get::<_, Uuid>("provider_instance_id")
+        || id(&result, "skill_id").map_err(invalid_proof)? != proof.row.get::<_, Uuid>("skill_id")
+        || result["skill_definition_digest"] != proof.digest
+        || result["contract"] != proof.contract
+        || result.get("micro_plugin_id").is_some()
+    {
+        return Err(conflict());
+    }
+    let output = result
+        .as_object_mut()
+        .and_then(|result| result.remove("output"))
+        .ok_or_else(conflict)?;
+    if serde_json::to_vec(&output)?.len() > proof.maximum {
+        return Err(conflict());
+    }
+    reject_jsonb_nul(&output).map_err(invalid_proof)?;
+    validate_business(&proof.definition["output_schema"], &output).map_err(invalid_proof)?;
+    Ok(output)
+}
+
+pub(super) async fn verified_nonexecution(
+    tx: &Transaction<'_>,
+    attempt: RecordedAttempt<'_>,
+) -> Result<()> {
+    verified_call(tx, &attempt, false).await?;
+    Ok(())
+}
+
+struct VerifiedCall {
+    row: Row,
+    definition: Value,
+    digest: String,
+    contract: Value,
+    maximum: usize,
+}
+
+async fn verified_call(
+    tx: &Transaction<'_>,
+    attempt: &RecordedAttempt<'_>,
+    succeeded: bool,
+) -> Result<VerifiedCall> {
+    let frozen = frozen_step(attempt)?;
     let rows = tx.query(
         "SELECT c.contract,c.result,c.provider_instance_id,c.skill_id,c.http_binding,
                 s.created_by AS skill_owner,s.definition,s.definition_digest,s.installation_id,
@@ -51,16 +101,28 @@ pub(super) async fn verified_output(
            AND g.instance_id=i.id AND g.subject_id=c.owner_id AND g.issuer_credential_id=c.credential_id
            AND g.parent_rpc_delegation_id IS NULL
          JOIN reservations r ON r.id=c.id AND r.kind='call' AND r.account_id=c.owner_id
+         JOIN attempts a ON a.broker_call_id=c.id
          WHERE c.id=$1 AND c.owner_id=$2 AND c.credential_id=$3 AND c.delegation_id<>$4
            AND d.id=$5 AND c.idempotency_key=$6 AND c.parent_call_id IS NULL
            AND c.micro_plugin_id IS NULL AND c.extension_plugin_id IS NULL
            AND e.subject_id=c.owner_id AND e.issuer_credential_id=c.credential_id AND e.run_as='user'
-           AND c.state='succeeded' AND c.completed_at IS NOT NULL AND c.error IS NULL AND r.status='released'
+           AND r.status='released'
+           AND (CASE WHEN $7::boolean THEN
+                c.state='succeeded' AND c.completed_at IS NOT NULL AND c.error IS NULL
+                  AND a.dispatch_started IS DISTINCT FROM FALSE
+              ELSE c.state='unknown' AND c.result IS NULL AND c.completed_at IS NULL
+                  AND a.dispatch_started IS FALSE
+                  AND NOT EXISTS (
+                    SELECT 1 FROM host_call_tickets ticket
+                    JOIN host_child_calls child ON child.ticket_id=ticket.id
+                    WHERE ticket.parent_call_id=c.id
+                  )
+              END)
          LIMIT 2",
         &[&attempt.call,&attempt.owner,&attempt.issuer,&attempt.task_delegation,
-          &attempt.deployment,&attempt.idempotency_key],
+          &attempt.deployment,&attempt.idempotency_key,&succeeded],
     ).await?;
-    let [row] = rows.as_slice() else {
+    let Ok([row]) = <[_; 1]>::try_from(rows) else {
         return Err(conflict());
     };
 
@@ -91,7 +153,7 @@ pub(super) async fn verified_output(
             crate::skills::candidate_binding(tx, installation, &manifest, &definition)
                 .await
                 .map_err(invalid_proof)?;
-            capability_binding(row, frozen, &definition, &manifest, &contract)?
+            capability_binding(&row, frozen, &definition, &manifest, &contract)?
         }
         Some("http") => {
             if !definition["stream_item_schema"].is_null()
@@ -105,34 +167,19 @@ pub(super) async fn verified_output(
                 .await
                 .map_err(invalid_proof)?;
             let operation = registry.bind_skill(&definition).map_err(invalid_proof)?;
-            http_binding(row, frozen, &definition, &contract, &digest, operation)?;
+            http_binding(&row, frozen, &definition, &contract, &digest, operation)?;
             MAX_STEP_JSON_BYTES
         }
         _ => return Err(conflict()),
     };
 
-    let mut result: Value = row.get::<_, Option<Value>>("result").ok_or_else(conflict)?;
-    validate("CallResult", &result).map_err(invalid_proof)?;
-    if id(&result, "call_id").map_err(invalid_proof)? != attempt.call
-        || id(&result, "provider_instance_id").map_err(invalid_proof)?
-            != row.get::<_, Uuid>("provider_instance_id")
-        || id(&result, "skill_id").map_err(invalid_proof)? != skill
-        || result["skill_definition_digest"] != digest
-        || result["contract"] != contract
-        || result.get("micro_plugin_id").is_some()
-    {
-        return Err(conflict());
-    }
-    let output = result
-        .as_object_mut()
-        .and_then(|result| result.remove("output"))
-        .ok_or_else(conflict)?;
-    if serde_json::to_vec(&output)?.len() > maximum {
-        return Err(conflict());
-    }
-    reject_jsonb_nul(&output).map_err(invalid_proof)?;
-    validate_business(&definition["output_schema"], &output).map_err(invalid_proof)?;
-    Ok(output)
+    Ok(VerifiedCall {
+        row,
+        definition,
+        digest,
+        contract,
+        maximum,
+    })
 }
 
 fn frozen_step<'a>(attempt: &RecordedAttempt<'a>) -> Result<&'a Value> {

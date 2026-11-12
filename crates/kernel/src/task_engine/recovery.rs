@@ -57,23 +57,25 @@ pub(crate) async fn resolve_unknown(
             "A nonempty resolution evidence description is required",
         ));
     }
-    if body["resolution"] == "confirmed_not_executed" {
-        if body.get("output").is_some() {
+    let resolution = string(body, "resolution")?;
+    let submitted = match (resolution, body.get("output")) {
+        ("confirmed_succeeded", Some(output)) => {
+            reject_jsonb_nul(output)?;
+            Some(output)
+        }
+        ("confirmed_succeeded", None) => {
+            return Err(Error::invalid(
+                "Confirmed success requires an explicit output",
+            ));
+        }
+        ("confirmed_not_executed", Some(_)) => {
             return Err(Error::invalid(
                 "Nonexecution confirmation cannot include output",
             ));
         }
-        return Err(Error::conflict(
-            "No definitive nonexecution evidence is available for this Task step",
-        ));
-    }
-    if body["resolution"] != "confirmed_succeeded" {
-        return Err(Error::invalid("Unknown Task resolution"));
-    }
-    let submitted = body
-        .get("output")
-        .ok_or_else(|| Error::invalid("Confirmed success requires an explicit output"))?;
-    reject_jsonb_nul(submitted)?;
+        ("confirmed_not_executed", None) => None,
+        _ => return Err(Error::invalid("Unknown Task resolution")),
+    };
 
     let attempt = tx
         .query_opt(
@@ -109,42 +111,50 @@ pub(crate) async fn resolve_unknown(
     let deployment = step
         .get::<_, Option<Uuid>>("provider_deployment_id")
         .ok_or_else(|| Error::conflict("Task step has no fixed deployment"))?;
-    let output = recovery_evidence::verified_output(
-        tx,
-        recovery_evidence::RecordedAttempt {
-            owner,
-            issuer,
-            task_delegation: task.get("delegation_id"),
-            deployment,
-            step_key: step.get("step_key"),
-            admission: &admission,
-            idempotency_key: key,
-            call,
-        },
-    )
-    .await?;
-    if &output != submitted {
-        return Err(Error::conflict(
-            "Submitted output differs from the linked Broker Call",
-        ));
-    }
+    let recorded = recovery_evidence::RecordedAttempt {
+        owner,
+        issuer,
+        task_delegation: task.get("delegation_id"),
+        deployment,
+        step_key: step.get("step_key"),
+        admission: &admission,
+        idempotency_key: key,
+        call,
+    };
+    let (state, output) = if let Some(submitted) = submitted {
+        let output = recovery_evidence::verified_output(tx, recorded).await?;
+        if &output != submitted {
+            return Err(Error::conflict(
+                "Submitted output differs from the linked Broker Call",
+            ));
+        }
+        ("succeeded", Some(output))
+    } else {
+        recovery_evidence::verified_nonexecution(tx, recorded).await?;
+        ("failed", None)
+    };
 
     // Historical evidence grants no execution rights. Time-bound operator
     // permissions are rechecked after waiting for locks and inspecting proof.
     crate::tasks::authorize_resolution(tx, ctx, &resource).await?;
     let attempt_id: Uuid = attempt.get("id");
     let now = clock(tx).await?;
-    let output_digest = digest(&serde_json::to_vec(&output)?);
+    let output_digest = output
+        .as_ref()
+        .map(serde_json::to_vec)
+        .transpose()?
+        .map(|bytes| digest(&bytes));
     tx.execute(
         "INSERT INTO task_step_resolutions(attempt_id,call_id,actor_subject_id,actor_credential_id,
                   request_id,resolution,evidence,output_digest,created_at)
-         VALUES($1,$2,$3,$4,$5,'confirmed_succeeded',$6,$7,$8)",
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)",
         &[
             &attempt_id,
             &call,
             &ctx.subject,
             &ctx.credential,
             &ctx.request,
+            &resolution,
             &evidence,
             &output_digest,
             &now,
@@ -152,8 +162,8 @@ pub(crate) async fn resolve_unknown(
     )
     .await?;
     tx.execute(
-        "UPDATE task_steps SET state='succeeded',output=$2,fence=$3,revision=revision+1,updated_at=$4 WHERE id=$1",
-        &[&step_id,&output,&next_fence,&now],
+        "UPDATE task_steps SET state=$2,output=$3,fence=$4,revision=revision+1,updated_at=$5 WHERE id=$1",
+        &[&step_id,&state,&output,&next_fence,&now],
     ).await?;
     settle_parent(tx, &task, task_id, now).await?;
     db::outbox(
@@ -161,7 +171,7 @@ pub(crate) async fn resolve_unknown(
         "task.step.resolved",
         step_id,
         &json!({"task_id":task_id,"step_id":step_id,"attempt_id":attempt_id,
-                "call_id":call,"resolution":"confirmed_succeeded"}),
+                "call_id":call,"resolution":resolution}),
     )
     .await?;
     crate::api::read_object(tx, "task_steps", step_id, "TaskStep").await
@@ -232,8 +242,24 @@ pub(crate) async fn validate_resolution_history(c: &(impl GenericClient + Sync))
             .query(
                 "SELECT r.attempt_id,r.output_digest,c.result->'output' AS output,
                     a.broker_call_id IS NOT DISTINCT FROM r.call_id AND a.state='unknown'
-                      AND s.fence>a.fence AND s.state='succeeded' AND s.output=(c.result->'output')
-                      AND c.state='succeeded' AND k.owner_id=r.actor_subject_id AS valid
+                      AND s.fence>a.fence AND k.owner_id=r.actor_subject_id
+                      AND (CASE r.resolution WHEN 'confirmed_succeeded' THEN
+                            s.state='succeeded' AND s.output=(c.result->'output')
+                              AND c.state='succeeded' AND a.dispatch_started IS DISTINCT FROM FALSE
+                           WHEN 'confirmed_not_executed' THEN
+                            a.dispatch_started IS FALSE AND c.state='unknown'
+                              AND c.result IS NULL AND c.completed_at IS NULL AND EXISTS (
+                                SELECT 1 FROM reservations q WHERE q.id=c.id AND q.kind='call'
+                                  AND q.account_id=c.owner_id AND q.status='released'
+                              ) AND NOT EXISTS (
+                                SELECT 1 FROM host_call_tickets ticket
+                                JOIN host_child_calls child ON child.ticket_id=ticket.id
+                                WHERE ticket.parent_call_id=c.id
+                              )
+                              AND (s.state IN ('failed','ready','canceled') OR EXISTS (
+                                SELECT 1 FROM attempts later WHERE later.step_id=a.step_id AND later.number>a.number
+                              ))
+                           ELSE false END) AS valid
              FROM task_step_resolutions r JOIN attempts a ON a.id=r.attempt_id
              JOIN task_steps s ON s.id=a.step_id JOIN calls c ON c.id=r.call_id
              JOIN credentials k ON k.id=r.actor_credential_id
@@ -253,7 +279,7 @@ pub(crate) async fn validate_resolution_history(c: &(impl GenericClient + Sync))
                 .transpose()?
                 .map(|bytes| digest(&bytes));
             if row.get::<_, Option<bool>>("valid") != Some(true)
-                || actual.as_deref() != Some(row.get::<_, &str>("output_digest"))
+                || actual.as_deref() != row.get::<_, Option<&str>>("output_digest")
             {
                 return Err(Error::conflict(
                     "Historical Task resolution differs from its Call evidence",

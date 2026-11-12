@@ -17,9 +17,11 @@ mod cancellation;
 mod input;
 mod recovery;
 mod recovery_evidence;
+mod retry;
 
 pub(crate) use cancellation::{cancel_task, finish_cancellations, finish_stopped_cancellations};
 pub(crate) use recovery::{resolve_unknown, validate_resolution_history};
+pub(crate) use retry::retry_task;
 
 const LEASE: Duration = Duration::seconds(30);
 pub(crate) const MAX_STEP_JSON_BYTES: usize = 4 * 1024 * 1024;
@@ -284,7 +286,7 @@ pub(crate) async fn record_broker_call(
         ));
     }
     let updated = tx.execute(
-        "UPDATE attempts a SET broker_call_id=c.id,revision=a.revision+1,updated_at=clock_timestamp()
+        "UPDATE attempts a SET broker_call_id=c.id,dispatch_started=false,revision=a.revision+1,updated_at=clock_timestamp()
          FROM calls c JOIN instances i ON i.id=c.provider_instance_id
          JOIN deployments d ON d.id=i.deployment_id JOIN installations n ON n.id=d.installation_id
          JOIN task_steps s ON s.provider_deployment_id=d.id
@@ -318,6 +320,33 @@ pub(crate) async fn record_broker_call(
     if updated != 1 {
         return Err(Error::conflict(
             "Broker Call does not match the live Task attempt",
+        ));
+    }
+    Ok(())
+}
+
+/// Cross the dispatch barrier in the Broker's final authorization transaction.
+/// The caller holds the call ledger and Task locks.
+pub(crate) async fn mark_broker_dispatch(
+    tx: &Transaction<'_>,
+    lease: &Lease,
+    call: Uuid,
+) -> Result<()> {
+    let updated = tx.execute(
+        "UPDATE attempts a SET dispatch_started=true,revision=a.revision+1,updated_at=clock_timestamp()
+         FROM task_steps s JOIN tasks t ON t.id=s.task_id JOIN execution_delegations e ON e.id=t.delegation_id,
+              calls c
+         WHERE a.id=$1 AND a.broker_call_id=$2 AND c.id=$2 AND a.dispatch_started IS FALSE
+           AND a.step_id=s.id AND s.id=$3 AND s.fence=a.fence AND a.fence=$4
+           AND t.id=$5 AND a.execution_id=$6 AND a.idempotency_key=$7
+           AND a.state='running' AND s.state='running' AND t.state='running' AND c.state='running'
+           AND e.status='active'
+           AND LEAST(a.lease_expires_at,t.deadline_at,e.expires_at,c.deadline_at)>clock_timestamp()",
+        &[&lease.attempt_id,&call,&lease.step_id,&lease.fence,&lease.task_id,&lease.execution_id,&lease.idempotency_key],
+    ).await?;
+    if updated != 1 {
+        return Err(Error::conflict(
+            "Task Call cannot cross the dispatch barrier",
         ));
     }
     Ok(())
@@ -875,7 +904,8 @@ async fn set_live_attempt(
 ) -> Result<()> {
     let updated = tx
         .execute(
-            "UPDATE attempts SET state=$2,revision=revision+1,updated_at=$3
+            "UPDATE attempts SET state=$2,revision=revision+1,updated_at=$3,
+                pre_dispatch_failure=($2='failed' AND state='leased' AND broker_call_id IS NULL)
          WHERE id=$1 AND LEAST(lease_expires_at,$4::timestamptz)>clock_timestamp()",
             &[&attempt, &state, &now, &deadline],
         )

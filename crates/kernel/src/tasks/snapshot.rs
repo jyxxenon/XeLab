@@ -281,7 +281,7 @@ async fn validate_attempts(
 ) -> Result<()> {
     let step_id: Uuid = step.get("id");
     let attempts = c.query(
-        "SELECT a.number,a.fence,a.state,a.idempotency_key,a.broker_call_id,c.state AS call_state,
+        "SELECT a.number,a.fence,a.state,a.idempotency_key,a.broker_call_id,a.dispatch_started,c.state AS call_state,
                 c.owner_id AS call_owner,c.credential_id,c.delegation_id,c.skill_id,c.skill_definition_digest,
                 c.contract,c.provider_instance_id,c.idempotency_key AS call_key,c.http_binding,c.result,
                 i.deployment_id,i.generation
@@ -320,6 +320,14 @@ async fn validate_attempts(
             active = true;
         }
         if let Some(call) = attempt.get("broker_call_id") {
+            if attempt.get::<_, Option<bool>>("dispatch_started") == Some(false)
+                && (!matches!(
+                    attempt.get::<_, Option<&str>>("call_state"),
+                    Some("accepted" | "running" | "unknown")
+                ) || attempt.get::<_, Option<Value>>("result").is_some())
+            {
+                return Err(invalid_task());
+            }
             validate_call(task, step, attempt, binding, call, &key, contract)?;
         }
     }

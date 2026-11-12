@@ -638,9 +638,20 @@ async fn execute_inner(
             )?;
             stream.ensure_open()?;
         }
+        let make_client = || {
+            InstanceHttp::from_runtime(
+                &app.config,
+                &app.runtime,
+                target.instance,
+                target.generation,
+            )
+        };
+        // Local Task setup cannot send anything. A missing local runtime
+        // binding must not invalidate the durable proof that no send began.
+        let task_client = task.map(|_| make_client()).transpose()?;
         check_live_call_for_source(
             app,
-            source,
+            CallCheck::BeforeDispatch(source),
             request,
             call,
             target.instance,
@@ -651,12 +662,7 @@ async fn execute_inner(
         if let Some(output) = output {
             output.ensure_open()?;
         }
-        let client = InstanceHttp::from_runtime(
-            &app.config,
-            &app.runtime,
-            target.instance,
-            target.generation,
-        )?;
+        let client = task_client.map_or_else(make_client, Ok)?;
         if let Some(output) = output {
             output.ensure_open()?;
         }
@@ -781,7 +787,7 @@ async fn execute_inner(
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 if let Err(error) = check_live_call_for_source(
                     app,
-                    source,
+                    CallCheck::Observe(source),
                     request,
                     call,
                     target.instance,
@@ -1320,7 +1326,7 @@ async fn read_events(
             drop(bytes);
             check_live_call_for_source(
                 app,
-                call_source,
+                CallCheck::Observe(call_source),
                 request,
                 call,
                 target.instance,

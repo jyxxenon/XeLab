@@ -9,6 +9,9 @@ mod cancellation;
 #[path = "host_task_resolution_tests.rs"]
 mod resolution;
 
+#[path = "host_task_retry_tests.rs"]
+mod retry;
+
 struct TaskFixture {
     host: Fixture,
     workflow: Uuid,

@@ -33,7 +33,8 @@ const TASK_BROKER_CALL: &str = include_str!("../migrations/0021_task_broker_call
 const TASK_DEADLINE_INDEXES: &str = include_str!("../migrations/0022_task_deadline_indexes.sql");
 const TASK_STEP_RESOLUTIONS: &str = include_str!("../migrations/0023_task_step_resolutions.sql");
 const TASK_CANCELLATIONS: &str = include_str!("../migrations/0024_task_cancellations.sql");
-const MIGRATIONS: [&str; 24] = [
+const TASK_RETRY_EVIDENCE: &str = include_str!("../migrations/0025_task_retry_evidence.sql");
+const MIGRATIONS: [&str; 25] = [
     BASELINE,
     CALL_CHARGES,
     SECRET_AUTHORITY,
@@ -58,6 +59,7 @@ const MIGRATIONS: [&str; 24] = [
     TASK_DEADLINE_INDEXES,
     TASK_STEP_RESOLUTIONS,
     TASK_CANCELLATIONS,
+    TASK_RETRY_EVIDENCE,
 ];
 pub const SCHEMA_VERSION: u64 = MIGRATIONS.len() as u64;
 pub const LEADER_LOCK: i64 = 0x58454c41424d3101;

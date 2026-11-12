@@ -621,7 +621,7 @@ fn dispatch<'a>(
             )
             .await?;
             if let Some(row)=tx.query_opt("SELECT fingerprint,safe_response,response_status,sensitive,resource_id FROM idempotency_records WHERE subject_id=$1 AND credential_id=$2 AND method=$3 AND path=$4 AND key=$5 AND expires_at>now()",&[&ctx.subject,&ctx.credential,&method,&path,&key]).await?{
-            let task_recovery = matches!(name, "resolveUnknownStep" | "cancelTask");
+            let task_recovery = matches!(name, "resolveUnknownStep" | "cancelTask" | "retryTask");
             if task_recovery {
                 // A stale Task grant must not reveal whether a previously
                 // submitted idempotency key or fingerprint exists.

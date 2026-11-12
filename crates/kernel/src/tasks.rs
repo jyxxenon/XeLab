@@ -30,13 +30,14 @@ pub(crate) fn handles(name: &str) -> bool {
             | "listTaskSteps"
             | "resolveUnknownStep"
             | "cancelTask"
+            | "retryTask"
     )
 }
 
 pub(crate) fn validate_query(name: &str, query: &str) -> Result<()> {
     if matches!(
         name,
-        "createTask" | "getTask" | "resolveUnknownStep" | "cancelTask"
+        "createTask" | "getTask" | "resolveUnknownStep" | "cancelTask" | "retryTask"
     ) && !query.is_empty()
     {
         return Err(Error::invalid("Unexpected task query parameter"));
@@ -51,14 +52,18 @@ pub(crate) async fn authorize(
     params: &HashMap<String, String>,
     body: &Value,
 ) -> Result<()> {
-    if name == "cancelTask" {
+    if matches!(name, "cancelTask" | "retryTask") {
         let task = path_id(params, "task_id")?;
         let row = c
             .query_opt("SELECT owner_id FROM tasks WHERE id=$1", &[&task])
             .await?
             .ok_or_else(Error::not_found)?;
         let resource = Resource::new("task", task, Some(row.get(0)));
-        return authorize_cancellation(c, ctx, &resource).await;
+        return if name == "cancelTask" {
+            authorize_cancellation(c, ctx, &resource).await
+        } else {
+            authorize_retry(c, ctx, &resource).await
+        };
     }
     if name == "resolveUnknownStep" {
         let resource = step_task_resource(c, path_id(params, "step_id")?)
@@ -111,6 +116,14 @@ pub(crate) async fn authorize_cancellation(
     authorize_visible_action(c, ctx, task, "task.cancel").await
 }
 
+pub(crate) async fn authorize_retry(
+    c: &(impl GenericClient + Sync),
+    ctx: &Context,
+    task: &Resource,
+) -> Result<()> {
+    authorize_visible_action(c, ctx, task, "task.retry").await
+}
+
 async fn authorize_visible_action(
     c: &(impl GenericClient + Sync),
     ctx: &Context,
@@ -146,6 +159,11 @@ pub(crate) async fn execute(
 ) -> Result<(Value, u16)> {
     match name {
         "createTask" => Ok((create(c, ctx, body).await?, 201)),
+        "retryTask" => Ok((
+            crate::task_engine::retry_task(c, auth, ctx, path_id(params, "task_id")?, headers)
+                .await?,
+            200,
+        )),
         "cancelTask" => Ok((
             crate::task_engine::cancel_task(c, ctx, path_id(params, "task_id")?, body, headers)
                 .await?,
