@@ -8,7 +8,7 @@ use crate::{
 };
 use chrono::{DateTime, Duration, Utc};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use tokio_postgres::GenericClient;
 use uuid::Uuid;
 
@@ -141,6 +141,18 @@ async fn create(c: &(impl GenericClient + Sync), ctx: &Context, body: &Value) ->
         }
     }
 
+    let target_paths = admissions
+        .iter()
+        .flat_map(|bound| &bound.targets)
+        .flat_map(|target| &target.paths);
+    let grant_ids: Vec<_> = workflow_paths
+        .iter()
+        .chain(target_paths)
+        .flat_map(|path| path.sources.iter().copied())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let source_expiries = authority::source_expiries(c, ctx, &grant_ids).await?;
     authorize_create(c, ctx).await?;
     let authority_expires = deadline.min(authority::issuer_expiry(c, ctx).await?);
     let checked_at: DateTime<Utc> = c.query_one("SELECT clock_timestamp()", &[]).await?.get(0);
@@ -152,10 +164,22 @@ async fn create(c: &(impl GenericClient + Sync), ctx: &Context, body: &Value) ->
         ));
     }
     let mut rules = BTreeMap::new();
-    collect_live_rules(&mut workflow_paths, ctx, checked_at, &mut rules)?;
+    collect_live_rules(
+        &mut workflow_paths,
+        ctx,
+        checked_at,
+        &source_expiries,
+        &mut rules,
+    )?;
     for bound in &mut admissions {
         for target in &mut bound.targets {
-            collect_live_rules(&mut target.paths, ctx, checked_at, &mut rules)?;
+            collect_live_rules(
+                &mut target.paths,
+                ctx,
+                checked_at,
+                &source_expiries,
+                &mut rules,
+            )?;
         }
     }
     let admission = json!({
@@ -204,8 +228,16 @@ fn collect_live_rules(
     paths: &mut Vec<Path>,
     ctx: &Context,
     checked_at: DateTime<Utc>,
+    source_expiries: &HashMap<Uuid, DateTime<Utc>>,
     rules: &mut BTreeMap<String, Value>,
 ) -> Result<()> {
+    paths.retain(|path| {
+        path.sources.iter().all(|grant| {
+            source_expiries
+                .get(grant)
+                .is_some_and(|expiry| *expiry > checked_at)
+        })
+    });
     authority::retain_live_paths(paths, ctx, checked_at)?;
     for path in paths {
         rules

@@ -8,7 +8,7 @@ use crate::{
 use axum::http::HeaderMap;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use tokio_postgres::GenericClient;
+use tokio_postgres::{GenericClient, Transaction};
 
 mod store;
 
@@ -46,40 +46,53 @@ pub(crate) async fn authorize(
         "getWorkflow" | "archiveWorkflow" => {
             let workflow = path_id(params, "workflow_id")?;
             let owner = store::owner(c, workflow).await?;
-            let reading = name == "getWorkflow";
-            let resource = Resource::new("workflow", workflow, Some(owner));
-            let result = auth::authorize(
+            authorize_existing(
                 c,
                 ctx,
-                if reading {
+                if name == "getWorkflow" {
                     "workflow.read"
                 } else {
                     "workflow.archive"
                 },
-                &resource,
+                &Resource::new("workflow", workflow, Some(owner)),
             )
-            .await;
-            if result
-                .as_ref()
-                .is_err_and(|error| error.code == "PERMISSION_DENIED")
-                && (reading || !crate::policy::allows(c, ctx, "workflow.read", &resource).await?)
-            {
-                return Err(Error::not_found());
-            }
-            result
+            .await
         }
         _ => Err(Error::not_found()),
     }
+}
+
+async fn authorize_existing(
+    c: &(impl GenericClient + Sync),
+    ctx: &Context,
+    action: &str,
+    resource: &Resource,
+) -> Result<()> {
+    let result = auth::authorize(c, ctx, action, resource).await;
+    if result
+        .as_ref()
+        .is_err_and(|error| error.code == "PERMISSION_DENIED")
+        && (action == "workflow.read"
+            || !crate::policy::allows(c, ctx, "workflow.read", resource).await?)
+    {
+        return Err(Error::not_found());
+    }
+    result
 }
 
 async fn validate_targets(
     c: &(impl GenericClient + Sync),
     ctx: &Context,
     spec: &Value,
-) -> Result<()> {
+) -> Result<Vec<(&'static str, Resource)>> {
+    let mut visible = Vec::new();
     for step in spec["steps"].as_array().unwrap() {
         if step.get("skill_id").is_some() {
             let skill = crate::skills::resolve_for_workflow(c, ctx, id(step, "skill_id")?).await?;
+            visible.push((
+                "skill.read",
+                Resource::new("skill", skill.id, Some(skill.owner)),
+            ));
             if unsigned(&step["timeout_ms"])? > unsigned(&skill.definition["maximum_timeout_ms"])? {
                 return Err(Error::invalid("Workflow step exceeds the Skill timeout"));
             }
@@ -100,16 +113,11 @@ async fn validate_targets(
                     "SELECT installation_id,owner_id FROM deployments WHERE id=$1 AND archived_at IS NULL FOR SHARE",
                     &[&deployment],
                 ).await?.ok_or_else(Error::not_found)?;
-                if !crate::policy::allows(
-                    c,
-                    ctx,
-                    "plugin.read",
-                    &Resource::new("deployment", deployment, Some(row.get("owner_id"))),
-                )
-                .await?
-                {
+                let resource = Resource::new("deployment", deployment, Some(row.get("owner_id")));
+                if !crate::policy::allows(c, ctx, "plugin.read", &resource).await? {
                     return Err(Error::not_found());
                 }
+                visible.push(("plugin.read", resource));
                 Some(row.get(0))
             } else {
                 None
@@ -132,7 +140,7 @@ async fn validate_targets(
             }
         }
     }
-    Ok(())
+    Ok(visible)
 }
 
 pub(crate) async fn validate_contract(
@@ -156,7 +164,7 @@ pub(crate) async fn validate_contract(
 
 #[allow(clippy::too_many_arguments)] // Shared HTTP dispatch inputs.
 pub(crate) async fn execute(
-    c: &(impl GenericClient + Sync),
+    c: &Transaction<'_>,
     auth: &Auth,
     ctx: &Context,
     name: &str,
@@ -168,8 +176,8 @@ pub(crate) async fn execute(
     match name {
         "createWorkflow" => {
             compile_business(&body["input_schema"])?;
-            validate_targets(c, ctx, body).await?;
-            Ok((store::publish(c, ctx.subject, body).await?, 201))
+            let visible = validate_targets(c, ctx, body).await?;
+            Ok((store::publish(c, ctx, body, &visible).await?, 201))
         }
         "getWorkflow" => Ok((
             read_object(c, "workflows", path_id(params, "workflow_id")?, "Workflow").await?,
@@ -177,7 +185,7 @@ pub(crate) async fn execute(
         )),
         "listWorkflows" => crate::plugin_catalog::execute(c, auth, ctx, name, query).await,
         "archiveWorkflow" => {
-            store::archive(c, path_id(params, "workflow_id")?, headers).await?;
+            store::archive(c, ctx, path_id(params, "workflow_id")?, headers).await?;
             Ok((Value::Null, 204))
         }
         _ => Err(Error::not_found()),

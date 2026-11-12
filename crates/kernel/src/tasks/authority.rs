@@ -5,7 +5,9 @@ use crate::{
 };
 use chrono::{DateTime, Utc};
 use serde_json::json;
+use std::collections::{BTreeSet, HashMap};
 use tokio_postgres::GenericClient;
+use uuid::Uuid;
 
 /// Freeze only alternatives that currently authorize this exact target. Keeping
 /// their source grants lets later admission reject a replacement grant.
@@ -44,6 +46,48 @@ pub(super) fn retain_live_paths(
         return Err(Error::denied());
     }
     Ok(())
+}
+
+/// Check all original grant issuers after policy expansion. Physical credential
+/// expiry is separate from conditions carried by a rule and from the submitter's
+/// own credential chain.
+pub(super) async fn source_expiries(
+    c: &(impl GenericClient + Sync),
+    ctx: &Context,
+    sources: &[Uuid],
+) -> Result<HashMap<Uuid, DateTime<Utc>>> {
+    let chains = Policy::for_context(c, ctx)
+        .live_grant_issuer_chains(sources)
+        .await?;
+    let credentials: Vec<_> = chains
+        .values()
+        .flat_map(|chain| chain.iter().copied())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let expiries: HashMap<_, _> = c
+        .query(
+            "SELECT id,expires_at FROM credentials WHERE id=ANY($1::uuid[])",
+            &[&credentials],
+        )
+        .await?
+        .into_iter()
+        .map(|row| (row.get::<_, Uuid>(0), row.get::<_, DateTime<Utc>>(1)))
+        .collect();
+    if expiries.len() != credentials.len() {
+        return Err(Error::denied());
+    }
+    Ok(chains
+        .into_iter()
+        .map(|(grant, chain)| {
+            let expiry = chain
+                .iter()
+                .map(|id| expiries[id])
+                .min()
+                .unwrap_or(DateTime::<Utc>::MAX_UTC);
+            (grant, expiry)
+        })
+        .collect())
 }
 
 /// The caller must hold the authorization fence on the admission transaction.

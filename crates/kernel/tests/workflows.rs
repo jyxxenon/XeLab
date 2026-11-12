@@ -5,6 +5,8 @@
 mod http_host;
 #[path = "support/task_admission.rs"]
 mod task_admission;
+#[path = "support/workflow_authority_wait.rs"]
+mod workflow_authority_wait;
 
 use axum::{
     body::{to_bytes, Body},

@@ -11,6 +11,90 @@ const LAST_PRE_TASK_ADMISSION: i64 = 19;
 const OLD_PASSWORD: &str = "correct horse task fixture password";
 const NEW_PASSWORD: &str = "fresh independent task recovery password";
 
+#[tokio::test]
+async fn actual_postgres_task_final_rules_drop_expired_independent_issuer() {
+    let Ok(base) = std::env::var("XELAB_TEST_DATABASE_URL") else {
+        eprintln!("SKIPPED: Task issuer expiry requires PostgreSQL");
+        return;
+    };
+    let admin = db::Db::new(base.clone()).unwrap().connect().await.unwrap();
+    let name = format!("task_issuer_{}", Uuid::new_v4().simple());
+    admin
+        .batch_execute(&format!("CREATE DATABASE {name}"))
+        .await
+        .unwrap();
+    let database = db::Db::new(format!("{base} dbname={name}")).unwrap();
+    database.migrate().await.unwrap();
+    let mut c = database.connect().await.unwrap();
+    let tx = c.transaction().await.unwrap();
+    let quota = json!({"maximum_depth":4,"maximum_descendants":20,"maximum_api_keys":50,"maximum_concurrent_calls":16,"daily_calls":10000});
+    let owner = auth::bootstrap(&tx, "Task issuer owner", OLD_PASSWORD, &quota)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let auth = auth::Auth::new(vec![61; 32]).unwrap();
+    let peer = "127.0.0.1".parse().unwrap();
+    let caller = auth
+        .login(&c, owner, OLD_PASSWORD.into(), peer, Uuid::new_v4())
+        .await
+        .unwrap();
+    let source = auth
+        .login(&c, owner, OLD_PASSWORD.into(), peer, Uuid::new_v4())
+        .await
+        .unwrap();
+    let ctx = auth
+        .authenticate(
+            &c,
+            caller["access_token"].as_str().unwrap(),
+            peer,
+            Uuid::new_v4(),
+        )
+        .await
+        .unwrap();
+    let issuer = contracts::id(&source["session"], "id").unwrap();
+    assert!(!ctx.chain.contains(&issuer));
+    let expiry: DateTime<Utc> = c.query_one(
+        "UPDATE credentials SET expires_at=clock_timestamp()+interval '1 minute' WHERE id=$1 RETURNING expires_at",
+        &[&issuer],
+    ).await.unwrap().get(0);
+    let live: Uuid = c.query_one(
+        "SELECT id FROM grants WHERE subject_id=$1 AND role_id='Owner' AND issuer_credential_id IS NULL AND scope->>'kind'='workflow'",
+        &[&owner],
+    ).await.unwrap().get(0);
+    let grant = Uuid::new_v4();
+    c.execute(
+        "INSERT INTO grants(id,subject_id,issuer_id,issuer_credential_id,role_id,scope,status,created_at,updated_at)
+         VALUES($1,$2,$2,$3,'Owner',$4,'active',now(),now())",
+        &[&grant, &owner, &issuer, &json!({"kind":"workflow","match":"all"})],
+    ).await.unwrap();
+
+    let tx = c.transaction().await.unwrap();
+    db::auth_lock(&tx, false).await.unwrap();
+    let expiries = super::authority::source_expiries(&tx, &ctx, &[grant, live])
+        .await
+        .unwrap();
+    assert_eq!(expiries[&grant], expiry);
+    let rule = json!({"action":"workflow.read","resource":{"kind":"workflow","match":"ids","ids":[Uuid::new_v4()]}});
+    let expired_path = crate::policy::Path {
+        rule: rule.clone(),
+        sources: [grant].into(),
+    };
+    let live_path = crate::policy::Path {
+        rule,
+        sources: [live].into(),
+    };
+    let mut paths = vec![expired_path.clone(), live_path.clone()];
+    let mut rules = Default::default();
+    super::collect_live_rules(&mut paths, &ctx, expiry, &expiries, &mut rules).unwrap();
+    assert_eq!(paths, vec![live_path]);
+    assert_eq!(rules.len(), 1);
+    let error =
+        super::collect_live_rules(&mut vec![expired_path], &ctx, expiry, &expiries, &mut rules)
+            .unwrap_err();
+    assert_eq!(error.code, "PERMISSION_DENIED");
+    tx.commit().await.unwrap();
+}
+
 async fn install_v19(c: &Client) {
     let mut sql = vec![(1, db::BASELINE.to_owned())];
     let migrations = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
