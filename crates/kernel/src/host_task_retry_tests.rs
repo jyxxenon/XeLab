@@ -285,12 +285,8 @@ async fn postgres_task_retry_rejects_sent_and_legacy_ambiguous_attempts() {
     assert_eq!(plugin.calls.load(Ordering::SeqCst), 1);
 }
 
-#[tokio::test]
-async fn postgres_task_retry_pre_dispatch_failure_rechecks_issuer_and_attempt_budget() {
-    let Some(f) = TaskFixture::new("none", false).await else {
-        return;
-    };
-    let initial = task(&f, f.task).await;
+async fn fail_before_dispatch(f: &TaskFixture) -> (Uuid, Value) {
+    let initial = task(f, f.task).await;
     let (status, canceled) = f
         .host
         .call(
@@ -320,11 +316,20 @@ async fn postgres_task_retry_pre_dispatch_failure_rechecks_issuer_and_attempt_bu
         .await;
     assert_eq!(status, 201, "{created}");
     let id = contracts::id(&created, "id").unwrap();
-    let c = f.host.app.db.connect().await.unwrap();
     assert!(crate::task_worker::run_once(&f.host.app).await.unwrap());
-    let failed = task(&f, id).await;
+    let failed = task(f, id).await;
     assert_eq!(failed["state"], "failed");
     assert_eq!(failed["error"]["code"], "INVALID_ARGUMENT");
+    (id, failed)
+}
+
+#[tokio::test]
+async fn postgres_task_retry_pre_dispatch_failure_rechecks_issuer_and_attempt_budget() {
+    let Some(f) = TaskFixture::new("none", false).await else {
+        return;
+    };
+    let (id, failed) = fail_before_dispatch(&f).await;
+    let c = f.host.app.db.connect().await.unwrap();
     let revision = failed["revision"].as_i64().unwrap();
     let rows = attempts(&c, id).await;
     assert_eq!(rows.len(), 1);
@@ -407,4 +412,134 @@ async fn postgres_task_retry_pre_dispatch_failure_rechecks_issuer_and_attempt_bu
     for column in 0..3 {
         assert_eq!(accounting.get::<_, i64>(column), 0);
     }
+}
+
+#[tokio::test]
+async fn postgres_task_retry_rechecks_expiring_action_after_step_lock_wait() {
+    let Some(f) = TaskFixture::new("none", false).await else {
+        return;
+    };
+    let (id, failed) = fail_before_dispatch(&f).await;
+    let owner = contracts::id(&failed, "owner_id").unwrap();
+    let c = f.host.app.db.connect().await.unwrap();
+    let step: Uuid = c
+        .query_one("SELECT id FROM task_steps WHERE task_id=$1", &[&id])
+        .await
+        .unwrap()
+        .get(0);
+    let mut blocker = f.host.app.db.connect().await.unwrap();
+    let lock = blocker.transaction().await.unwrap();
+    let blocker_pid: i32 = lock
+        .query_one(
+            "SELECT pg_backend_pid() FROM task_steps WHERE id=$1 FOR UPDATE",
+            &[&step],
+        )
+        .await
+        .unwrap()
+        .get(0);
+
+    let expires_at = Utc::now() + chrono::Duration::seconds(8);
+    let resource = json!({"kind":"task","match":"ids","ids":[id]});
+    let (status, operator) = f.host.call(
+        "createApiKey", &[("account_id", owner)],
+        json!({
+            "name":"Retry action expires during Step lock wait",
+            "inheritance":{"mode":"selected","rules":[
+                {"action":"task.read","resource":resource},
+                {"action":"task.retry","resource":resource,"conditions":{"expires_at":expires_at}},
+            ]},
+            "conditions":{"expires_at":Utc::now()+chrono::Duration::minutes(5)}
+        }),
+        None, "create-retry-expiring-action", None,
+    ).await;
+    assert_eq!(status, 201, "Could not create scoped retry credential");
+    let operator_id = contracts::id(&operator["credential"], "id").unwrap();
+    let token = operator["secret"].as_str().unwrap();
+    let key = "retry-expired-during-step-lock";
+    let journal = "SELECT jsonb_build_object('step',to_jsonb(s),
+        'attempts',(SELECT jsonb_agg(to_jsonb(a) ORDER BY a.number) FROM attempts a WHERE a.step_id=s.id),
+        'outbox',(SELECT jsonb_agg(to_jsonb(o) ORDER BY o.id) FROM outbox o WHERE o.aggregate_id IN (s.id,s.task_id)),
+        'idempotency',(SELECT count(*) FROM idempotency_records WHERE credential_id=$2 AND key=$3))
+        FROM task_steps s WHERE s.id=$1";
+    let before: Value = c
+        .query_one(journal, &[&step, &operator_id, &key])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(before["attempts"][0]["pre_dispatch_failure"], true);
+    assert_eq!(before["idempotency"], 0);
+
+    let params = [("task_id", id)];
+    let retry = f.host.call(
+        "retryTask",
+        &params,
+        Value::Null,
+        failed["revision"].as_i64(),
+        key,
+        Some(token),
+    );
+    tokio::pin!(retry);
+    let wait_for_expiry = async {
+        let observed: DateTime<Utc> = loop {
+            if let Some(row) = c
+                .query_opt(
+                    "SELECT clock_timestamp() FROM pg_stat_activity WHERE datname=current_database()
+                     AND wait_event_type='Lock' AND $1=ANY(pg_blocking_pids(pid))
+                     AND query LIKE '%FOR UPDATE OF s'",
+                    &[&blocker_pid],
+                )
+                .await
+                .unwrap()
+            {
+                break row.get(0);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert!(
+            observed < expires_at,
+            "Retry must reach the lock while authorized"
+        );
+        tokio::time::sleep((expires_at - Utc::now()).to_std().unwrap_or_default()).await;
+        while !c
+            .query_one("SELECT clock_timestamp()>=$1", &[&expires_at])
+            .await
+            .unwrap()
+            .get::<_, bool>(0)
+            || Utc::now() < expires_at
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    };
+    tokio::select! {
+        (status, error) = &mut retry => panic!("Retry finished before the Step lock was released: {status} {error}"),
+        expired = tokio::time::timeout(Duration::from_secs(12), wait_for_expiry) => {
+            expired.expect("Retry must wait on the Step lock until the scoped action expires");
+        }
+    }
+    lock.rollback().await.unwrap();
+    let (status, error) = tokio::time::timeout(Duration::from_secs(5), retry)
+        .await
+        .expect("Retry did not return after release of the Step lock");
+    assert_eq!(status, 403, "{error}");
+    assert_eq!(error["error"]["code"], "PERMISSION_DENIED");
+
+    let (status, current) = f
+        .host
+        .call(
+            "getTask",
+            &params,
+            Value::Null,
+            None,
+            "read-after-retry-expiry",
+            Some(token),
+        )
+        .await;
+    assert_eq!(status, 200, "{current}");
+    assert_eq!(current, failed);
+    let after: Value = c
+        .query_one(journal, &[&step, &operator_id, &key])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(after, before);
 }
