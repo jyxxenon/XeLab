@@ -293,6 +293,25 @@ button:active{transform:translateY(1px)}
   transform:translate(2px,2px);
 }
 
+.window-content::-webkit-scrollbar,.result::-webkit-scrollbar{
+  width:8px;
+  height:8px;
+}
+.window-content::-webkit-scrollbar-track,.result::-webkit-scrollbar-track{
+  background:transparent;
+}
+.window-content::-webkit-scrollbar-thumb,.result::-webkit-scrollbar-thumb{
+  background:color-mix(in srgb,var(--border) 75%,transparent);
+  border-radius:999px;
+  border:2px solid transparent;
+  background-clip:padding-box;
+}
+.window-content::-webkit-scrollbar-thumb:hover,.result::-webkit-scrollbar-thumb:hover{
+  background:color-mix(in srgb,var(--muted-text) 70%,transparent);
+  border:2px solid transparent;
+  background-clip:padding-box;
+}
+
 dialog{
   border:1px solid var(--shell-border);
   border-radius:20px;
@@ -328,6 +347,8 @@ dialog>header h2{font-size:18px;letter-spacing:-.25px}
 .app-grid .app-icon{
   width:42px;
   height:42px;
+  display:grid;
+  place-items:center;
   border-radius:12px;
   border:1px solid color-mix(in srgb,var(--border) 62%,transparent);
   background:linear-gradient(150deg,color-mix(in srgb,var(--surface) 90%,#fff),color-mix(in srgb,var(--desktop) 70%,var(--surface)));
@@ -402,6 +423,8 @@ dialog[open]{animation:shell-dialog-in .18s var(--ease-shell)}
   .window-title{height:42px;gap:8px;padding:0 8px}
   .window-controls{gap:4px}
   .window-content{padding:16px}
+  .window-content>.toolbar{padding-bottom:12px;margin-bottom:14px}
+  .window-content .toolbar h2{font-size:15.5px}
   dialog{padding:18px;border-radius:16px}
   .app-grid .app-icon{width:36px;height:36px;border-radius:10px;font-size:18px}
 }
@@ -455,6 +478,10 @@ label{font-size:12px;font-weight:600;color:var(--muted-text)}
   border-color:color-mix(in srgb,var(--accent) 70%,var(--text));
   filter:none;
 }
+.primary:active{
+  background:color-mix(in srgb,var(--accent) 90%,#000);
+  border-color:color-mix(in srgb,var(--accent) 84%,var(--text));
+}
 button.danger{border-color:color-mix(in srgb,var(--danger) 40%,var(--border));color:var(--danger)}
 button.danger:hover{background:color-mix(in srgb,var(--danger) 8%,var(--surface));border-color:color-mix(in srgb,var(--danger) 55%,var(--border));filter:none}
 button:disabled{box-shadow:none}
@@ -503,6 +530,32 @@ button:disabled{box-shadow:none}
   line-height:1.65;
 }
 
+.window-content>.toolbar{
+  padding-bottom:14px;
+  margin-bottom:18px;
+  border-bottom:1px solid var(--shell-border);
+  gap:8px;
+}
+.window-content .toolbar h2{
+  font-size:17px;
+  font-weight:680;
+  letter-spacing:-.25px;
+}
+.window-content .toolbar button{
+  min-height:32px;
+  padding:6px 11px;
+  font-size:12px;
+}
+.window-content .card .toolbar{
+  padding-top:10px;
+  margin-top:12px;
+  border-top:1px solid color-mix(in srgb,var(--shell-border) 65%,transparent);
+  gap:6px;
+}
+.window-content .inline-field{
+  margin-bottom:14px;
+}
+
 @media(max-width:650px){
   .card{padding:13px}
   .state{padding:18px 14px}
@@ -545,3 +598,23 @@ button:disabled{box-shadow:none}
   .overview-grid{grid-template-columns:1fr}
   .overview-section{padding:13px}
 }
+
+/* ==========================================================================
+   Shell motion layer
+   Window appearance and toast entry get one short, finite fade each. Only
+   opacity and a 6px transform are animated, so no layout or pointer target
+   moves; nothing loops or runs while idle. The existing reduced-motion rules
+   (`reduced-motion` class and the prefers-reduced-motion media query) remove
+   both, and reduced transparency is unaffected because neither surface adds
+   blur.
+   ========================================================================== */
+@keyframes shell-window-in{
+  from{opacity:0}
+  to{opacity:1}
+}
+@keyframes shell-toast-in{
+  from{opacity:0;transform:translateY(-6px)}
+  to{opacity:1;transform:none}
+}
+.window:not([hidden]){animation:shell-window-in .16s var(--ease-shell)}
+#toast:not(:empty){animation:shell-toast-in .18s var(--ease-shell)}
