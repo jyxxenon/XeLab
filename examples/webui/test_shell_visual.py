@@ -146,6 +146,17 @@ class ShellVisual(unittest.TestCase):
         self.page.locator('.window[data-app="settings"]').wait_for()
         self.assertIn("window-title", self.page.evaluate("document.activeElement.className"))
 
+        # Restoring a minimized window from the launcher list must hand focus
+        # into the window, the same contract as the Dock restore paths.
+        window = self.fixture.app("系统状态")
+        window.get_by_role("button", name="最小化系统状态").click()
+        window.wait_for(state="hidden")
+        trigger.click()
+        self.page.locator("#launcher").wait_for(state="visible")
+        self.page.get_by_role("button", name="聚焦窗口2 系统状态", exact=True).click()
+        window.wait_for(state="visible")
+        self.assertIn("window-title", self.page.evaluate("document.activeElement.className"))
+
     def test_desktop_wallpaper_is_served_and_applied(self):
         self.open()
         background = self.style("#desktop")["backgroundImage"]
