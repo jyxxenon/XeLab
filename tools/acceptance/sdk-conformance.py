@@ -4,6 +4,7 @@
 import argparse
 import json
 from pathlib import Path
+import socket
 import subprocess
 import sys
 import tempfile
@@ -72,8 +73,12 @@ def generate_artifacts(root):
 
 
 def sandbox(identity, client, library_dir):
-    command = ["bwrap", "--clearenv", "--unshare-user", "--unshare-net", "--unshare-pid", "--die-with-parent",
-               "--ro-bind", "/usr", "/usr", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp"]
+    command = ["bwrap", "--clearenv", "--unshare-user", "--unshare-pid", "--die-with-parent",
+               "--ro-bind", "/usr", "/usr", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp",
+               "--chdir", "/"]
+    # Some CI hosts provision the loopback-only network outside the user namespace.
+    if {name for _, name in socket.if_nameindex()} != {"lo"}:
+        command.append("--unshare-net")
     for name in ("/bin", "/lib", "/lib64"):
         path = Path(name)
         if path.is_symlink():
