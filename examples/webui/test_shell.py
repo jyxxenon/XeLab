@@ -28,6 +28,7 @@ class ShellBrowser(unittest.TestCase):
         self.fail_preferences = 0
         self.launcher_pages = None
         self.key_denied = False
+        self.key_error = None
         self.subject = desktop.ACCOUNT
         self.page.route("**/*", self.route)
 
@@ -72,7 +73,10 @@ class ShellBrowser(unittest.TestCase):
                      "updated_at": desktop.NOW, "last_used_at": None,
                      "inheritance": {"mode": "all_snapshot", "secret": "DO-NOT-RENDER-NESTED-SECRET"},
                      "secret": "DO-NOT-RENDER-ISSUANCE-SECRET", "verification_digest": "DO-NOT-RENDER-DIGEST"}
-            if self.key_denied:
+            if self.key_error:
+                status, code, message = self.key_error
+                self.reply(route, {"error": {"code": code, "message": message}}, status)
+            elif self.key_denied:
                 self.reply(route, {"error": {"code": "PERMISSION_DENIED", "message": "component ceiling denied"}}, 403)
             else:
                 self.reply(route, {"items": [value], "next_cursor": None} if url.path.endswith("/api-keys") else value)
@@ -495,6 +499,17 @@ class ShellBrowser(unittest.TestCase):
         self.page.locator('.window[data-app^="api-keys:"]').get_by_role("heading", name="无权限", exact=True).wait_for()
         self.assertNotIn("xk_safe", self.page.locator("body").inner_text())
         self.assertNotIn("DO-NOT-RENDER", self.page.locator("body").inner_text())
+
+    def test_desktop_failure_redacts_server_error_messages(self):
+        secret = "TOKEN=do-not-render-account-secret"
+        self.key_error = (500, "INTERNAL_ERROR", secret)
+        self.fixture.open()
+        self.fixture.app("账户与权限").get_by_role("button", name="API Key 元数据", exact=True).click()
+        window = self.page.locator('.window[data-app^="api-keys:"]')
+        window.get_by_role("heading", name="请求失败", exact=True).wait_for()
+        body = self.page.locator("body").inner_text()
+        self.assertNotIn(secret, body)
+        self.assertIn("INTERNAL_ERROR", window.inner_text())
 
 
 if __name__ == "__main__":
