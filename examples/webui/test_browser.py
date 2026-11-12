@@ -119,6 +119,7 @@ class DesktopBrowser(unittest.TestCase):
                 and parse_qs(request.post_data or "", keep_blank_values=True) == {
                     "grant_type": ["refresh_token"], "client_id": ["browser-component"], "refresh_token": ["component-refresh"]}):
             self.pending_refresh.append(route)
+            self.page.evaluate("() => { globalThis.__heldRefreshCaptured = true; }")
             return
         if (self.hold_mount_verify and request.method == "GET" and url.path.endswith("/ui/contributions/" + self.contributions["main"]["deployment_id"] + "/main")
                 and sum(call["path"] == url.path for call in self.calls) == 1):
@@ -887,11 +888,13 @@ class DesktopBrowser(unittest.TestCase):
         self.open(expires_ms=45000, refresh_token="component-refresh")
         self.page.clock.fast_forward(46000)
         self.hold_refresh = True
-        self.app("系统状态")
-        resources = self.page.locator('.window[data-app="resources"]')
-        self.page.wait_for_function("() => sessionStorage.getItem('xelab.oauth:https://core.example.test:browser-component') === null")
-        self.assertEqual(len(self.pending_refresh), 1)
         try:
+            self.app("系统状态")
+            resources = self.page.locator('.window[data-app="resources"]')
+            self.page.wait_for_function("() => sessionStorage.getItem('xelab.oauth:https://core.example.test:browser-component') === null")
+            # Storage is cleared before the OAuth request reaches the route callback.
+            self.page.wait_for_function("() => globalThis.__heldRefreshCaptured === true")
+            self.assertEqual(len(self.pending_refresh), 1)
             self.app("Skill")
             skills = self.page.locator('.window[data-app="skills"]')
             self.assertEqual(skills.get_by_text("登录后继续", exact=True).count(), 0)
