@@ -887,6 +887,7 @@ async fn actual_postgres_schedule_plugin_and_batch_history_copy_resets_execution
         "createTask",
         &params,
         &json!({"workflow_id":workflow,"input":input}),
+        &axum::http::HeaderMap::new(),
         "",
     )
     .await
