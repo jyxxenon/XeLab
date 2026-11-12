@@ -970,7 +970,24 @@ async function loadLauncher(reset) {
   }catch(error){if(epoch===launcherEpoch)launcherError=error;}
   finally{if(epoch===launcherEpoch){launcherLoading=false;renderLauncher();}}
 }
-function openLauncher(){renderLauncher();$('#launcher').showModal();loadLauncher(true);}
+let launcherReturnFocus=null;
+function openLauncher(){
+  renderLauncher();
+  launcherReturnFocus=document.activeElement instanceof HTMLElement?document.activeElement:null;
+  $('#launcher').showModal();
+  $('#app-search').focus();
+  loadLauncher(true);
+}
+$('#launcher').addEventListener('close',()=>{
+  // Restore after the UA finishes moving focus out of the closed dialog; a launch action
+  // has already focused the new window, which must not be stolen back.
+  setTimeout(()=>{
+    const active=document.activeElement;
+    if(active&&active!==document.body&&!$('#launcher').contains(active))return;
+    const target=launcherReturnFocus&&document.contains(launcherReturnFocus)?launcherReturnFocus:$('#launcher-toggle');
+    target.focus();
+  },0);
+});
 $('#launcher-toggle').addEventListener('click',openLauncher);
 $('#launcher-close').addEventListener('click',()=>$('#launcher').close());
 $('#app-search').addEventListener('input',renderLauncher);
