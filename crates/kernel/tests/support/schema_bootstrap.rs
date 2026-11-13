@@ -4,8 +4,10 @@
 //! Synthetic metadata host capacity is inherited; this is not RUN-03 evidence.
 use super::*;
 use base64::{engine::general_purpose::STANDARD, Engine};
+use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signer, SigningKey};
 use std::sync::atomic::Ordering;
+use tokio_postgres::Client;
 use xelab_kernel::{artifact, controller, tls};
 
 struct WithheldKey {
@@ -171,6 +173,182 @@ async fn reap(f: &Fixture, scratch: Uuid) {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     panic!("detached schema scratch was not physically reclaimed");
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ReadyWriter {
+    generation: i64,
+    restart_count: i32,
+    fence: i64,
+    observed_at: DateTime<Utc>,
+}
+
+async fn ready_writer(c: &Client, volume: Uuid, instance: Uuid) -> Option<ReadyWriter> {
+    c.query_opt(
+        "SELECT i.generation,i.restart_count,a.fence,p.observed_at
+           FROM instances i
+           JOIN volume_attachments a ON a.instance_id=i.id AND a.generation=i.generation
+           JOIN volumes v ON v.id=a.volume_id AND v.writer_instance_id=i.id
+           JOIN provider_records p ON p.instance_id=i.id AND p.observed_generation=i.generation
+          WHERE v.id=$1 AND i.id=$2 AND i.phase='ready' AND p.availability='ready'
+          ORDER BY p.observed_at DESC LIMIT 1",
+        &[&volume, &instance],
+    )
+    .await
+    .unwrap()
+    .map(|row| ReadyWriter {
+        generation: row.get("generation"),
+        restart_count: row.get("restart_count"),
+        fence: row.get("fence"),
+        observed_at: row.get("observed_at"),
+    })
+}
+
+async fn wait_for_writer(
+    c: &Client,
+    volume: Uuid,
+    instance: Uuid,
+    after: DateTime<Utc>,
+) -> ReadyWriter {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Some(writer) = ready_writer(c, volume, instance).await {
+                if writer.observed_at > after {
+                    return writer;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("controller did not publish a fresh health observation")
+}
+
+async fn lock_deployment_runtime(f: &Fixture, deployment: Uuid) -> Client {
+    let fence = f.app.db.connect().await.unwrap();
+    let name = format!("xelab/deployment-runtime/{deployment}");
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        fence.query_one("SELECT pg_advisory_lock(hashtextextended($1,0))", &[&name]),
+    )
+    .await
+    .expect("controller did not release its deployment runtime fence")
+    .unwrap();
+    fence
+}
+
+async fn contend_with_mount_check(
+    f: &Fixture,
+    c: &Client,
+    deployment: Uuid,
+    volume: Uuid,
+    instance: Uuid,
+) -> ReadyWriter {
+    let mut blocker = f.app.db.connect().await.unwrap();
+    let gate = blocker.transaction().await.unwrap();
+    let pid: i32 = gate
+        .query_one(
+            "SELECT pg_backend_pid() FROM volume_allocations WHERE volume_id=$1 FOR UPDATE",
+            &[&volume],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    // Hold the actual mount transaction before it reaches the root lock.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let waiting: bool = c
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname=current_database()
+                   AND query='SELECT * FROM volume_allocations WHERE volume_id=$1 FOR UPDATE'
+                   AND $1=ANY(pg_blocking_pids(pid)))",
+                    &[&pid],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            if waiting {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("controller mount transaction did not reach the allocation lock");
+    let before = ready_writer(c, volume, instance)
+        .await
+        .expect("schema bootstrap must have published a ready writer");
+    let root = ProjectStore::open(&f.app.config.root().join("volumes")).unwrap();
+    gate.rollback().await.unwrap();
+    // The controller owns this advisory lock until the observed pass returns.
+    // Hold it across the assertions so a second pass cannot hide changes.
+    let fence = lock_deployment_runtime(f, deployment).await;
+    assert_eq!(
+        ready_writer(c, volume, instance).await.as_ref(),
+        Some(&before),
+        "root contention must preserve the published writer and its previous observation"
+    );
+    assert!(f.app.runtime.running(instance).await.unwrap());
+    drop(root);
+    drop(fence);
+
+    let after = wait_for_writer(c, volume, instance, before.observed_at).await;
+    assert_eq!(after.fence, before.fence);
+    assert_eq!(after.generation, before.generation);
+    assert_eq!(after.restart_count, before.restart_count);
+    eprintln!("XFS root contention preserved the running writer and its attachment fence");
+    after
+}
+
+async fn verify_quota_mismatch_fences_writer(
+    f: &Fixture,
+    c: &Client,
+    deployment: Uuid,
+    volume: Uuid,
+    instance: Uuid,
+    before: ReadyWriter,
+) {
+    // Change only the recorded expectation. The check still reads actual XFS
+    // quota and the original on-disk limit remains in force.
+    let original: i64 = c
+        .query_one(
+            "UPDATE volume_allocations SET inode_limit=inode_limit-1
+               WHERE volume_id=$1 RETURNING inode_limit+1",
+            &[&volume],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let fenced: bool = c.query_one(
+                "SELECT phase='degraded' AND conditions='[\"NOT_READY\"]'::jsonb
+                      AND NOT EXISTS(SELECT 1 FROM provider_records WHERE instance_id=$2 AND availability='ready')
+                      AND NOT EXISTS(SELECT 1 FROM volume_attachments WHERE instance_id=$2)
+                      AND (SELECT writer_instance_id IS NULL FROM volumes WHERE id=$3)
+                   FROM deployments WHERE id=$1",
+                &[&deployment, &instance, &volume],
+            ).await.unwrap().get(0);
+            if fenced {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("XFS quota mismatch did not fence the writer and withdraw its Provider");
+    assert!(!f.app.runtime.running(instance).await.unwrap());
+
+    c.execute(
+        "UPDATE volume_allocations SET inode_limit=$2 WHERE volume_id=$1",
+        &[&volume, &original],
+    )
+    .await
+    .unwrap();
+    let recovered = wait_for_writer(c, volume, instance, before.observed_at).await;
+    assert!(recovered.fence > before.fence);
+    assert!(recovered.restart_count > before.restart_count);
+    eprintln!("XFS quota mismatch fenced the writer before its verified restart");
 }
 
 pub(super) async fn register(
@@ -367,15 +545,18 @@ pub async fn exercise(f: &Fixture, publisher: Uuid) {
     assert!(runtime["annotations"][format!("org.xelab.volume.{scratch}")].is_null());
     let scratch_row = c.query_one("SELECT project_id,state,desired_capacity+desired_metadata_charge AS charge FROM volume_allocations WHERE volume_id=$1", &[&scratch]).await.unwrap();
     assert_eq!(scratch_row.get::<_, String>("state"), "quarantined");
-    assert_eq!(
-        ProjectStore::open(&f.app.config.root().join("volumes"))
-            .unwrap()
-            .inspect(scratch, scratch_row.get::<_, i32>("project_id") as u32)
-            .unwrap()
-            .limits
-            .capacity_bytes,
-        67108864
-    );
+    {
+        let _fence = lock_deployment_runtime(f, deployment).await;
+        assert_eq!(
+            ProjectStore::open(&f.app.config.root().join("volumes"))
+                .unwrap()
+                .inspect(scratch, scratch_row.get::<_, i32>("project_id") as u32)
+                .unwrap()
+                .limits
+                .capacity_bytes,
+            67108864
+        );
+    }
     let before: i64 = c
         .query_one("SELECT reserved_bytes FROM volume_storage_root", &[])
         .await
@@ -391,6 +572,7 @@ pub async fn exercise(f: &Fixture, publisher: Uuid) {
         after <= before - scratch_row.get::<_, i64>("charge") + 65536,
         "actual deletion must release scratch capacity while retaining its tombstone"
     );
+    let writer = contend_with_mount_check(f, &c, deployment, business, instance).await;
     let replay = f
         .api(
             "setDeploymentEnabled",
@@ -431,6 +613,7 @@ pub async fn exercise(f: &Fixture, publisher: Uuid) {
     assert_eq!(actual["schema"], "1");
     assert_eq!(actual["items"].as_array().unwrap().len(), 1);
     assert_eq!(actual["items"][0]["id"], called.1["call_id"]);
+    verify_quota_mismatch_fences_writer(f, &c, deployment, business, instance, writer).await;
     let upgrade_supervisor =
         super::schema_same_format::exercise(f, publisher, installation, deployment, business).await;
     let (changing, changing_manifest, _) = register(

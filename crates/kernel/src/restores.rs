@@ -568,7 +568,7 @@ async fn stop_target(app: &App, operation: Uuid, fence: &db::DeploymentFence) ->
         .await?;
     for instance in records {
         let id: Uuid = instance.get(0);
-        tx.execute("UPDATE instances SET phase='stopped',health='unknown',revision=revision+1,updated_at=now() WHERE id=$1",&[&id]).await?;
+        tx.execute("UPDATE instances SET phase='stopped',health='unknown',runtime_id=NULL,revision=revision+1,updated_at=now() WHERE id=$1",&[&id]).await?;
         volumes::release_stopped(&tx, Some(id)).await?;
         crate::admission::release_stopped(&tx, id).await?;
     }

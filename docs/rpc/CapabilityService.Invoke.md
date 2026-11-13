@@ -41,4 +41,8 @@
 
 校验失败 INVALID_ARGUMENT；无有效身份 UNAUTHENTICATED；越权 PERMISSION_DENIED；契约/状态冲突 FAILED_PRECONDITION；无资源 RESOURCE_EXHAUSTED；期限到期 DEADLINE_EXCEEDED；对端中断 UNAVAILABLE。细节通过 xelab-error-bin 返回，稳定码见错误目录。
 
+内核对一元业务错误核对单个有界 `xelab-error-bin` 中的稳定码及对应 gRPC 状态。
+错误消息、重试策略和持久引用由内核生成。已准入的失败保留原 Call 与活动预约，
+由现有核实和围栏流程处理。客户端用原幂等键或 Call UUID 查询结果。
+
 任何有外部副作用的中断不能仅靠 gRPC status 断言未执行；先查询/核实，再按幂等与任务恢复规则处理。
