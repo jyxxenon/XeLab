@@ -97,6 +97,20 @@ class ShellVisual(unittest.TestCase):
         }""", references)
         self.assertEqual(missing, [], "every stylesheet and script referenced by index.html must load")
 
+    def test_minimizing_a_window_hands_focus_to_its_dock_button(self):
+        self.open()
+        window = self.fixture.app("系统状态")
+        window.get_by_role("button", name="最小化系统状态").click()
+        self.page.wait_for_function(
+            "() => [...document.querySelectorAll('.window')].every(element => element.hidden)")
+        self.assertEqual(
+            self.page.evaluate("() => document.activeElement.getAttribute('data-app-id')"),
+            "resources",
+            "minimizing the focused window should focus its Dock entry")
+        self.page.keyboard.press("Enter")
+        window.wait_for(state="visible")
+        self.assertIn("window-title", self.page.evaluate("document.activeElement.className"))
+
     def test_closing_a_window_hands_focus_back_to_the_desktop(self):
         self.open()
         self.fixture.app("系统状态")
@@ -130,6 +144,17 @@ class ShellVisual(unittest.TestCase):
         self.assertEqual(self.page.evaluate("document.activeElement.id"), "app-search")
         self.page.get_by_role("button", name="启动设置", exact=True).click()
         self.page.locator('.window[data-app="settings"]').wait_for()
+        self.assertIn("window-title", self.page.evaluate("document.activeElement.className"))
+
+        # Restoring a minimized window from the launcher list must hand focus
+        # into the window, the same contract as the Dock restore paths.
+        window = self.fixture.app("系统状态")
+        window.get_by_role("button", name="最小化系统状态").click()
+        window.wait_for(state="hidden")
+        trigger.click()
+        self.page.locator("#launcher").wait_for(state="visible")
+        self.page.get_by_role("button", name="聚焦窗口2 系统状态", exact=True).click()
+        window.wait_for(state="visible")
         self.assertIn("window-title", self.page.evaluate("document.activeElement.className"))
 
     def test_desktop_wallpaper_is_served_and_applied(self):

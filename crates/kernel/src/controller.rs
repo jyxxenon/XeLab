@@ -667,8 +667,20 @@ async fn reconcile(app: &App, deployment: Uuid, probes: &mut BTreeMap<Uuid, Prob
     probe.bind(id, generation);
     let limits: Value = i.get("limits");
     let running = app.runtime.running(id).await?;
-    let mounts = match crate::volumes::mounts(app, deployment, id, generation, &manifest).await {
-        Ok(mounts) => mounts,
+    let mounts = match crate::volumes::try_mounts(app, deployment, id, generation, &manifest).await
+    {
+        Ok(Some(mounts)) => mounts,
+        Ok(None) => {
+            // A volume worker can hold the root lock during this sweep.
+            // Preserve the writer's fence and let the health observation age.
+            if app.leader.is_closed() {
+                return Err(Error::unavailable("Controller leadership is lost"));
+            }
+            if !running && i.get::<_, String>("phase") == "ready" {
+                mark_stopping(app, id).await?;
+            }
+            return Ok(());
+        }
         Err(error) => {
             mark_stopping(app, id).await?;
             app.runtime.stop(id).await?;
