@@ -478,6 +478,27 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(sum(frame["terminal"] for frame in frames), 1)
         self.assert_business_slots_released()
 
+    def test_hold_receipt_requires_a_valid_admitted_hold(self):
+        with tempfile.TemporaryDirectory(dir=self.root) as directory:
+            receipt = pathlib.Path(directory) / "hold-receipt"
+            self.state.initialize(receipt)
+            call_id = str(uuid.uuid4())
+            headers = {"X-Xelab-Call-ID": call_id}
+            body = b'{"message":"private hold body","delay_ms":20}'
+            self.assertEqual(self.request(headers=headers)[0], 200)
+            self.assertEqual(self.request(path=HOLD_PATH, body=body,
+                                          headers={"X-Xelab-Call-ID": "invalid"})[0], 403)
+            self.assertEqual(self.request(path=HOLD_PATH, headers=headers)[0], 400)
+            self.assertFalse(receipt.exists())
+            self.assertEqual(self.request(path=HOLD_PATH, body=body, headers=headers)[0], 200)
+            self.assertEqual(receipt.read_bytes(), call_id.encode("ascii"))
+            self.assertEqual(receipt.stat().st_mode & 0o777, 0o600)
+            self.state.initialize()
+            receipt.unlink()
+            self.assertEqual(self.request(path=HOLD_PATH, body=body, headers=headers)[0], 200)
+            self.assertFalse(receipt.exists())
+            self.assert_business_slots_released()
+
     def test_sse_deadline_is_a_terminal_frame_and_releases_the_slot(self):
         status, _, raw = self.request(path=EVENTS_PATH,
             body=b'{"message":"deadline","items":2,"interval_ms":1000}',
@@ -539,6 +560,7 @@ class ArtifactTests(unittest.TestCase):
             digest = "sha256:" + hashlib.sha256(raw).hexdigest()
             self.assertEqual(manifest["routes"][0]["http_contract_digest"], digest)
             self.assertEqual(manifest["skills"][0]["target"]["http_contract_digest"], digest)
+            self.assertNotIn("test_hold_receipt", manifest["config_schema"].get("properties", {}))
             operation = json.loads(raw)["paths"][BUSINESS_PATH]["post"]
             self.assertEqual(operation["x-permission"], manifest["routes"][0]["required_action"])
             self.assertEqual(operation["operationId"], manifest["skills"][0]["target"]["http_operation_id"])
@@ -557,6 +579,14 @@ class ArtifactTests(unittest.TestCase):
                 checks.append(f"{name} {hashlib.sha256((package / name).read_bytes()).hexdigest()}\n")
             self.assertEqual(cap["contract"]["schema_digest"], "sha256:" + hashlib.sha256("".join(checks).encode()).hexdigest())
             self.assertEqual(manifest["skills"][0]["version"], "2.0.0")
+            self.assertEqual(manifest["config_schema"]["properties"]["test_hold_receipt"], {"const": True})
+            raw = (root / "xelab/http/openapi.json").read_bytes()
+            operation = json.loads(raw)["paths"][HOLD_PATH]["post"]
+            hold = manifest["skills"][-1]
+            self.assertEqual(hold["target"]["http_operation_id"], operation["operationId"])
+            self.assertEqual(hold["target"]["http_contract_digest"], "sha256:" + hashlib.sha256(raw).hexdigest())
+            self.assertEqual(hold["input_schema"], operation["requestBody"]["content"]["application/json"]["schema"])
+            self.assertEqual(hold["output_schema"], operation["responses"]["200"]["content"]["application/json"]["schema"])
 
 
 if __name__ == "__main__":

@@ -30,6 +30,7 @@ pub fn context(subject: Option<Uuid>) -> rpc::RpcContext {
 }
 
 pub async fn run(app: Arc<App>) {
+    let mut workers = tokio::task::JoinSet::new();
     let mut state = ControllerState::default();
     let mut rotate = tokio::time::Instant::now();
     loop {
@@ -62,9 +63,26 @@ pub async fn run(app: Arc<App>) {
                 );
             }
         }
+        while let Some(result) = workers.try_join_next() {
+            if let Err(error) = result {
+                tracing::error!(
+                    reason_code = "TASK_WORKER_EXIT",
+                    panicked = error.is_panic(),
+                    "Task worker stopped unexpectedly"
+                );
+            }
+        }
+        if app.ready.load(Ordering::SeqCst)
+            && workers.is_empty()
+            && !app.shutdown.load(Ordering::SeqCst)
+            && !app.leader.is_closed()
+        {
+            workers.spawn(crate::task_worker::run(app.clone()));
+        }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
     app.ready.store(false, Ordering::SeqCst);
+    workers.shutdown().await;
 }
 
 #[derive(Default)]
@@ -190,6 +208,62 @@ async fn reconcile_tick(app: &App, state: &mut ControllerState) -> Result<()> {
     result
 }
 
+pub(crate) async fn startup_runtime_ids(c: &tokio_postgres::Client) -> Result<Vec<Uuid>> {
+    // A missing container record is not a stop proof for a durable instance ID.
+    // Call reservations do not have an instance_id of their own.
+    Ok(c.query(
+        "WITH unsettled_calls(id) AS (
+             SELECT id FROM calls WHERE state IN ('accepted','running')
+             UNION SELECT id FROM reservations WHERE kind='call' AND status<>'released'
+             UNION SELECT broker_call_id FROM attempts
+                 WHERE state IN ('leased','running') AND broker_call_id IS NOT NULL
+         )
+         SELECT provider_instance_id FROM calls JOIN unsettled_calls USING (id)
+             WHERE provider_instance_id IS NOT NULL
+         UNION SELECT instance_id FROM volume_attachments
+         UNION SELECT instance_id FROM plugin_http_requests",
+        &[],
+    )
+    .await?
+    .into_iter()
+    .map(|row| row.get(0))
+    .collect())
+}
+
+/// The startup leader calls this only after stopping every known old runtime.
+pub(crate) async fn settle_startup_metadata(tx: &tokio_postgres::Transaction<'_>) -> Result<()> {
+    db::call_lock(tx).await?;
+    crate::volumes::release_stopped(tx, None).await?;
+    tx.execute("DELETE FROM plugin_http_requests", &[]).await?;
+    tx.execute(
+        "UPDATE calls SET state='unknown',error=$1 WHERE state IN ('accepted','running')",
+        &[&Error::new(
+            "OUTCOME_UNKNOWN",
+            "Kernel restarted before the result was committed",
+            axum::http::StatusCode::CONFLICT,
+        )
+        .detail()],
+    )
+    .await?;
+    tx.execute(
+        "UPDATE rpc_delegations SET status='revoked' WHERE status='active'",
+        &[],
+    )
+    .await?;
+    crate::tasks::revoke_transient_delegations(tx).await?;
+    tx.execute(
+        "UPDATE reservations SET status='released' WHERE kind='call' AND status<>'released'",
+        &[],
+    )
+    .await?;
+    crate::task_engine::reconcile_stopped(tx).await?;
+    crate::task_engine::finish_stopped_cancellations(tx).await?;
+    tx.execute("UPDATE quotas SET concurrent_calls_used=0", &[])
+        .await?;
+    tx.execute("UPDATE instances SET phase='pending',health='unknown',restart_count=0,revision=revision+1,updated_at=now() WHERE phase<>'stopped'", &[]).await?;
+    Ok(())
+}
+
 async fn tick(app: &App, first: bool, state: &mut ControllerState) -> Result<()> {
     let mut c = app.db.connect().await?;
     if first {
@@ -204,51 +278,12 @@ async fn tick(app: &App, first: bool, state: &mut ControllerState) -> Result<()>
         // Stable instance IDs and their resource reservations survive this restart.
         let mut old: std::collections::BTreeSet<Uuid> =
             app.runtime.inventory().await?.into_iter().collect();
-        // A lost container record does not prove that its old cgroup is empty.
-        // Every durable attachment also needs an explicit stop proof.
-        old.extend(
-            c.query("SELECT DISTINCT instance_id FROM volume_attachments", &[])
-                .await?
-                .into_iter()
-                .map(|r| r.get::<_, Uuid>(0)),
-        );
-        old.extend(
-            c.query("SELECT DISTINCT instance_id FROM plugin_http_requests", &[])
-                .await?
-                .into_iter()
-                .map(|row| row.get::<_, Uuid>(0)),
-        );
+        old.extend(startup_runtime_ids(&c).await?);
         for id in old {
             app.runtime.stop(id).await?;
         }
         let tx = c.transaction().await?;
-        db::call_lock(&tx).await?;
-        crate::volumes::release_stopped(&tx, None).await?;
-        tx.execute("DELETE FROM plugin_http_requests", &[]).await?;
-        tx.execute(
-            "UPDATE calls SET state='unknown',error=$1 WHERE state IN ('accepted','running')",
-            &[&Error::new(
-                "OUTCOME_UNKNOWN",
-                "Kernel restarted before the result was committed",
-                axum::http::StatusCode::CONFLICT,
-            )
-            .detail()],
-        )
-        .await?;
-        tx.execute(
-            "UPDATE rpc_delegations SET status='revoked' WHERE status='active'",
-            &[],
-        )
-        .await?;
-        crate::tasks::revoke_transient_delegations(&tx).await?;
-        tx.execute(
-            "UPDATE reservations SET status='released' WHERE kind='call' AND status<>'released'",
-            &[],
-        )
-        .await?;
-        tx.execute("UPDATE quotas SET concurrent_calls_used=0", &[])
-            .await?;
-        tx.execute("UPDATE instances SET phase='pending',health='unknown',restart_count=0,revision=revision+1,updated_at=now() WHERE phase<>'stopped'", &[]).await?;
+        settle_startup_metadata(&tx).await?;
         tx.commit().await?;
         c.execute(
             "UPDATE node_budget SET admission_enabled=true,revision=revision+1,updated_at=now()",
