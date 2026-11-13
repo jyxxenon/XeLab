@@ -510,9 +510,12 @@ fn invoke_inner<'a>(
         }
         tx.commit().await?;
         drop(c);
-        let remaining = || {
-            Duration::from_millis((deadline - chrono::Utc::now()).num_milliseconds().max(0) as u64)
-        };
+        let execution_deadline = deadline_bound.min(
+            tokio::time::Instant::now()
+                + (deadline - chrono::Utc::now()).to_std().unwrap_or_default(),
+        );
+        let remaining =
+            || execution_deadline.saturating_duration_since(tokio::time::Instant::now());
         let result = async {
             if let Some(stream) = stream {
                 if let Some(skill) = skill.as_ref() {
@@ -530,7 +533,11 @@ fn invoke_inner<'a>(
                 stream.emit("accepted", json!({})).await?;
             }
             let address = app.runtime.address(instance)?;
-            let channel = tls::channel(&app.config, instance, generation, &address).await?;
+            // Use the admitted Call budget for business RPCs, including time
+            // spent in admission. Lifecycle RPCs retain their own timeout.
+            let channel =
+                tls::channel_with_timeout(&app.config, instance, generation, &address, remaining())
+                    .await?;
             let mut client = CapabilityServiceClient::new(channel).max_decoding_message_size(
                 app.config
                     .rpc_limit(stream.map(|s| s.maximum_rpc_response()).unwrap_or(16778240)),
@@ -692,7 +699,7 @@ fn invoke_inner<'a>(
             }
         };
         let monitored = race_live_call(result, monitor, consumer);
-        let mut result = tokio::time::timeout(remaining(), monitored)
+        let mut result = tokio::time::timeout_at(execution_deadline, monitored)
             .await
             .unwrap_or_else(|_| {
                 Err(Error::new(
