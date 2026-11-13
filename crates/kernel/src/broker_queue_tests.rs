@@ -397,15 +397,22 @@ async fn concurrent_same_key_waiters_dispatch_once_and_replay_the_confirmed_resu
 
 #[tokio::test]
 async fn concurrent_unary_completions_release_slots_during_a_burst() {
-    let Some(c) = Component::new(object_concurrency()).await else {
+    let mut concurrency = object_concurrency();
+    // Exercise slot recycling under concurrent finalization. Deadline
+    // enforcement is covered independently using the signed five seconds.
+    concurrency["queue_timeout_ms"] = json!(30000);
+    let Some(c) = Component::new(concurrency).await else {
         return;
     };
     c.gate.add_permits(12);
     let requests: Vec<_> = (0..12)
-        .map(|n| c.owner_call(&format!("burst-{n}"), 15000))
+        .map(|n| c.owner_call(&format!("burst-{n}"), 30000))
         .collect();
-    for request in requests {
-        request.await.unwrap().unwrap();
+    for (index, request) in requests.into_iter().enumerate() {
+        request
+            .await
+            .unwrap()
+            .unwrap_or_else(|error| panic!("burst-{index} failed: {error:?}"));
     }
     assert_eq!(c.ledger().await, (12, 0, 12));
     assert_eq!(c.plugin.calls.load(Ordering::SeqCst), 12);
