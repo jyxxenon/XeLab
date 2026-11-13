@@ -48,6 +48,9 @@ mod platform_versioned;
 
 #[path = "support/m4.rs"]
 mod m4;
+#[path = "support/oci_process.rs"]
+mod oci_process;
+use oci_process::{exited as stream_process_exited, running as stream_process};
 #[path = "support/ordinary_effects.rs"]
 mod ordinary_effects;
 #[path = "support/upgrades.rs"]
@@ -2302,36 +2305,6 @@ async fn ordinary_skill_lifecycle(
     skill
 }
 
-// Capture the actual task PID and start time so a released ledger row alone
-// cannot be mistaken for proof that the previous OCI process stopped.
-async fn stream_process(app: &App, instance: Uuid) -> (u32, String) {
-    let tasks = String::from_utf8(
-        app.runtime
-            .ctr(&["tasks".into(), "list".into()])
-            .await
-            .unwrap(),
-    )
-    .unwrap();
-    let pid = tasks
-        .lines()
-        .find_map(|line| {
-            let fields: Vec<_> = line.split_whitespace().collect();
-            (fields.len() >= 3 && fields[0] == instance.to_string() && fields[2] == "RUNNING")
-                .then(|| fields[1].parse::<u32>().unwrap())
-        })
-        .expect("a healthy provider must have a real running OCI task");
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
-    let started = stat
-        .rsplit_once(") ")
-        .unwrap()
-        .1
-        .split_whitespace()
-        .nth(19)
-        .unwrap()
-        .to_owned();
-    (pid, started)
-}
-
 // This is an observation of real tasks, never a provider/heartbeat fixture.
 // Include every live SQL identity so a stale draining historical instance
 // cannot be silently omitted from the offline source's consistency boundary.
@@ -2386,21 +2359,6 @@ async fn offline_source_processes(
     processes
 }
 
-fn stream_process_exited(process: &(u32, String)) -> bool {
-    match fs::read_to_string(format!("/proc/{}/stat", process.0)) {
-        Ok(stat) => {
-            stat.rsplit_once(") ")
-                .unwrap()
-                .1
-                .split_whitespace()
-                .nth(19)
-                .unwrap()
-                != process.1
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
-        Err(error) => panic!("cannot verify the old OCI process: {error}"),
-    }
-}
 struct StreamRecovery<'a> {
     app: &'a App,
     router: &'a Router,

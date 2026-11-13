@@ -406,18 +406,24 @@ pub(crate) async fn revalidate(
         .await?;
     authorize_saved(c, &ctx, row).await?;
     let deployment: Uuid = row.get("deployment_id");
+    let metadata: Value = row.get("installation_metadata");
     let current = c.query_opt("SELECT d.spec,d.installation_id,d.archived_at FROM deployments d JOIN deployment_storage_holds h ON h.deployment_id=d.id AND h.operation_id=$2 WHERE d.id=$1", &[&deployment,&operation]).await?.ok_or_else(|| Error::conflict("Schema bootstrap deployment hold is missing"))?;
     if current.get::<_, Value>("spec") != row.get::<_, Value>("deployment_spec")
         || current.get::<_, Uuid>("installation_id") != row.get::<_, Uuid>("installation_id")
         || current
             .get::<_, Option<chrono::DateTime<chrono::Utc>>>("archived_at")
             .is_some()
-        || upgrades::installation(c, row.get("installation_id")).await?
-            != row.get::<_, Value>("installation_metadata")
+        || upgrades::installation(c, row.get("installation_id")).await? != metadata
     {
         return Err(Error::conflict(
             "Schema bootstrap immutable deployment changed",
         ));
+    }
+    if metadata["manifest"]["requested_rules"]
+        .as_array()
+        .is_some_and(|rules| !rules.is_empty())
+    {
+        crate::host_blobs::check_approval(c, app, deployment, &metadata["manifest"]).await?;
     }
     let instance: Uuid = row.get("instance_id");
     let current = c

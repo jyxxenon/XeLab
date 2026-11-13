@@ -240,6 +240,18 @@ pub async fn create(
     )
     .await?;
     let original: Value = row.get("spec");
+    // The worker clears approvals when publishing a new installation. A
+    // versioned target with required Blob grants must be approved while disabled.
+    if original["enabled"] == true
+        && target["manifest"]["data_schema_version"] != "none"
+        && target["manifest"]["requested_rules"]
+            .as_array()
+            .is_some_and(|rules| rules.iter().any(|request| request["required"] == true))
+    {
+        return Err(Error::conflict(
+            "Disable the deployment before changing to a versioned installation that requires Blob approvals",
+        ));
+    }
     let mut next = original.clone();
     next["installation_id"] = json!(target_id);
     Artifact {

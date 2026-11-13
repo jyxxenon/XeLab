@@ -176,11 +176,9 @@ fn validate_profile_inner(manifest: &Value, allow_versioned: bool) -> Result<()>
     }
     if versioned {
         let schema = manifest["data_schema_version"].as_str().unwrap();
-        let requests = manifest.get("requested_rules").and_then(Value::as_array);
         let volumes = manifest["volumes"].as_array().unwrap();
         if schema.len() > 64
             || schema.chars().any(char::is_control)
-            || requests.is_some_and(|r| !r.is_empty())
             || manifest["upgrade_strategy"] != "recreate"
             || volumes.is_empty()
             || volumes.len() > 16
@@ -195,7 +193,34 @@ fn validate_profile_inner(manifest: &Value, allow_versioned: bool) -> Result<()>
             })
         {
             return Err(Error::invalid(
-                "Versioned data requires an exclusive recreate volume group without proxy requests",
+                "Versioned data requires an exclusive recreate volume group",
+            ));
+        }
+        // A verified data provider can read input Blobs and create result Blobs
+        // under the current Skill Call's authority. Lifecycle instances have no
+        // active Call delegation and still cannot access HostService Blobs.
+        if manifest["requested_rules"].as_array().is_some_and(|rules| {
+            !rules.is_empty()
+                && (manifest["business_entry"] != "skill_required"
+                    || !manifest["routes"].as_array().is_some_and(Vec::is_empty)
+                    || !manifest["dependencies"]
+                        .as_array()
+                        .is_some_and(Vec::is_empty)
+                    || manifest["capabilities"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|cap| !cap["stream_item_schema"].is_null())
+                    || rules.iter().any(|request| {
+                        request["rule"]["resource"]["kind"] != "blob"
+                            || !matches!(
+                                request["rule"]["action"].as_str(),
+                                Some("blob.read" | "blob.create")
+                            )
+                    }))
+        }) {
+            return Err(Error::invalid(
+                "Versioned proxy requests require unary Skills with only Blob read and create access",
             ));
         }
     }
@@ -567,6 +592,49 @@ mod tests {
             }
             assert!(validate_runtime_profile(&wrong).is_err(), "{variant}");
         }
+    }
+
+    #[test]
+    fn versioned_blob_requests_use_the_internal_unary_skill_profile() {
+        let mut manifest: Value = serde_json::from_str(include_str!(
+            "../../../docs/preset-plugins/object-storage/manifest.json"
+        ))
+        .unwrap();
+        validate_runtime_profile(&manifest).unwrap();
+        let key_schema = &manifest["capabilities"][0]["input_schema"]["properties"]["key"];
+        assert!(!key_schema["pattern"].as_str().unwrap().contains('\0'));
+        validate_business(key_schema, &json!("reports/报告.txt")).unwrap();
+        for key in [
+            "reports\0/file",
+            "reports/\u{1f}",
+            "reports/\u{7f}",
+            "reports\\file",
+        ] {
+            assert!(validate_business(key_schema, &json!(key)).is_err());
+        }
+        assert_eq!(
+            validate_profile(&manifest).unwrap_err().message,
+            "Unsupported plugin profile"
+        );
+        for (action, kind) in [
+            ("skill.invoke", "skill"),
+            ("capability.invoke", "capability"),
+            ("event.publish", "event"),
+            ("blob.read", "plugin"),
+        ] {
+            let mut invalid = manifest.clone();
+            invalid["requested_rules"][0]["rule"]["action"] = json!(action);
+            invalid["requested_rules"][0]["rule"]["resource"]["kind"] = json!(kind);
+            assert!(
+                validate_runtime_profile(&invalid).is_err(),
+                "{action} {kind}"
+            );
+        }
+        let mut invalid = manifest.clone();
+        invalid["capabilities"][0]["stream_item_schema"] = json!({"type":"string"});
+        assert!(validate_runtime_profile(&invalid).is_err());
+        manifest["business_entry"] = json!("direct");
+        assert!(validate_runtime_profile(&manifest).is_err());
     }
 
     #[test]

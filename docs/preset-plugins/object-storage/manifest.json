@@ -16,7 +16,7 @@
       "contract": {
         "name": "data.object.put",
         "version": "1.0.0",
-        "schema_digest": "sha256:1d6e52730bee82172976ba1f7e03929d5c1a9e36ca10c3bd4db0bc182ae152cc"
+        "schema_digest": "sha256:efbe1b0c1188f1d2c0bdbda74c32c314ade6476467ff0c858a392fba4fa26fbc"
       },
       "input_schema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -28,7 +28,7 @@
             "minLength": 1,
             "maxLength": 1024,
             "description": "NFC逻辑key，UTF8<=1024字节；拒绝首尾斜线/空段/dot段/控制符/反斜线，不作URL decode",
-            "pattern": "^[^\u0000-\u001f\\\\]+$",
+            "pattern": "^[^\\x00-\\x1F\\x7F\\\\]+$",
             "example": "reports/example.txt"
           },
           "blob_id": {
@@ -134,7 +134,7 @@
                 "minLength": 1,
                 "maxLength": 1024,
                 "description": "NFC逻辑key，UTF8<=1024字节；拒绝首尾斜线/空段/dot段/控制符/反斜线，不作URL decode",
-                "pattern": "^[^\u0000-\u001f\\\\]+$",
+                "pattern": "^[^\\x00-\\x1F\\x7F\\\\]+$",
                 "example": "reports/example.txt"
               },
               "revision": {
@@ -205,7 +205,7 @@
       "contract": {
         "name": "data.object.list",
         "version": "1.0.0",
-        "schema_digest": "sha256:2dd1db5e881f8482d91489566c89145c65e689bcc658314443f3bcb9b6b79e19"
+        "schema_digest": "sha256:4ae27364cfd7b9b51323224af5e50277cd42d24ea43df09837c77e60fab5bb39"
       },
       "input_schema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -267,7 +267,7 @@
                   "minLength": 1,
                   "maxLength": 1024,
                   "description": "NFC逻辑key，UTF8<=1024字节；拒绝首尾斜线/空段/dot段/控制符/反斜线，不作URL decode",
-                  "pattern": "^[^\u0000-\u001f\\\\]+$",
+                  "pattern": "^[^\\x00-\\x1F\\x7F\\\\]+$",
                   "example": "reports/example.txt"
                 },
                 "revision": {
@@ -355,7 +355,7 @@
       "contract": {
         "name": "data.object.stat",
         "version": "1.0.0",
-        "schema_digest": "sha256:d525223c471a851e12100708fd74a7fb944fd9675dc4ab009262da7e64df7c74"
+        "schema_digest": "sha256:c63590fb048ffc6c4fb0c35bf7203d9f7da600286bfc092eafb62feaa3a28d92"
       },
       "input_schema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -367,7 +367,7 @@
             "minLength": 1,
             "maxLength": 1024,
             "description": "NFC逻辑key，UTF8<=1024字节；拒绝首尾斜线/空段/dot段/控制符/反斜线，不作URL decode",
-            "pattern": "^[^\u0000-\u001f\\\\]+$",
+            "pattern": "^[^\\x00-\\x1F\\x7F\\\\]+$",
             "example": "reports/example.txt"
           }
         },
@@ -404,7 +404,7 @@
                 "minLength": 1,
                 "maxLength": 1024,
                 "description": "NFC逻辑key，UTF8<=1024字节；拒绝首尾斜线/空段/dot段/控制符/反斜线，不作URL decode",
-                "pattern": "^[^\u0000-\u001f\\\\]+$",
+                "pattern": "^[^\\x00-\\x1F\\x7F\\\\]+$",
                 "example": "reports/example.txt"
               },
               "revision": {
@@ -475,7 +475,7 @@
       "contract": {
         "name": "data.object.export",
         "version": "1.0.0",
-        "schema_digest": "sha256:f1cf0208bbcb7eff045e1307d3d340f14f5dd908bcd99698e2b58dc352d9b57d"
+        "schema_digest": "sha256:19277fe085b821081727a4202c98ea151102ccfdde7e448d79cfeb2b46046538"
       },
       "input_schema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -487,7 +487,7 @@
             "minLength": 1,
             "maxLength": 1024,
             "description": "NFC逻辑key，UTF8<=1024字节；拒绝首尾斜线/空段/dot段/控制符/反斜线，不作URL decode",
-            "pattern": "^[^\u0000-\u001f\\\\]+$",
+            "pattern": "^[^\\x00-\\x1F\\x7F\\\\]+$",
             "example": "reports/example.txt"
           },
           "expected_revision": {
@@ -567,7 +567,7 @@
       "contract": {
         "name": "data.object.delete",
         "version": "1.0.0",
-        "schema_digest": "sha256:9d7c1ffe820bf90d5221b961a56c3691cb16e4bb946d189a346d5e3eaf3f5466"
+        "schema_digest": "sha256:3e7f59a85c14c1e25546d79b3eabcf80d5b348b7988d522567a5d8f0b31a697b"
       },
       "input_schema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -579,7 +579,7 @@
             "minLength": 1,
             "maxLength": 1024,
             "description": "NFC逻辑key，UTF8<=1024字节；拒绝首尾斜线/空段/dot段/控制符/反斜线，不作URL decode",
-            "pattern": "^[^\u0000-\u001f\\\\]+$",
+            "pattern": "^[^\\x00-\\x1F\\x7F\\\\]+$",
             "example": "reports/example.txt"
           },
           "expected_revision": {
@@ -629,7 +629,7 @@
       "contract": {
         "name": "data.object.usage.get",
         "version": "1.0.0",
-        "schema_digest": "sha256:6343e9c3b79aa482131a4c2ed5a11b6f0b5a4acc6707b0607e3fee68cafaadd3"
+        "schema_digest": "sha256:06edd6ab369c29f57d164af5d0d8b84a7b55358c081937b79a07bec93b1baca7"
       },
       "input_schema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -815,7 +815,7 @@
             "minLength": 1,
             "maxLength": 1024,
             "description": "NFC逻辑key，UTF8<=1024字节；拒绝首尾斜线/空段/dot段/控制符/反斜线，不作URL decode",
-            "pattern": "^[^\u0000-\u001f\\\\]+$",
+            "pattern": "^[^\\x00-\\x1F\\x7F\\\\]+$",
             "example": "reports/example.txt"
           },
           "blob_id": {
@@ -921,7 +921,7 @@
                 "minLength": 1,
                 "maxLength": 1024,
                 "description": "NFC逻辑key，UTF8<=1024字节；拒绝首尾斜线/空段/dot段/控制符/反斜线，不作URL decode",
-                "pattern": "^[^\u0000-\u001f\\\\]+$",
+                "pattern": "^[^\\x00-\\x1F\\x7F\\\\]+$",
                 "example": "reports/example.txt"
               },
               "revision": {
@@ -990,7 +990,7 @@
         "contract": {
           "name": "data.object.put",
           "version": "1.0.0",
-          "schema_digest": "sha256:1d6e52730bee82172976ba1f7e03929d5c1a9e36ca10c3bd4db0bc182ae152cc"
+          "schema_digest": "sha256:efbe1b0c1188f1d2c0bdbda74c32c314ade6476467ff0c858a392fba4fa26fbc"
         }
       },
       "mapping": "identity",
@@ -1065,7 +1065,7 @@
                   "minLength": 1,
                   "maxLength": 1024,
                   "description": "NFC逻辑key，UTF8<=1024字节；拒绝首尾斜线/空段/dot段/控制符/反斜线，不作URL decode",
-                  "pattern": "^[^\u0000-\u001f\\\\]+$",
+                  "pattern": "^[^\\x00-\\x1F\\x7F\\\\]+$",
                   "example": "reports/example.txt"
                 },
                 "revision": {
@@ -1151,7 +1151,7 @@
         "contract": {
           "name": "data.object.list",
           "version": "1.0.0",
-          "schema_digest": "sha256:2dd1db5e881f8482d91489566c89145c65e689bcc658314443f3bcb9b6b79e19"
+          "schema_digest": "sha256:4ae27364cfd7b9b51323224af5e50277cd42d24ea43df09837c77e60fab5bb39"
         }
       },
       "mapping": "identity",
@@ -1176,7 +1176,7 @@
             "minLength": 1,
             "maxLength": 1024,
             "description": "NFC逻辑key，UTF8<=1024字节；拒绝首尾斜线/空段/dot段/控制符/反斜线，不作URL decode",
-            "pattern": "^[^\u0000-\u001f\\\\]+$",
+            "pattern": "^[^\\x00-\\x1F\\x7F\\\\]+$",
             "example": "reports/example.txt"
           }
         },
@@ -1213,7 +1213,7 @@
                 "minLength": 1,
                 "maxLength": 1024,
                 "description": "NFC逻辑key，UTF8<=1024字节；拒绝首尾斜线/空段/dot段/控制符/反斜线，不作URL decode",
-                "pattern": "^[^\u0000-\u001f\\\\]+$",
+                "pattern": "^[^\\x00-\\x1F\\x7F\\\\]+$",
                 "example": "reports/example.txt"
               },
               "revision": {
@@ -1282,7 +1282,7 @@
         "contract": {
           "name": "data.object.stat",
           "version": "1.0.0",
-          "schema_digest": "sha256:d525223c471a851e12100708fd74a7fb944fd9675dc4ab009262da7e64df7c74"
+          "schema_digest": "sha256:c63590fb048ffc6c4fb0c35bf7203d9f7da600286bfc092eafb62feaa3a28d92"
         }
       },
       "mapping": "identity",
@@ -1307,7 +1307,7 @@
             "minLength": 1,
             "maxLength": 1024,
             "description": "NFC逻辑key，UTF8<=1024字节；拒绝首尾斜线/空段/dot段/控制符/反斜线，不作URL decode",
-            "pattern": "^[^\u0000-\u001f\\\\]+$",
+            "pattern": "^[^\\x00-\\x1F\\x7F\\\\]+$",
             "example": "reports/example.txt"
           },
           "expected_revision": {
@@ -1385,7 +1385,7 @@
         "contract": {
           "name": "data.object.export",
           "version": "1.0.0",
-          "schema_digest": "sha256:f1cf0208bbcb7eff045e1307d3d340f14f5dd908bcd99698e2b58dc352d9b57d"
+          "schema_digest": "sha256:19277fe085b821081727a4202c98ea151102ccfdde7e448d79cfeb2b46046538"
         }
       },
       "mapping": "identity",
@@ -1410,7 +1410,7 @@
             "minLength": 1,
             "maxLength": 1024,
             "description": "NFC逻辑key，UTF8<=1024字节；拒绝首尾斜线/空段/dot段/控制符/反斜线，不作URL decode",
-            "pattern": "^[^\u0000-\u001f\\\\]+$",
+            "pattern": "^[^\\x00-\\x1F\\x7F\\\\]+$",
             "example": "reports/example.txt"
           },
           "expected_revision": {
@@ -1458,7 +1458,7 @@
         "contract": {
           "name": "data.object.delete",
           "version": "1.0.0",
-          "schema_digest": "sha256:9d7c1ffe820bf90d5221b961a56c3691cb16e4bb946d189a346d5e3eaf3f5466"
+          "schema_digest": "sha256:3e7f59a85c14c1e25546d79b3eabcf80d5b348b7988d522567a5d8f0b31a697b"
         }
       },
       "mapping": "identity",
@@ -1541,7 +1541,7 @@
         "contract": {
           "name": "data.object.usage.get",
           "version": "1.0.0",
-          "schema_digest": "sha256:6343e9c3b79aa482131a4c2ed5a11b6f0b5a4acc6707b0607e3fee68cafaadd3"
+          "schema_digest": "sha256:06edd6ab369c29f57d164af5d0d8b84a7b55358c081937b79a07bec93b1baca7"
         }
       },
       "mapping": "identity",

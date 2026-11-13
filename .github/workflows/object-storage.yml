@@ -1,0 +1,167 @@
+name: Object storage RPC conformance
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/object-storage.yml"
+      - "examples/object-storage/**"
+      - "docs/preset-plugins/object-storage/**"
+      - "docs/preset-plugins/contracts/registry.json"
+      - "docs/skills/object-storage/**"
+      - "docs/contracts/proto/**"
+      - "examples/echo/sign_artifact.py"
+      - "crates/kernel/src/artifact.rs"
+      - "crates/kernel/src/schema_jobs*.rs"
+      - "crates/kernel/src/upgrades.rs"
+      - "crates/kernel/tests/volumes.rs"
+      - "crates/kernel/tests/support/schema_bootstrap.rs"
+      - "crates/kernel/tests/support/object_storage_kernel.rs"
+
+permissions:
+  contents: read
+
+jobs:
+  component:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: xelab
+          POSTGRES_PASSWORD: test-only-password
+          POSTGRES_DB: xelab_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U xelab -d xelab_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      XELAB_TEST_DATABASE_URL: "host=127.0.0.1 port=5432 user=xelab password=test-only-password dbname=xelab_test"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Build the object storage release and conformance images
+        run: |
+          python3 examples/object-storage/build_artifact.py \
+            --publisher-id 00000000-0000-4000-8000-000000000001
+          docker build --platform linux/amd64 --target release \
+            -f examples/object-storage/Dockerfile -t docker.io/xelab-ci/object-storage:acceptance .
+          docker build --platform linux/amd64 --target conformance \
+            -f examples/object-storage/Dockerfile -t xelab-object-storage-rpc:acceptance .
+      - name: Test mutual TLS and delegated Blob transport without external networking
+        run: |
+          docker run --rm --pull never --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --tmpfs /tmp:rw,nosuid,nodev,noexec,mode=1777 \
+            xelab-object-storage-rpc:acceptance
+      - name: Verify a signed, immutable release image in containerd
+        run: |
+          sudo systemctl start containerd
+          sudo ctr namespaces create xelab-ci
+          private=$(mktemp -d "$RUNNER_TEMP/xelab-object-artifact.XXXXXXXX")
+          mkdir "$private/rootfs"
+          cleanup() {
+            if mountpoint -q "$private/rootfs"; then sudo umount "$private/rootfs" || return; fi
+            rm -rf -- "$private"
+          }
+          trap cleanup EXIT
+          tag=docker.io/xelab-ci/object-storage:acceptance
+          docker save "$tag" -o "$private/image.tar"
+          sudo ctr -n xelab-ci images import "$private/image.tar"
+          rm -- "$private/image.tar"
+          record=$(sudo ctr -n xelab-ci images list | awk -v tag="$tag" '$1 == tag {print $2,$3}')
+          read -r media digest <<< "$record"
+          if [[ ! "$digest" =~ ^sha256:[a-f0-9]{64}$ || ( "$media" != application/vnd.oci.image.manifest.v1+json && "$media" != application/vnd.docker.distribution.manifest.v2+json ) ]]; then
+            echo 'Expected a platform-specific OCI manifest' >&2
+            exit 1
+          fi
+          image="${tag%:*}@$digest"
+          sudo ctr -n xelab-ci images tag "$tag" "$image"
+          echo "XELAB_TEST_OBJECT_STORAGE_IMAGE=$image" >> "$GITHUB_ENV"
+          sudo ctr -n xelab-ci images mount "$image" "$private/rootfs"
+          manifest="$private/rootfs/xelab/plugin.json"
+          cmp "$manifest" examples/object-storage/generated/xelab/plugin.json
+          umask 077
+          openssl genpkey -algorithm Ed25519 -out "$private/fixture.key"
+          openssl pkey -in "$private/fixture.key" -pubout -out "$private/fixture.pub"
+          python3 examples/echo/sign_artifact.py --image "$image" --manifest "$manifest" \
+            --key "$private/fixture.key" > "$private/install.json"
+          python3 - "$private" "$image" <<'PY'
+          import base64, hashlib, json, pathlib, subprocess, sys
+          directory, image = pathlib.Path(sys.argv[1]), sys.argv[2]
+          install = json.loads((directory / "install.json").read_bytes())
+          raw = (directory / "rootfs/xelab/plugin.json").read_bytes()
+          manifest = json.loads(raw)
+          assert install["image"] == image and install["publisher_id"] == manifest["publisher_id"]
+          envelope = "\n".join(("xelab-artifact-v1", manifest["publisher_id"], manifest["plugin_id"],
+                                manifest["version"], image.rsplit("@", 1)[1],
+                                "sha256:" + hashlib.sha256(raw).hexdigest(), ""))
+          (directory / "envelope").write_text(envelope, encoding="utf-8")
+          (directory / "signature").write_bytes(base64.b64decode(install["signature"], validate=True))
+          subprocess.run(["openssl", "pkeyutl", "-verify", "-rawin", "-pubin", "-inkey", directory / "fixture.pub",
+                          "-in", directory / "envelope", "-sigfile", directory / "signature"], check=True)
+          print(f"Verified signed bytes from imported release image {image}")
+          PY
+      - name: Exercise writable and read-only XFS projects in the container
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y nftables xfsprogs
+          private=$(mktemp -d "$RUNNER_TEMP/xelab-object-xfs.XXXXXXXX")
+          filesystem="$private/fs"
+          mkdir "$filesystem"
+          cleanup() {
+            if mountpoint -q "$filesystem"; then sudo umount "$filesystem" || return; fi
+            rm -rf -- "$private"
+          }
+          trap cleanup EXIT
+          truncate -s 24G "$private/volume.img"
+          sudo mkfs.xfs -q "$private/volume.img"
+          sudo mount -o loop,prjquota,nosuid,nodev,noexec "$private/volume.img" "$filesystem"
+          project="$filesystem/objects"
+          sudo install -d -m 0700 -o 65532 -g 65532 "$project"
+          sudo xfs_quota -x -c "project -s -p $project 12001" "$filesystem"
+          sudo xfs_quota -x -c 'limit -p bhard=20g 12001' "$filesystem"
+          args=(--rm --pull never --network none --read-only --cap-drop ALL
+            --security-opt no-new-privileges --tmpfs /tmp:rw,nosuid,nodev,noexec,mode=1777
+            --env XELAB_OBJECT_TEST_XFS=1 --workdir /tests --entrypoint /usr/bin/python3)
+          docker run "${args[@]}" --mount "type=bind,src=$project,dst=/data/objects" \
+            xelab-object-storage-rpc:acceptance -m unittest -v physical_rpc.ObjectXfs.test_write_on_project_volume
+          docker run "${args[@]}" --mount "type=bind,src=$project,dst=/data/objects,readonly" \
+            xelab-object-storage-rpc:acceptance -m unittest -v physical_rpc.ObjectXfs.test_verify_on_read_only_project_volume
+          sudo xfs_quota -x -c 'limit -p bhard=1g 12001' "$filesystem"
+          docker run "${args[@]}" --mount "type=bind,src=$project,dst=/data/objects" \
+            xelab-object-storage-rpc:acceptance -m unittest -v physical_rpc.ObjectXfs.test_refuses_an_undersized_project_volume
+      - name: Compile the kernel volume acceptance binary
+        run: cargo test -p xelab-kernel --test volumes --no-run --locked
+      - name: Bootstrap signed object storage in the kernel and invoke its Skills
+        run: |
+          mapfile -t binaries < <(find target/debug/deps -maxdepth 1 -type f -executable -name 'volumes-*')
+          test "${#binaries[@]}" -eq 1
+          sudo --preserve-env=XELAB_TEST_DATABASE_URL,XELAB_TEST_OBJECT_STORAGE_IMAGE \
+            bash -s -- "${binaries[0]}" <<'BASH'
+          set -euo pipefail
+          private=$(mktemp -d /mnt/xelab-object-kernel.XXXXXXXX)
+          service="$private/service"
+          cleanup() {
+            local rc=$? target
+            local -a mounts
+            trap - EXIT
+            mapfile -t mounts < <(findmnt -rn -o TARGET | awk -v prefix="$service/" 'index($0,prefix)==1' | sort -r)
+            for target in "${mounts[@]}"; do
+              umount "$target" || exit 1
+            done
+            rm -rf --one-file-system -- "$private"
+            exit "$rc"
+          }
+          trap cleanup EXIT
+          mkdir -m 700 "$service" "$service/volumes"
+          truncate -s 24G "$private/volume.img"
+          mkfs.xfs -q "$private/volume.img"
+          mount -o loop,prjquota,nosuid,nodev,noexec "$private/volume.img" "$service/volumes"
+          chmod 700 "$service/volumes"
+          export XELAB_XFS_TEST=1 XELAB_VOLUME_TEST_ROOT="$service"
+          "$1" --ignored --nocapture --exact actual_object_storage_kernel_round_trip
+          BASH

@@ -358,11 +358,28 @@ pub(super) async fn register(
     variable: &str,
     expected_schema: &str,
 ) -> (Uuid, Value, String) {
+    register_artifact(
+        f,
+        publisher,
+        std::path::Path::new(&format!("examples/generated-{variant}/xelab/plugin.json")),
+        variable,
+        expected_schema,
+    )
+    .await
+}
+
+pub(super) async fn register_artifact(
+    f: &Fixture,
+    publisher: Uuid,
+    manifest_path: &std::path::Path,
+    variable: &str,
+    expected_schema: &str,
+) -> (Uuid, Value, String) {
     assert_eq!(unsafe { libc::geteuid() }, 0);
     assert_eq!(std::env::var("XELAB_XFS_TEST").unwrap(), "1");
     let c = f.app.db.connect().await.unwrap();
     let image = std::env::var(variable).expect("CI-imported versioned reference image");
-    let raw = fs::read(format!("examples/generated-{variant}/xelab/plugin.json")).unwrap();
+    let raw = fs::read(manifest_path).unwrap();
     let manifest: Value = serde_json::from_slice(&raw).unwrap();
     assert_eq!(manifest["data_schema_version"], expected_schema);
     assert_eq!(manifest["publisher_id"], publisher.to_string());
@@ -386,6 +403,36 @@ pub(super) async fn register(
         artifact::read_image_file(&mounted, "xelab/plugin.json", 1048576).unwrap(),
         raw
     );
+    for capability in manifest["capabilities"].as_array().unwrap() {
+        let contract = &capability["contract"];
+        let name = contract["name"].as_str().unwrap();
+        let version = contract["version"].as_str().unwrap();
+        let mut checks = String::new();
+        for (file, field) in [
+            ("input.schema.json", "input_schema"),
+            ("output.schema.json", "output_schema"),
+            ("stream.schema.json", "stream_item_schema"),
+            ("semantics.json", "side_effect"),
+        ] {
+            let bytes = artifact::read_image_file(
+                &mounted,
+                &format!("xelab/contracts/{name}/{version}/{file}"),
+                1048576,
+            )
+            .unwrap();
+            let value = contracts::strict_json(&bytes, 1048576).unwrap();
+            if field == "side_effect" {
+                assert_eq!(value[field], capability[field]);
+            } else {
+                assert_eq!(value, capability[field]);
+            }
+            checks.push_str(&format!("{file} {}\n", &contracts::digest(&bytes)[7..]));
+        }
+        assert_eq!(
+            contracts::digest(checks.as_bytes()),
+            contract["schema_digest"]
+        );
+    }
     let request = json!({"publisher_id":publisher,"image":image,"signature":signature});
     let rejected = match artifact::Artifact::inspect(&f.app.runtime, &request, &pem).await {
         Err(error) => error,

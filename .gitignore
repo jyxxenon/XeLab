@@ -12,6 +12,7 @@ __pycache__/
 /examples/generated-volume/
 
 /examples/generated-host-blob/
+/examples/object-storage/generated/
 /examples/generated-m4-consumer/
 
 /examples/generated-schema/

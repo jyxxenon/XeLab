@@ -24,6 +24,8 @@
 
 ## 文档与契约
 
+六个能力都是一元 RPC。各契约目录中的 `stream.schema.json` 包含字面量 `null`，对应清单的 `stream_item_schema: null`，表示该能力不提供流式输出。
+
 - [接口、对象模型与错误](interfaces.md)
 - [配置与容量预算](configuration.md)
 - [持久化、CAS、幂等与GC](storage.md)
