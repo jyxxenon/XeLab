@@ -121,7 +121,7 @@ def build_report(api):
         claim_counts = Counter(claim["user"].casefold() for claim in claims)
         issues.append({
             "number": item["number"],
-            "title": safe_text(redact(item["title"]))[:120],
+            "title": safe_text(redact(item["title"])),
             "url": item["html_url"],
             "labels": labels,
             "status": status,
@@ -130,6 +130,9 @@ def build_report(api):
             "multiple_claimants": len(claim_counts) > 1,
             "repeated_claim_candidates": any(count > 1 for count in claim_counts.values()),
         })
+    duplicates = duplicate_candidates(issues)
+    for issue in issues:
+        issue["title"] = issue["title"][:120]
     return {
         "schema": SCHEMA,
         "kind": "issue-triage-report",
@@ -141,7 +144,7 @@ def build_report(api):
         "unassigned": [i["number"] for i in issues if not i["assignees"]],
         "multiple_claimants": [i["number"] for i in issues if i["multiple_claimants"]],
         "repeated_claim_candidates": [i["number"] for i in issues if i["repeated_claim_candidates"]],
-        "duplicate_candidates": duplicate_candidates(issues),
+        "duplicate_candidates": duplicates,
         "duplicates_are_definitive": False,
         "note": NOTE,
     }
