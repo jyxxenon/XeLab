@@ -198,6 +198,24 @@ class LoginBootstrapAudit:
         self.snapshot(page, label, "failure")
 
 
+def observe_skill_read_status(http, audit, method, path, status):
+    if method != "GET":
+        return
+    if re.fullmatch(r"/api/platform/v1/calls/[0-9a-fA-F-]{36}", path):
+        field = "call_proof_statuses"
+    elif re.fullmatch(r"/api/platform/v1/ui/contributions/[0-9a-fA-F-]{36}/[a-z][a-z0-9_-]{0,63}", path):
+        field = "contribution_recheck_statuses"
+    else:
+        return
+    status = status if 100 <= status <= 599 else 0
+    histories = [http[field]]
+    if audit is not None and audit.entry["status"] == "running":
+        histories.append(audit.entry[field])
+    for entries in histories:
+        entries.append(status)
+        del entries[:-8]
+
+
 class SkillCallAudit:
     """Bounded per-call stage, timing and fixed-state diagnostics.
 
@@ -205,6 +223,7 @@ class SkillCallAudit:
     Only fixed labels, booleans, counters and elapsed times leave the browser.
     """
     limit = 8
+    read_limit = 32
 
     def __init__(self, report, bodies, label, expected_successes):
         self.report, self.bodies = report, bodies
@@ -212,10 +231,11 @@ class SkillCallAudit:
         self.started = time.monotonic()
         self.attempts_start = report["http"]["skill_post_attempts"]
         self.successes_start = report["http"]["actual_skill_successes"]
-        self.proofs_start = len(report["http"].get("call_proof_statuses", ()))
-        self.rechecks_start = len(report["http"].get("contribution_recheck_statuses", ()))
+        self.read_requests = {}
         self.entry = {"label": label, "expected_successes": expected_successes,
-                      "stage": "created", "status": "running", "timeline": []}
+                      "stage": "created", "status": "running", "timeline": [],
+                      "call_proof_statuses": [], "contribution_recheck_statuses": [],
+                      "read_requests": [], "dropped_read_requests": 0}
         entries = report.setdefault("skill_call_diagnostics", [])
         if len(entries) >= self.limit:
             entries.pop(0)
@@ -224,10 +244,56 @@ class SkillCallAudit:
     def elapsed(self):
         return min(max(int((time.monotonic() - self.started) * 1000), 0), 300000)
 
+    def observe_read(self, event, value, core, contribution_paths):
+        if self.entry["status"] != "running":
+            return
+        try:
+            request = value.request if event == "response" else value
+            state = self.read_requests.get(request)
+            if event == "request":
+                if state is None:
+                    self.start_read(request, core, contribution_paths)
+                return
+            if state is None or state["finished_ms"] is not None or state["failed_ms"] is not None:
+                return
+            if event == "response" and state["response_ms"] is None:
+                state["response_ms"] = self.elapsed()
+                status = value.status
+                state["status"] = status if isinstance(status, int) and 100 <= status <= 599 else 0
+            elif event == "finished":
+                state["finished_ms"] = self.elapsed()
+            elif event == "failed":
+                state["failed_ms"] = self.elapsed()
+                state["failure_category"] = selected_failure_category(request.failure)
+        except Exception:
+            self.entry["read_observer_error"] = True
+
+    def start_read(self, request, core, contribution_paths):
+        if request.method != "GET":
+            return
+        parsed = urllib.parse.urlsplit(request.url)
+        if f"{parsed.scheme}://{parsed.netloc}" != core or parsed.query or parsed.fragment:
+            return
+        if parsed.path in contribution_paths:
+            role = "contribution_recheck"
+        elif re.fullmatch(r"/api/platform/v1/calls/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", parsed.path):
+            role = "call_proof"
+        else:
+            return
+        if len(self.read_requests) >= self.read_limit:
+            self.entry["dropped_read_requests"] = min(self.entry["dropped_read_requests"] + 1, 65535)
+            return
+        state = {"role": role, "start_ms": self.elapsed(), "response_ms": None, "finished_ms": None,
+                 "failed_ms": None, "status": None, "failure_category": None}
+        self.read_requests[request] = state
+        self.entry["read_requests"].append(state)
+
     def mark(self, stage):
         if stage not in SKILL_STAGES:
             raise CheckFailed("invalid_skill_stage")
         self.entry["stage"] = stage
+        if stage == "complete":
+            self.entry["status"] = "completed"
         self.entry["elapsed_ms"] = self.elapsed()
         self.entry["timeline"].append({"stage": stage, "ms": self.entry["elapsed_ms"]})
         del self.entry["timeline"][:-len(SKILL_STAGES)]
@@ -287,6 +353,12 @@ class SkillCallAudit:
             return "response_not_observed"
         if not any(state.get("verified") for state in states):
             return "response_not_verified"
+        proofs = self.entry["call_proof_statuses"]
+        rechecks = self.entry["contribution_recheck_statuses"]
+        if proofs and proofs[-1] != 200:
+            return "call_proof_not_successful"
+        if rechecks and rechecks[-1] != 200:
+            return "contribution_recheck_not_successful"
         iframe = self.entry.get("iframe") or {}
         if not iframe.get("dom_available"):
             return "iframe_unavailable"
@@ -294,18 +366,10 @@ class SkillCallAudit:
             return "iframe_state_" + str(iframe.get("state_class"))
         if not iframe.get("result_matches"):
             return "result_mismatch"
-        proofs = self.report["http"].get("call_proof_statuses", ())[self.proofs_start:]
-        rechecks = self.report["http"].get("contribution_recheck_statuses", ())[self.rechecks_start:]
-        self.entry["call_proof_statuses"] = list(proofs)
-        self.entry["contribution_recheck_statuses"] = list(rechecks)
         if not proofs:
             return "call_proof_not_observed"
-        if 200 not in proofs:
-            return "call_proof_not_successful"
         if not rechecks:
             return "contribution_recheck_not_observed"
-        if 200 not in rechecks:
-            return "contribution_recheck_not_successful"
         return "none"
 
     def failure(self, frame, page, error, expected):
@@ -762,6 +826,15 @@ def run(config, report):
     calls = bodies.calls
     bootstrap = LoginBootstrapAudit(core, ui, reference, report)
     window_open = WindowOpenAudit(core, config["reference_deployment_id"], report)
+    skill_contribution_paths = {
+        f"/api/platform/v1/ui/contributions/{config['reference_deployment_id']}/{name}"
+        for name in ("echo_window", "echo_widget")
+    }
+    skill_context, active_skill_audit = None, None
+
+    def observe_skill_read(event, value, browser_context):
+        if browser_context is skill_context and active_skill_audit is not None:
+            active_skill_audit.observe_read(event, value, core, skill_contribution_paths)
 
     def observe_request(request, context_label=None):
         observed["active_request_observers"] += 1
@@ -783,7 +856,7 @@ def run(config, report):
         finally:
             observed["active_request_observers"] -= 1
 
-    def observe_response(response):
+    def observe_response(response, browser_context):
         observed["active_response_observers"] += 1
         phase = "response_origin"
         try:
@@ -793,6 +866,8 @@ def run(config, report):
             if url_origin(response.url) != core:
                 return
             phase = "response_read"
+            audit = active_skill_audit if browser_context is skill_context else None
+            observe_skill_read_status(report["http"], audit, response.request.method, parsed.path, response.status)
             if response.request.method in ("GET", "OPTIONS") and parsed.path in reads:
                 try:
                     value = response.json()
@@ -810,19 +885,11 @@ def run(config, report):
                 report["http"]["preference_writes"] += 1
             elif "/ui/contributions" in parsed.path and response.status == 200:
                 report["http"]["contribution_reads"] += 1
-                if response.request.method == "GET" and re.fullmatch(r"/api/platform/v1/ui/contributions/[0-9a-fA-F-]{36}/[a-z][a-z0-9_-]{0,63}", parsed.path):
-                    entries = report["http"].setdefault("contribution_recheck_statuses", [])
-                    entries.append(response.status if 100 <= response.status <= 599 else 0)
-                    del entries[:-8]
             elif parsed.path == f"/api/platform/v1/skills/{config['skill_id']}/calls" and response.request.method == "POST":
                 # No body RPC in this callback: retain the actual response until
                 # requestfinished, then audit it in the outer protocol pump.
                 phase = "response_skill_body"
                 bodies.response(response)
-            if response.request.method == "GET" and re.fullmatch(r"/api/platform/v1/calls/[0-9a-fA-F-]{36}", parsed.path):
-                entries = report["http"].setdefault("call_proof_statuses", [])
-                entries.append(response.status if 100 <= response.status <= 599 else 0)
-                del entries[:-8]
         except Exception as error:
             record_observer_failure(observed, phase, error)
         finally:
@@ -831,7 +898,7 @@ def run(config, report):
     def context(browser, label):
         result = browser.new_context(viewport={"width": 1440, "height": 1000})
         result.on("request", lambda request: observe_request(request, label))
-        result.on("response", observe_response)
+        result.on("response", lambda response: observe_response(response, result))
         result.on("request", lambda request: bootstrap.request(request, label))
         result.on("response", lambda response: bootstrap.response(response, label))
         result.on("requestfinished", lambda request: bootstrap.terminal(request, label, False))
@@ -842,6 +909,9 @@ def run(config, report):
         result.on("response", lambda response: window_open.observe("response", response))
         result.on("requestfinished", lambda request: window_open.observe("finished", request))
         result.on("requestfailed", lambda request: window_open.observe("failed", request))
+        for event, phase in (("request", "request"), ("response", "response"),
+                             ("requestfinished", "finished"), ("requestfailed", "failed")):
+            result.on(event, lambda value, phase=phase: observe_skill_read(phase, value, result))
         result.on("page", lambda page: page.on("pageerror", lambda _: observed.__setitem__("page_errors", observed["page_errors"] + 1)))
         return result
 
@@ -920,7 +990,9 @@ def run(config, report):
         return frame
 
     def echo(frame, message, label, expected_successes):
+        nonlocal skill_context, active_skill_audit
         audit = SkillCallAudit(report, bodies, label, expected_successes)
+        skill_context, active_skill_audit = frame.page.context, audit
         try:
             audit.mark("fill_input")
             bodies.expect(expected_successes)
@@ -938,6 +1010,8 @@ def run(config, report):
         except Exception as error:
             audit.failure(frame, page, error, message)
             raise
+        finally:
+            skill_context, active_skill_audit = None, None
 
     def fetch(page, path, method="GET", body=None):
         return page.evaluate(FETCH, {"core": core, "client": config["client_id"], "path": path, "method": method, "body": body, "key": str(uuid.uuid4())})

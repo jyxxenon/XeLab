@@ -38,6 +38,10 @@ HTTP/2 读取回归直接服务生产 `api.js`，不拦截或伪造浏览器响�
 
 2026-11-12 的真实 OCI 失败复核显示两个不同签名：`widget_bridge_calls_real_http_skill` 的调用与文本检查已通过，超时发生在随后的网络审计结算，原步骤名只到调用名；`valid_call_after_replay_rejection` 则停在 iframe 结果等待。现在 `tools/m3-ui-browser.py` 为每次 Skill 调用记录 `fill_input`/`submit_click`/`wait_iframe_result`/`check_result`/`audit_settle`/`audit_pump`/`audit_read`/`complete` 阶段与累计耗时，并报告首个不匹配点（提交、HTTP 响应、响应体核验、Call 只读证明、贡献配置复核、iframe 固定状态与结果）；窗口导航和帧核验也有独立步骤名。诊断仅在安全报告中保留最多 8 次调用，只含固定标签、布尔值、计数和时序，不保留正文、URL、标识或异常文本；不重试业务动作，不改变原调用次数、期限、权限和重放断言，也不能替代真实通过证据。#82 的根因仍待新 CI 的阶段证据。
 
+每次 Skill 调用分别记录其浏览器上下文中固定 Call 证明和贡献复核 GET 的最近 8 个 HTTP 状态码。最近一次读取返回非 200 时，即使 iframe 尚未完成，报告也标记该次读取失败。
+
+同一调用最多保留 32 条固定 GET 的请求时序，区分发起、收到响应、结束和失败。报告只保留请求类别、状态码、耗时和固定失败类别，便于排查结果传递期间停在哪一步。
+
 公开 CSP 原先枚举无关账户的部署来源，UI游标原先明文携带被过滤部署标识并暴露全局候选数量桶；两者均是阻断合并的P1元数据泄露。现实现专用UI namespace的固定frame-src、公开默认/配置父源和经过真实OAuth Client绑定的framing-only精确父源，另以不透明游标和分页前Policy预选修复目录泄露。详见[贡献规范](../plugins/ui-contributions.md)。最新4项真实PostgreSQL/独立mTLS回归通过，但最终Core/UI全回归与真实OCI门禁仍待执行；不能把该证明当用户授权或把组件通过当整体通过。
 
 打包 QA 保留 `packaged-ui-qa-20261104/evidence.json`、源文件 SHA-256、探针及日志； 实际观察到 UID 65532、只读根、零有效 capability 和 NoNewPrivs。 该本地 Docker 的 `CgroupDriver=none`，CPU/内存/PID 标志仅已配置，**没有逐容器资源限额执行证据**。 临时容器、QA 镜像标签和测试私钥已删除；镜像短摘要是本次执行标识，不是发布/签名引用。
