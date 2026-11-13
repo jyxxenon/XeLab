@@ -4,6 +4,7 @@ __pycache__/
 /target/
 /.local/
 /examples/generated/
+/examples/echo-cpp/generated/
 
 
 /examples/generated-python/
