@@ -199,6 +199,7 @@ impl Fixture {
                 "call_id",
                 "blob_id",
                 "credential_id",
+                "grant_id",
             ] {
                 path = path.replace(&format!("{{{p}}}"), &id.to_string());
             }

@@ -9,10 +9,10 @@ use xelab_kernel::{controller, host, schema_jobs};
 
 const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
 
-async fn send_blob(f: &Fixture, request: Builder, body: Body) -> Response {
+async fn send_blob(f: &Fixture, token: &str, request: Builder, body: Body) -> Response {
     let mut request = request
         .header("host", http_host::authority(None))
-        .header("authorization", format!("Bearer {}", f.token))
+        .header("authorization", format!("Bearer {token}"))
         .body(body)
         .unwrap();
     request.extensions_mut().insert(ConnectInfo(
@@ -22,21 +22,32 @@ async fn send_blob(f: &Fixture, request: Builder, body: Body) -> Response {
 }
 
 async fn upload_blob(f: &Fixture, size: usize, digest: &str, body: Body) -> (u16, Value) {
+    upload_blob_as(f, &f.token, size, digest, body).await
+}
+
+async fn upload_blob_as(
+    f: &Fixture,
+    token: &str,
+    size: usize,
+    digest: &str,
+    body: Body,
+) -> (u16, Value) {
     let request = Request::post("/api/platform/v1/blobs?content_type=application%2Foctet-stream")
         .header("content-type", "application/octet-stream")
         .header("content-length", size)
         .header("x-content-sha256", digest)
         .header("idempotency-key", format!("object-source-{digest}"));
-    let response = send_blob(f, request, body).await;
+    let response = send_blob(f, token, request, body).await;
     (
         response.status().as_u16(),
         serde_json::from_slice(&to_bytes(response.into_body(), 1048576).await.unwrap()).unwrap(),
     )
 }
 
-async fn download_blob(f: &Fixture, id: Uuid) -> Response {
+async fn download_blob(f: &Fixture, token: &str, id: Uuid) -> Response {
     send_blob(
         f,
+        token,
         Request::get(format!("/api/platform/v1/blobs/{id}/content")),
         Body::empty(),
     )
@@ -44,7 +55,11 @@ async fn download_blob(f: &Fixture, id: Uuid) -> Response {
 }
 
 async fn assert_blob(f: &Fixture, id: Uuid, size: usize, digest: &str) {
-    let response = download_blob(f, id).await;
+    assert_blob_as(f, &f.token, id, size, digest).await;
+}
+
+async fn assert_blob_as(f: &Fixture, token: &str, id: Uuid, size: usize, digest: &str) {
+    let response = download_blob(f, token, id).await;
     assert_eq!(response.status(), 200, "download {id}");
     assert_eq!(response.headers()["content-length"], size.to_string());
     assert_eq!(response.headers()["x-content-sha256"], digest);
@@ -170,7 +185,7 @@ async fn expire_blob(f: &Fixture, c: &tokio_postgres::Client, id: Uuid) {
         1,
         "only the fixture's live, unpinned Blob should be aged"
     );
-    assert_eq!(download_blob(f, id).await.status(), 404);
+    assert_eq!(download_blob(f, &f.token, id).await.status(), 404);
 }
 
 async fn verify_export_expiry(
@@ -189,7 +204,7 @@ async fn verify_export_expiry(
     expire_blob(f, c, blob).await;
     let replay = skill(f, export, target.clone(), "object-export-before-expiry").await;
     assert_eq!(replay, original);
-    assert_eq!(download_blob(f, blob).await.status(), 404);
+    assert_eq!(download_blob(f, &f.token, blob).await.status(), 404);
     assert_eq!(
         c.query_one(
             "SELECT count(*) FROM host_blob_outputs WHERE call_id=$1",
@@ -321,6 +336,263 @@ async fn other_subject(f: &Fixture, list: Uuid, put: Uuid, input: &Value) {
         denied.1["error"]["resource_id"].is_null(),
         "denial must precede dispatch"
     );
+}
+
+async fn grant_group(
+    f: &Fixture,
+    account: Uuid,
+    name: &str,
+    scope: Value,
+    actions: &[&str],
+) -> Value {
+    let rules: Vec<_> = actions
+        .iter()
+        .map(|action| json!({"action":action,"resource":scope}))
+        .collect();
+    let group = f
+        .api(
+            "createGroup",
+            None,
+            json!({"name":name,"rules":rules}),
+            &format!("{name}-group"),
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(group.0, 201, "{name}: {}", group.1);
+    let grant = f
+        .api(
+            "createGrant",
+            Some(account),
+            json!({"source":"group","group_version":{"group_id":group.1["id"],"version":1},
+                   "scope":scope}),
+            &format!("{name}-grant"),
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(grant.0, 201, "{name}: {}", grant.1);
+    grant.1
+}
+
+async fn revoke_guest_grant(f: &Fixture, grant: &Value, key: &str) {
+    let revoked = f
+        .api(
+            "revokeGrant",
+            Some(contracts::id(grant, "id").unwrap()),
+            Value::Null,
+            key,
+            grant["revision"].as_i64(),
+            None,
+        )
+        .await;
+    assert_eq!(revoked.0, 204, "{key}: {}", revoked.1);
+}
+
+async fn guest_authority(
+    f: &Fixture,
+    skills: &BTreeMap<&str, Uuid>,
+    foreign_input: &Value,
+    owner_object: &Value,
+) {
+    const PASSWORD: &str = "object fixture guest password";
+    let account = Uuid::new_v4();
+    let hash = auth::password_hash(PASSWORD).unwrap();
+    // Independent guest users are provisioned by the trusted host. Use the
+    // public grant and login paths for all permission and credential changes.
+    let mut c = f.app.db.connect().await.unwrap();
+    let tx = c.transaction().await.unwrap();
+    tx.execute(
+        "INSERT INTO accounts(id,kind,status,display_name,password_hash,created_at,updated_at)
+         VALUES($1,'user','active','Object storage guest',$2,now(),now())",
+        &[&account, &hash],
+    )
+    .await
+    .unwrap();
+    tx.execute("INSERT INTO account_closure VALUES($1,$1,0)", &[&account])
+        .await
+        .unwrap();
+    assert_eq!(
+        tx.execute(
+            "INSERT INTO quotas(account_id,spec,daily_bucket,created_at,updated_at)
+             SELECT $1,spec,current_date,now(),now() FROM quotas WHERE account_id=$2",
+            &[&account, &f.owner],
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    tx.commit().await.unwrap();
+    let role = f
+        .api(
+            "createGrant",
+            Some(account),
+            json!({"source":"role","role_id":"Guest",
+                   "scope":{"kind":"capability","match":"ids",
+                            "ids":["data.object.list@1.0.0","data.object.put@1.0.0",
+                                   "data.object.export@1.0.0"]}}),
+            "object-guest-role",
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(role.0, 201, "{}", role.1);
+    let login = f
+        .api(
+            "login",
+            None,
+            json!({"account_id":account,"password":PASSWORD}),
+            "object-guest-login",
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(login.0, 200, "{}", login.1["error"]);
+    let token = login.1["access_token"].as_str().unwrap();
+    let list = skills["data.object.list"];
+    let put = skills["data.object.put"];
+    let export = skills["data.object.export"];
+    let (status, denied) =
+        invoke_skill_as(f, token, list, json!({}), "object-guest-role-only").await;
+    assert_eq!(status, 403, "{denied}");
+    assert_eq!(denied["error"]["code"], "PERMISSION_DENIED");
+    assert!(denied["error"]["resource_id"].is_null());
+
+    let invoke_grant = grant_group(
+        f,
+        account,
+        "object-guest-skills",
+        json!({"kind":"skill","match":"ids","ids":[list,put,export]}),
+        &["skill.invoke"],
+    )
+    .await;
+    let listed = completed_skill(
+        list,
+        "object-guest-empty",
+        invoke_skill_as(f, token, list, json!({}), "object-guest-empty").await,
+    );
+    assert_eq!(listed["output"]["items"], json!([]));
+    assert!(listed["output"]["next_cursor"].is_null());
+    let target = json!({"key":owner_object["key"],"expected_revision":owner_object["revision"]});
+    let (status, missing) = invoke_skill_as(
+        f,
+        token,
+        export,
+        target.clone(),
+        "object-guest-foreign-object",
+    )
+    .await;
+    assert_eq!(status, 404, "{missing}");
+    assert_eq!(missing["error"]["code"], "RESOURCE_NOT_FOUND");
+
+    let bytes = b"guest-owned object";
+    let digest = contracts::digest(bytes);
+    let (status, denied) =
+        upload_blob_as(f, token, bytes.len(), &digest, Body::from(&bytes[..])).await;
+    assert_eq!(status, 403, "{denied}");
+    assert_eq!(denied["error"]["code"], "PERMISSION_DENIED");
+    let blob_grant = grant_group(
+        f,
+        account,
+        "object-guest-blobs",
+        json!({"kind":"blob","match":"owned_by","owner_id":account}),
+        &["blob.create", "blob.read"],
+    )
+    .await;
+    let foreign_blob = contracts::id(foreign_input, "blob_id").unwrap();
+    assert_eq!(download_blob(f, token, foreign_blob).await.status(), 404);
+    let (status, denied) = invoke_skill_as(
+        f,
+        token,
+        put,
+        foreign_input.clone(),
+        "object-guest-foreign-source",
+    )
+    .await;
+    assert_eq!(status, 403, "{denied}");
+    assert_eq!(denied["error"]["code"], "PERMISSION_DENIED");
+    assert!(denied["error"]["resource_id"].is_null());
+
+    let (status, source) =
+        upload_blob_as(f, token, bytes.len(), &digest, Body::from(&bytes[..])).await;
+    assert_eq!(status, 201, "{source}");
+    assert_eq!(source["owner_id"], account.to_string());
+    let mut own_input = foreign_input.clone();
+    own_input["blob_id"] = source["id"].clone();
+    own_input["digest"] = json!(digest);
+    own_input["size_bytes"] = json!(bytes.len());
+    let added = completed_skill(
+        put,
+        "object-guest-put",
+        invoke_skill_as(f, token, put, own_input.clone(), "object-guest-put").await,
+    );
+    let guest_object = &added["output"]["object"];
+    assert_eq!(guest_object["owner_id"], account.to_string());
+    assert_eq!(guest_object["key"], owner_object["key"]);
+    assert_ne!(guest_object["id"], owner_object["id"]);
+    let exported = completed_skill(
+        export,
+        "object-guest-export",
+        invoke_skill_as(f, token, export, target.clone(), "object-guest-export").await,
+    );
+    let output = &exported["output"];
+    assert_eq!(output["object_id"], guest_object["id"]);
+    assert_eq!(output["digest"], digest);
+    let blob = contracts::id(output, "blob_id").unwrap();
+    assert_blob_as(f, token, blob, bytes.len(), &digest).await;
+    let metadata = f
+        .api_as(
+            ("getBlob", Some(blob)),
+            Value::Null,
+            "object-guest-output",
+            None,
+            None,
+            token,
+        )
+        .await;
+    assert_eq!(metadata.0, 200, "{}", metadata.1);
+    assert_eq!(metadata.1["owner_id"], account.to_string());
+    let replay = completed_skill(
+        put,
+        "object-guest-put",
+        invoke_skill_as(f, token, put, own_input.clone(), "object-guest-put").await,
+    );
+    assert_eq!(replay, added);
+
+    revoke_guest_grant(f, &blob_grant, "object-guest-revoke-blobs").await;
+    assert_eq!(download_blob(f, token, blob).await.status(), 404);
+    for key in ["object-guest-put", "object-guest-put-after-revoke"] {
+        let (status, denied) = invoke_skill_as(f, token, put, own_input.clone(), key).await;
+        assert_eq!(status, 403, "{key}: {denied}");
+        assert_eq!(denied["error"]["code"], "PERMISSION_DENIED");
+        assert!(denied["error"]["resource_id"].is_null());
+    }
+    revoke_guest_grant(f, &invoke_grant, "object-guest-revoke-skills").await;
+    for key in ["object-guest-export", "object-guest-export-after-revoke"] {
+        let (status, denied) = invoke_skill_as(f, token, export, target.clone(), key).await;
+        assert_eq!(status, 403, "{key}: {denied}");
+        assert_eq!(denied["error"]["code"], "PERMISSION_DENIED");
+        assert!(denied["error"]["resource_id"].is_null());
+    }
+    let calls = c
+        .query(
+            "SELECT id,state FROM calls WHERE owner_id=$1 AND idempotency_key IN
+             ('object-guest-role-only','object-guest-foreign-source','object-guest-put',
+              'object-guest-export','object-guest-put-after-revoke','object-guest-export-after-revoke')
+             ORDER BY idempotency_key",
+            &[&account],
+        )
+        .await
+        .unwrap();
+    assert_eq!(calls.len(), 2);
+    for (row, call) in calls.iter().zip([&exported, &added]) {
+        assert_eq!(
+            row.get::<_, Uuid>("id"),
+            contracts::id(call, "call_id").unwrap()
+        );
+        assert_eq!(row.get::<_, String>("state"), "succeeded");
+    }
+    println!("Object storage: scoped Guest grants isolated a shared key and blocked Blob access and Call replay after revocation");
 }
 
 async fn api_key_authority(
@@ -653,6 +925,7 @@ pub(super) async fn exercise() {
         &input,
     )
     .await;
+    guest_authority(&f, &skills, &input, object).await;
     api_key_authority(
         &f,
         &c,
