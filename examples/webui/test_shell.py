@@ -34,6 +34,10 @@ class ShellBrowser(unittest.TestCase):
         self.hold_account_ids = set()
         self.held_account_routes = {}
         self.fast_accounts = {}
+        self.hold_operation_ids = set()
+        self.held_operation_routes = {}
+        self.operation_responses = {}
+        self.allow_second_refresh = False
         self.arm_hold_widget_after_put = False
         self.hold_widget_lookup = False
         self.held_widget_routes = []
@@ -78,6 +82,23 @@ class ShellBrowser(unittest.TestCase):
             status, code, message = self.account_action_error
             self.reply(route, {"error": {"code": code, "message": message}}, status)
             return
+        if (self.allow_second_refresh and request.method == "POST" and url.path == "/oauth/token"
+                and parse_qs(request.post_data or "", keep_blank_values=True) == {
+                    "grant_type": ["refresh_token"], "client_id": ["browser-component"], "refresh_token": ["component-rotated-refresh"]}):
+            self.custom_calls.append({"path": url.path, "method": request.method, "refresh_token": "component-rotated-refresh"})
+            self.reply(route, {"access_token": "component-rotated-access-2", "refresh_token": "component-rotated-refresh-2",
+                               "token_type": "Bearer", "expires_in": 900, "scope": "client:browser-component"})
+            return
+        if url.path.startswith("/api/platform/v1/operations/"):
+            op_id = url.path.removeprefix("/api/platform/v1/operations/")
+            if "/" not in op_id:
+                if op_id in self.hold_operation_ids:
+                    self.held_operation_routes[op_id] = route
+                    return
+                if op_id in self.operation_responses:
+                    status, data = self.operation_responses[op_id]
+                    self.reply(route, data, status)
+                    return
         if url.path.startswith("/api/platform/v1/accounts/"):
             target_id = url.path.removeprefix("/api/platform/v1/accounts/")
             if "/" not in target_id:
@@ -905,6 +926,104 @@ class ShellBrowser(unittest.TestCase):
         self.assertIn("INVALID_ARGUMENT · 无效的请求参数。", error.inner_text())
         self.assertFalse(any(call["path"].startswith("/api/platform/v1/operations/")
                              for call in self.fixture.calls))
+
+    def test_settings_save_error_renders_valid_live_status_and_recovers(self):
+        self.fail_preferences = 1
+        self.fixture.open()
+        settings_win = self.fixture.app("设置")
+        settings_win.get_by_role("button", name="保存到当前账户", exact=True).click()
+        status = settings_win.locator('[role="status"][aria-live="polite"]')
+        error = status.locator('.state[data-kind="unavailable"]')
+        error.wait_for(state="visible")
+        self.assertEqual(self.page.evaluate(
+            "() => document.querySelectorAll('.window[data-app=\"settings\"] p .state, .window[data-app=\"settings\"] .theme-preview-note .state').length"
+        ), 0)
+
+        settings_win.get_by_label("主题模式", exact=True).select_option("dark")
+        status.locator("p.theme-preview-note").get_by_text("当前为未保存预览。", exact=True).wait_for()
+        self.assertEqual(status.locator(".state").count(), 0)
+
+        settings_win.get_by_role("button", name="保存到当前账户", exact=True).click()
+        status.locator("p.theme-preview-note").get_by_text("已保存到核心，重新登录后仍可读取。", exact=True).wait_for()
+        self.assertEqual(len(self.custom_calls), 2)
+
+    def test_accounts_and_tasks_submit_on_enter_and_tasks_ignores_stale_response(self):
+        acct_enter_id = "00000000-0000-4000-8000-000000000011"
+        op_slow = "00000000-0000-4000-8000-000000000021"
+        op_fast = "00000000-0000-4000-8000-000000000022"
+        op_err_slow = "00000000-0000-4000-8000-000000000023"
+        self.fast_accounts[acct_enter_id] = {"id": acct_enter_id, "display_name": "Enter Account", "status": "active"}
+        self.operation_responses[op_fast] = (200, {"id": op_fast, "status": "succeeded", "marker": "fresh-fast-op"})
+
+        self.fixture.open()
+        accounts_win = self.fixture.app("账户与权限")
+        accounts_win.get_by_role("heading", name="Component account · active", exact=True).wait_for()
+        uuid_input = accounts_win.get_by_label("账户 UUID")
+        uuid_input.fill(acct_enter_id)
+        uuid_input.press("Enter")
+        accounts_win.get_by_role("heading", name="Enter Account · active", exact=True).wait_for()
+
+        self.open_launcher()
+        self.page.get_by_role("button", name="启动任务与知识库", exact=True).click()
+        tasks_win = self.page.locator('.window[data-app="tasks"]')
+        op_input = tasks_win.get_by_role("textbox", name="Operation UUID", exact=True)
+
+        self.hold_operation_ids.add(op_slow)
+        op_input.fill(op_slow)
+        op_input.press("Enter")
+        while op_slow not in self.held_operation_routes:
+            self.page.wait_for_timeout(10)
+
+        op_input.fill(op_fast)
+        op_input.press("Enter")
+        tasks_win.get_by_text("fresh-fast-op", exact=False).wait_for()
+
+        self.hold_operation_ids.discard(op_slow)
+        self.reply(self.held_operation_routes.pop(op_slow), {"id": op_slow, "status": "succeeded", "marker": "stale-slow-op"})
+        self.page.wait_for_timeout(120)
+        self.assertIn("fresh-fast-op", tasks_win.inner_text())
+        self.assertNotIn("stale-slow-op", tasks_win.inner_text())
+
+        self.hold_operation_ids.add(op_err_slow)
+        op_input.fill(op_err_slow)
+        op_input.press("Enter")
+        while op_err_slow not in self.held_operation_routes:
+            self.page.wait_for_timeout(10)
+
+        op_input.fill(op_fast)
+        op_input.press("Enter")
+        tasks_win.get_by_text("fresh-fast-op", exact=False).wait_for()
+
+        self.hold_operation_ids.discard(op_err_slow)
+        self.reply(self.held_operation_routes.pop(op_err_slow), {"error": {"code": "UNAVAILABLE", "message": "stale-error-op"}}, 503)
+        self.page.wait_for_timeout(120)
+        self.assertIn("fresh-fast-op", tasks_win.inner_text())
+        self.assertEqual(tasks_win.get_by_role("heading", name="当前不可用", exact=True).count(), 0)
+
+    def test_repeated_credential_rotations_do_not_duplicate_editor_lock_banner(self):
+        self.page.clock.set_fixed_time("2026-11-01T12:00:00Z")
+        self.fixture.refresh_enabled = True
+        self.allow_second_refresh = True
+        self.fixture.open(expires_ms=45000, refresh_token="component-refresh")
+
+        skills = self.fixture.app("Skill")
+        skills.get_by_role("button", name="调用测试", exact=True).click()
+        editor = self.page.locator('.window[data-app="editor-invokeSkill"]')
+        editor.wait_for(state="visible")
+
+        self.page.clock.set_fixed_time("2026-11-01T12:00:16Z")
+        resources = self.fixture.app("系统状态")
+        resources.get_by_text('"component-only"', exact=False).wait_for()
+        editor.get_by_text("原请求已锁定", exact=True).wait_for()
+        self.assertEqual(editor.locator('.state[data-kind="unavailable"]').count(), 1)
+
+        self.page.clock.set_fixed_time("2026-11-01T12:15:00Z")
+        accounts_win = self.fixture.app("账户与权限")
+        accounts_win.get_by_role("heading", name="Component account · active", exact=True).wait_for()
+        self.assertEqual(len(self.custom_calls), 1)
+        self.assertEqual(editor.get_by_role("heading", name="原请求已锁定", exact=True).count(), 1)
+        self.assertEqual(editor.locator('.state[data-kind="unavailable"]').count(), 1)
+        self.assertTrue(editor.get_by_role("button", name="提交", exact=True).is_disabled())
 
 
 if __name__ == "__main__":

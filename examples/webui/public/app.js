@@ -191,9 +191,10 @@ oauth.addEventListener('credentialchange',()=>{
   for(const win of windows.values()){
     win.bridge?.close('unavailable');
     if(win.app.id.startsWith('editor-')){
+      const firstLock=!win.credentialChanged;
       win.credentialChanged=true;win.controller?.abort();
       for(const submit of win.content.querySelectorAll('[data-intent-submit]'))submit.disabled=true;
-      win.content.prepend(state('unavailable','原请求已锁定','访问凭证已轮换；请先核实原 Call/Operation，保留原请求键，再明确创建新的意图。'));
+      if(firstLock)win.content.prepend(state('unavailable','原请求已锁定','访问凭证已轮换；请先核实原 Call/Operation，保留原请求键，再明确创建新的意图。'));
     }
   }
   for(const widget of widgetViews.values())widget.bridge?.close('unavailable');
@@ -498,7 +499,9 @@ async function accounts(win) {
       display.replaceChildren(failure(error));
     }
   };
-  win.content.replaceChildren(toolbar(win,'账户与权限'),node('p',{class:'muted'},'账户身份、祖先限制与凭证来源均以核心返回为准；WebUI 不收集平台密码。'),node('div',{class:'inline-field'},accountInput,button('读取',()=>inspect(accountInput.value.trim()))),display);
+  const accountForm=node('form',{class:'inline-field'},accountInput,button('读取',()=>{},{type:'submit'}));
+  accountForm.addEventListener('submit',event=>{event.preventDefault();inspect(accountInput.value.trim());});
+  win.content.replaceChildren(toolbar(win,'账户与权限'),node('p',{class:'muted'},'账户身份、祖先限制与凭证来源均以核心返回为准；WebUI 不收集平台密码。'),accountForm,display);
   if (accountId) await inspect(accountId); else display.replaceChildren(state('unavailable','当前账户详情尚不可用','当前委托未获准读取本人会话元数据。可输入已知账户 UUID，在现有授权内查询。'));
 }
 function keyMetadata(value) {
@@ -811,12 +814,14 @@ async function settings(win) {
       toast(`核心偏好暂不可用（主题更改将仅为预览）：${errorDetail(error)}`);
     }
   }
-  const notice = node('p',{class:'theme-preview-note'},preferences?'已读取当前用户核心偏好。':'核心偏好未加载；以下仅为本页预览，未持久保存。');
+  const notice = node('div',{role:'status','aria-live':'polite'});
+  const setNotice = text => notice.replaceChildren(node('p',{class:'theme-preview-note'},text));
+  setNotice(preferences?'已读取当前用户核心偏好。':'核心偏好未加载；以下仅为本页预览，未持久保存。');
   const form = node('div',{class:'settings-grid'});
   const mode = node('select',{'aria-label':'主题模式'},...['system','light','dark','custom'].map(value=>node('option',{value},({system:'跟随系统',light:'明亮',dark:'深色',custom:'自定义'})[value])));
   mode.value=preview.theme.mode;
   const colors=node('div',{class:'theme-colors'});
-  const mark = () => { notice.textContent='当前为未保存预览。';applyTheme(); };
+  const mark = () => { setNotice('当前为未保存预览。');applyTheme(); };
   function customFields() {
     colors.replaceChildren();colors.hidden=preview.theme.mode!=='custom';
     if (colors.hidden) return;
@@ -838,8 +843,9 @@ async function settings(win) {
     if(saveIntent.body!==null&&saveIntent.body!==canonicalIntent)saveIntent={key:crypto.randomUUID(),body:null};
     saveIntent.body=canonicalIntent;
     save.disabled=true;
-    try {const result=await request('setMyUiPreferences',{body:preview,etag:preferenceEtag,idempotencyKey:saveIntent.key,signal:win.controller.signal});preferences=result.data;preferenceEtag=result.etag||revision(result.data);preview=structuredClone(result.data.spec);applyTheme();notice.textContent='已保存到核心，重新登录后仍可读取。';saveIntent={key:crypto.randomUUID(),body:null};}
-    catch(error){notice.replaceChildren(failure(error));}finally{save.disabled=false;}
+    const {signal}=win.controller;
+    try {const result=await request('setMyUiPreferences',{body:preview,etag:preferenceEtag,idempotencyKey:saveIntent.key,signal});if(signal.aborted||!notice.isConnected)return;preferences=result.data;preferenceEtag=result.etag||revision(result.data);preview=structuredClone(result.data.spec);applyTheme();setNotice('已保存到核心，重新登录后仍可读取。');saveIntent={key:crypto.randomUUID(),body:null};}
+    catch(error){if(!signal.aborted&&notice.isConnected)notice.replaceChildren(failure(error));}finally{save.disabled=false;}
   },{class:'primary'});
   form.append(node('label',{},'主题',mode),colors,check('减少动画','reduce_motion'),check('减少透明度','reduce_transparency'),node('label',{},'Dock 位置',dock),node('label',{class:'check'},autoHide,'自动隐藏 Dock'),notice,node('div',{class:'toolbar'},save,button('恢复已保存偏好',()=> {preview=preferences?structuredClone(preferences.spec):defaults();applyTheme();loadApp(win);})),node('p',{class:'code'},`核心：${runtimeConfig.core_origin}\n公共 Client：${runtimeConfig.client_id}`));
   customFields();
@@ -849,7 +855,23 @@ async function unavailable(win) {win.content.replaceChildren(toolbar(win,win.app
 async function tasks(win) {
   const input=node('input',{'aria-label':'Operation UUID',placeholder:'已接受操作的 UUID'});
   const result=node('div');
-  win.content.replaceChildren(toolbar(win,'任务与能力'),node('p',{},'查询核心已经接受的 Operation；结果以其持久终态为准。'),node('div',{class:'inline-field'},input,button('查询 Operation',async()=>{result.replaceChildren(state('loading','查询中…'));try{const response=await request('getOperation',{params:{operation_id:input.value.trim()},signal:win.controller.signal});result.replaceChildren(raw(response.data));}catch(error){result.replaceChildren(failure(error));}})),result,state('unavailable','Batch / Workflow / 微插件 / 知识库尚不可用','未安装或实现的后续执行系统没有可展示的运行结果。'));
+  let sequence=0;
+  const inspect=async()=>{
+    const current=++sequence;
+    const {signal}=win.controller;
+    result.replaceChildren(state('loading','查询中…'));
+    try{
+      const response=await request('getOperation',{params:{operation_id:input.value.trim()},signal});
+      if(current!==sequence||signal.aborted||!result.isConnected)return;
+      result.replaceChildren(raw(response.data));
+    }catch(error){
+      if(current!==sequence||signal.aborted||!result.isConnected)return;
+      result.replaceChildren(failure(error));
+    }
+  };
+  const form=node('form',{class:'inline-field'},input,button('查询 Operation',()=>{},{type:'submit'}));
+  form.addEventListener('submit',event=>{event.preventDefault();inspect();});
+  win.content.replaceChildren(toolbar(win,'任务与能力'),node('p',{},'查询核心已经接受的 Operation；结果以其持久终态为准。'),form,result,state('unavailable','Batch / Workflow / 微插件 / 知识库尚不可用','未安装或实现的后续执行系统没有可展示的运行结果。'));
 }
 // Read-only overview (issue #14). Each section calls exactly one existing
 // public API and renders only whitelisted non-sensitive scalars: plugin
