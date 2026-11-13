@@ -16,6 +16,18 @@
 - `crates/kernel/src/{ui,webui,deployments}.rs` 及 OAuth/HTTP/Skill 既有模块：签名贡献发现、账户偏好、默认 UI、精确 Client/回调及停用配置更新；沿用核心 Authorizer、Broker、Runtime 和追加迁移 16。
 - `crates/kernel/tests/m3_ui.rs`、`tools/m3-ui-browser.py`、`tools/prepare-m3-ui-images.sh`：实际签名 OCI 制品、核心 HTTPS/HostService/Controller、PostgreSQL 和 Chromium 的整体门禁，不模拟核心响应。
 
+## 视觉层与设计令牌
+
+外壳与窗口内容层自 #2/#5/#6/#100/#102 起按下述边界组织，规范和实现一一对应：
+
+- `public/styles.css`：原始布局与交互规则；`desktop.css`：菜单栏、Dock、窗口边框/标题栏、启动器、壁纸；`components.css`：表单控件、卡片、状态/结果块、总览区、窗口工具栏；`motion.css`：窗口与提示条的两处有限淡入。`index.html` 按此顺序链接，层叠顺序与拆分前一致。
+- 令牌来源：`applyTheme()` 从当前账户偏好写入 `--accent`、`--surface`、`--desktop`、`--text`、`--muted-text`、`--border`、`--danger`、`--radius`、`--blur`、`--opacity`、`--font`；外壳层只派生 `--menubar-h`、`--shell-radius`、`--shell-border`、`--ease-shell`，不引入第二套色板。`system`/`light`/`dark`/自定义主题共用同一套派生规则；自定义主题的 `color-scheme` 由 `desktop` 令牌的相对亮度决定，使 `light-dark()` 阴影与边框跟随主题。
+- 模糊只作用于菜单栏、Dock 与启动器对话框，窗口正文保持不透明；`reduced-transparency` 关闭这些模糊并恢复不透明表面，`prefers-reduced-motion` 与「减少动画」偏好移除全部过渡与两处淡入。
+- 图标为 `app.js` 内联的 24×24 描边 SVG（`createElementNS` 构建，无 `innerHTML`、无图标库）；窗口控制点保留 24×24 命中区域，默认显示色点，hover/focus/触屏时显示符号。
+- 壁纸 `wallpaper.svg` 为仓库内原创矢量图，叠加在主题渐变之上并以 `cover` 缩放；不引用外部资源。
+- 键盘焦点在启动器打开/关闭、窗口关闭、最小化与恢复时显式交接，不落回 `document.body`。
+- 上述约束由 `examples/webui/test_shell_visual.py` 的契约断言覆盖（令牌、模糊/动效偏好、图标、控制点、布局、壁纸、焦点与资源加载）；`test_overview.py` 覆盖只读总览窗口。
+
 桌面有插件/部署/审批/配置/版本与状态、Skill 注册/启停/调用、账户/子账户/权限来源、资源、Client、默认 UI 和 Operation 入口；实际能力取决于当前账户和 Client 上限。 BatchEngine、Workflow、微插件及知识库业务保持不可用；桥的未来 batch 方法返回明确不支持，不制造成功或业务数据。
 
 ## 已执行证据与尚缺证据

@@ -30,6 +30,15 @@ class ShellBrowser(unittest.TestCase):
         self.key_pages = None
         self.key_denied = False
         self.key_error = None
+        self.account_action_error = None
+        self.hold_account_ids = set()
+        self.held_account_routes = {}
+        self.fast_accounts = {}
+        self.arm_hold_widget_after_put = False
+        self.hold_widget_lookup = False
+        self.held_widget_routes = []
+        self.hold_installation = False
+        self.held_installation_routes = []
         self.subject = desktop.ACCOUNT
         self.page.route("**/*", self.route)
 
@@ -56,6 +65,28 @@ class ShellBrowser(unittest.TestCase):
                 self.fail_preferences -= 1
                 self.reply(route, {"error": {"code": "UNAVAILABLE", "message": "explicit component outage"}}, 503)
                 return
+            if self.arm_hold_widget_after_put:
+                self.arm_hold_widget_after_put = False
+                self.hold_widget_lookup = True
+        if self.hold_widget_lookup and request.method == "GET" and "/ui/contributions/" in url.path:
+            self.held_widget_routes.append(route)
+            return
+        if self.hold_installation and url.path.startswith("/api/platform/v1/installations/"):
+            self.held_installation_routes.append(route)
+            return
+        if self.account_action_error and url.path.endswith("/effective-permissions"):
+            status, code, message = self.account_action_error
+            self.reply(route, {"error": {"code": code, "message": message}}, status)
+            return
+        if url.path.startswith("/api/platform/v1/accounts/"):
+            target_id = url.path.removeprefix("/api/platform/v1/accounts/")
+            if "/" not in target_id:
+                if target_id in self.hold_account_ids:
+                    self.held_account_routes[target_id] = route
+                    return
+                if target_id in self.fast_accounts:
+                    self.reply(route, self.fast_accounts[target_id])
+                    return
         if url.path.endswith("/sessions") and self.subject != desktop.ACCOUNT:
             self.reply(route, {"items": [{"account_id": self.subject, "status": "active"}], "next_cursor": None})
             return
@@ -265,6 +296,106 @@ class ShellBrowser(unittest.TestCase):
         self.assertEqual(self.custom_calls[0]["headers"]["if-match"], '"rev-1"')
         self.assertEqual(self.custom_calls[1]["headers"]["if-match"], '"rev-2"')
         self.assertNotEqual(self.custom_calls[0]["headers"]["idempotency-key"], self.custom_calls[1]["headers"]["idempotency-key"])
+
+    def test_closed_launcher_cannot_open_window_after_reopening(self):
+        value = self.window_contribution()
+        self.fixture.open()
+        self.open_launcher()
+        launcher = self.page.locator("#launcher")
+        launch = launcher.get_by_role("button", name="启动贡献 " + value["spec"]["title"], exact=True)
+        original_button = launch.element_handle()
+        self.hold_widget_lookup = True
+        original_button.click()
+        for _ in range(250):
+            if self.held_widget_routes:
+                break
+            self.page.wait_for_timeout(20)
+        self.assertEqual(len(self.held_widget_routes), 1)
+        self.assertTrue(original_button.is_disabled())
+
+        self.page.keyboard.press("Escape")
+        launcher.wait_for(state="hidden")
+        active = self.fixture.app("系统状态")
+        active.get_by_text('"component-only"', exact=False).wait_for()
+        self.open_launcher()
+        search = launcher.locator("#app-search")
+        search.fill("settings")
+        self.hold_widget_lookup = False
+        self.held_widget_routes.pop().fallback()
+        # The detached button is re-enabled when its old handler has returned.
+        self.page.wait_for_function("button => !button.disabled", arg=original_button)
+        self.assertEqual(self.page.locator('.window[data-app^="plugin:"]').count(), 0)
+        self.assertTrue(launcher.is_visible())
+        self.assertEqual(search.input_value(), "settings")
+        self.assertTrue(search.evaluate("element => element === document.activeElement"))
+        self.assertEqual(self.page.locator("#toast").inner_text(), "")
+
+        search.fill(value["spec"]["title"])
+        launch.click()
+        launcher.wait_for(state="hidden")
+        window = self.page.locator('.window[data-app^="plugin:"]')
+        window.locator("iframe[src]").wait_for()
+        self.assertEqual(window.count(), 1)
+        self.assertTrue(window.locator(".window-title").evaluate("element => element === document.activeElement"))
+
+    def test_closed_launcher_cannot_submit_widget_after_preference_read(self):
+        value = contribution("late_widget", "widget")
+        self.fixture.contributions["late_widget"] = value
+        self.fixture.open()
+        self.open_launcher()
+        launcher = self.page.locator("#launcher")
+        launch = launcher.get_by_role("button", name="启动贡献 " + value["spec"]["title"], exact=True)
+        original_button = launch.element_handle()
+        self.fixture.hold_preferences = True
+        original_button.click()
+        for _ in range(250):
+            if self.fixture.pending_preferences:
+                break
+            self.page.wait_for_timeout(20)
+        self.assertEqual(len(self.fixture.pending_preferences), 1)
+        self.assertTrue(original_button.is_disabled())
+
+        self.page.get_by_role("button", name="关闭启动器", exact=True).click()
+        launcher.wait_for(state="hidden")
+        self.open_launcher()
+        self.fixture.hold_preferences = False
+        self.fixture.route(self.fixture.pending_preferences.pop())
+        self.page.wait_for_function("button => !button.disabled", arg=original_button)
+        self.assertEqual(self.fixture.saved["spec"]["widgets"], [])
+        self.assertEqual(self.custom_calls, [])
+        self.assertTrue(launcher.is_visible())
+        self.assertEqual(self.page.locator("#widgets iframe").count(), 0)
+        self.assertEqual(self.page.locator("#toast").inner_text(), "")
+
+        # An explicit new launch can submit once. Let its already-sent write
+        # finish after closing the dialog, without dismissing the next opening.
+        pending_writes = []
+
+        def hold_write(route):
+            if route.request.method == "PUT":
+                pending_writes.append(route)
+            else:
+                route.fallback()
+
+        self.page.route(desktop.CORE + "/api/platform/v1/me/ui-preferences", hold_write)
+        retry_button = launch.element_handle()
+        retry_button.click()
+        for _ in range(250):
+            if pending_writes:
+                break
+            self.page.wait_for_timeout(20)
+        self.assertEqual(len(pending_writes), 1)
+        self.assertTrue(retry_button.is_disabled())
+        self.page.get_by_role("button", name="关闭启动器", exact=True).click()
+        launcher.wait_for(state="hidden")
+        self.open_launcher()
+        pending_writes.pop().fallback()
+        self.page.wait_for_function("button => !button.disabled", arg=retry_button)
+        self.assertTrue(launcher.is_visible())
+        self.assertEqual(len(self.custom_calls), 1)
+        widgets = self.fixture.saved["spec"]["widgets"]
+        self.assertEqual([widget["contribution"]["contribution_id"] for widget in widgets], ["late_widget"])
+        self.page.locator("#widgets iframe[src]").wait_for()
 
     def test_pinned_digest_change_cannot_silently_open_new_version(self):
         value = self.window_contribution()
@@ -558,6 +689,176 @@ class ShellBrowser(unittest.TestCase):
         self.assertEqual(keys_window.locator(".card").count(), 2)
         self.assertEqual(keys_window.locator(".state").count(), 0)
         self.assertTrue(more.is_hidden())
+
+    def test_toast_redacts_server_error_messages_across_actions(self):
+        value = self.window_contribution("toast-redact")
+        self.fixture.open()
+
+        # 1. apiKeys detail button (getApiKey 500) redacts server error.message in #toast
+        self.fixture.app("账户与权限").get_by_role("button", name="API Key 元数据", exact=True).click()
+        keys_window = self.page.locator('.window[data-app^="api-keys:"]')
+        keys_window.get_by_role("heading", name="Read-only monitor", exact=True).wait_for()
+        secret_key = "TOKEN=toast-secret-api-key"
+        self.key_error = (500, "INTERNAL_ERROR", secret_key)
+        keys_window.get_by_role("button", name="读取密钥元数据", exact=True).click()
+        self.page.locator("#toast").get_by_text("INTERNAL_ERROR", exact=False).wait_for()
+        self.assertNotIn(secret_key, self.page.locator("body").inner_text())
+        self.key_error = None
+        keys_window.get_by_role("button", name="关闭API Key 元数据", exact=True).click()
+
+        # 2. accounts toolbar action (getEffectivePermissions 403) redacts server error.message
+        secret_perm = "TOKEN=toast-secret-effective-perms"
+        self.account_action_error = (403, "PERMISSION_DENIED", secret_perm)
+        self.fixture.app("账户与权限").get_by_role("button", name="有效权限与阻断祖先", exact=True).click()
+        self.page.locator("#toast").get_by_text("PERMISSION_DENIED", exact=False).wait_for()
+        self.assertNotIn(secret_perm, self.page.locator("body").inner_text())
+        self.account_action_error = None
+
+        # 3. launcher pin failure (503 UNAVAILABLE) redacts explicit server error message
+        self.fail_preferences = 1
+        self.open_launcher()
+        self.page.locator("#app-search").fill(value["spec"]["title"])
+        self.page.get_by_role("button", name="固定 " + value["spec"]["title"], exact=True).click()
+        self.page.locator("#toast").get_by_text("UNAVAILABLE", exact=False).wait_for()
+        self.assertNotIn("explicit component outage", self.page.locator("body").inner_text())
+        self.page.locator("#launcher-close").click()
+
+        # 4. Closing settings mid-flight aborts initial preference read without spurious toast
+        self.page.evaluate("document.querySelector('#toast').textContent = ''")
+        self.fixture.hold_preferences = True
+        settings_win = self.fixture.app("设置")
+        while not self.fixture.pending_preferences:
+            self.page.wait_for_timeout(10)
+        settings_win.get_by_role("button", name="关闭设置", exact=True).click()
+        self.fixture.hold_preferences = False
+        pending = self.fixture.pending_preferences.pop()
+        self.reply(pending, {"error": {"code": "UNAVAILABLE", "message": "secret-after-settings-close"}}, 503)
+        self.page.wait_for_timeout(120)
+        self.assertEqual(self.page.locator("#toast").inner_text(), "")
+        self.assertNotIn("secret-after-settings-close", self.page.locator("body").inner_text())
+
+    def test_widget_removal_during_load_prevents_stale_mount_and_polling(self):
+        value = contribution("stale_widget", "widget")
+        value["spec"]["refresh_interval_seconds"] = 30
+        value["contribution_digest"] = "sha256:" + hashlib.sha256(
+            json.dumps(value["spec"], sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        self.fixture.contributions["stale_widget"] = value
+        self.fixture.open()
+
+        self.open_launcher()
+        self.page.get_by_role("button", name="启动插件页面", exact=True).click()
+        listing = self.page.locator('.window[data-app="contributions"]')
+        listing.get_by_role("heading", name="Independent fixture", exact=True).wait_for()
+
+        # Part 1: Hold getUiContribution during renderWidgets(), then remove the widget before mountContribution runs.
+        self.arm_hold_widget_after_put = True
+        listing.get_by_role("button", name="添加桌面组件", exact=True).click()
+        listing.get_by_role("button", name="关闭插件页面", exact=True).click()
+        card = self.page.locator("#widgets .widget-card")
+        card.wait_for(state="visible")
+        while not self.held_widget_routes:
+            self.page.wait_for_timeout(10)
+        card.get_by_role("button", name="移除", exact=True).click()
+        self.page.wait_for_function("() => document.querySelectorAll('#widgets .widget-card').length === 0")
+
+        self.hold_widget_lookup = False
+        for held in self.held_widget_routes:
+            try:
+                held.fallback()
+            except Exception:
+                pass
+        self.held_widget_routes.clear()
+        self.page.wait_for_timeout(150)
+
+        self.assertEqual(self.page.locator("#widgets .widget-card").count(), 0)
+        self.assertEqual(self.page.locator("#widgets iframe").count(), 0)
+        self.assertFalse(any("/installations/" in call["path"] for call in self.fixture.calls))
+        self.assertEqual(self.page.locator("#toast").inner_text(), "")
+
+        # Part 2: Mount the widget with refresh_interval_seconds=30, remove it while verifyPureWidget fetches
+        # getInstallation, and confirm no getSkill polling verification or DOM mutation continues afterward.
+        self.open_launcher()
+        self.page.get_by_role("button", name="启动插件页面", exact=True).click()
+        listing = self.page.locator('.window[data-app="contributions"]')
+        listing.get_by_role("heading", name="Independent fixture", exact=True).wait_for()
+        self.hold_installation = True
+        listing.get_by_role("button", name="添加桌面组件", exact=True).click()
+        listing.get_by_role("button", name="关闭插件页面", exact=True).click()
+        card = self.page.locator("#widgets .widget-card")
+        card.wait_for(state="visible")
+        while not self.held_installation_routes:
+            self.page.wait_for_timeout(10)
+        card.get_by_role("button", name="移除", exact=True).click()
+        self.page.wait_for_function("() => document.querySelectorAll('#widgets .widget-card').length === 0")
+
+        self.hold_installation = False
+        for held in self.held_installation_routes:
+            try:
+                self.reply(held, {"error": {"code": "UNAVAILABLE", "message": "late"}}, 503)
+            except Exception:
+                pass
+        self.held_installation_routes.clear()
+        self.page.wait_for_timeout(150)
+
+        self.assertEqual(self.page.locator("#widgets .widget-card").count(), 0)
+        self.assertEqual(self.page.locator("#widgets iframe").count(), 0)
+        self.assertFalse(any("/skills/" in call["path"] for call in self.fixture.calls))
+        self.assertEqual(self.page.locator("#toast").inner_text(), "")
+
+    def test_account_lookup_ignores_stale_response_and_api_keys_window_not_persisted(self):
+        slow_id = "00000000-0000-4000-8000-00000000000a"
+        fast_id = "00000000-0000-4000-8000-00000000000b"
+        self.hold_account_ids.add(slow_id)
+        self.fast_accounts[fast_id] = {"id": fast_id, "display_name": "Fresh Fast Account", "status": "active"}
+
+        self.fixture.open()
+        accounts_win = self.fixture.app("账户与权限")
+        accounts_win.get_by_role("heading", name="Component account · active", exact=True).wait_for()
+        uuid_input = accounts_win.get_by_label("账户 UUID")
+        read_btn = accounts_win.get_by_role("button", name="读取", exact=True)
+
+        uuid_input.fill(slow_id)
+        read_btn.click()
+        while slow_id not in self.held_account_routes:
+            self.page.wait_for_timeout(10)
+
+        uuid_input.fill(fast_id)
+        read_btn.click()
+        accounts_win.get_by_text("Fresh Fast Account · active", exact=True).wait_for()
+
+        self.hold_account_ids.discard(slow_id)
+        self.reply(self.held_account_routes.pop(slow_id), {"id": slow_id, "display_name": "Stale Slow Account", "status": "active"})
+        self.page.wait_for_timeout(120)
+
+        self.assertIn("Fresh Fast Account", accounts_win.inner_text())
+        self.assertNotIn("Stale Slow Account", accounts_win.inner_text())
+
+        # Opening API Key 元数据 creates an ephemeral window excluded from persisted localStorage layout.
+        accounts_win.get_by_role("button", name="API Key 元数据", exact=True).click()
+        self.page.locator('.window[data-app^="api-keys:"]').wait_for()
+        saved_apps = self.page.evaluate("""() => {
+          const layouts = [];
+          for (let i = 0; i < localStorage.length; i++) {
+            const k = localStorage.key(i);
+            if (k && k.startsWith('xelab:windows:')) layouts.push(...JSON.parse(localStorage.getItem(k) || '[]'));
+          }
+          return layouts.map(item => item.app);
+        }""")
+        self.assertFalse(any(app.startswith("api-keys:") for app in saved_apps), saved_apps)
+
+    def test_invalid_operation_uuid_shows_local_validation_without_a_core_request(self):
+        self.fixture.open()
+        self.open_launcher()
+        self.page.get_by_role("button", name="启动任务与知识库", exact=True).click()
+        window = self.page.locator('.window[data-app="tasks"]')
+        window.get_by_role("textbox", name="Operation UUID", exact=True).fill("not-a-valid-uuid")
+        window.get_by_role("button", name="查询 Operation", exact=True).click()
+        error = window.locator('.state[data-kind="error"]')
+        error.get_by_role("heading", name="请求失败", exact=True).wait_for()
+        self.assertIn("INVALID_ARGUMENT · 无效的请求参数。", error.inner_text())
+        self.assertFalse(any(call["path"].startswith("/api/platform/v1/operations/")
+                             for call in self.fixture.calls))
 
 
 if __name__ == "__main__":

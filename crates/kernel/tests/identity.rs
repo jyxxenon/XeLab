@@ -384,6 +384,153 @@ fn key_body(inheritance: Value) -> Value {
     json!({"name":"acceptance key","inheritance":inheritance,"conditions":{"expires_at":(chrono::Utc::now()+chrono::Duration::days(30)).date_naive().and_hms_opt(0,0,0).unwrap().and_utc()}})
 }
 
+#[tokio::test]
+async fn key_issued_grant_and_child_account_use_the_persisted_expiry() {
+    use chrono::{Duration, Timelike, Utc};
+
+    let Some(f) = Fixture::new().await else {
+        return;
+    };
+    let requested = (Utc::now() + Duration::hours(1))
+        .with_nanosecond(123_456_789)
+        .unwrap();
+    let expected = requested.with_nanosecond(123_456_000).unwrap();
+    let owner = [("account_id", f.owner.to_string())];
+    let mut body = key_body(json!({"mode":"all_snapshot"}));
+    body["conditions"]["expires_at"] = json!(requested);
+    let issuer = f.call("createApiKey", &owner, &f.token, body, None).await;
+    assert_eq!(issuer.0, 201, "{}", issuer.1["error"]);
+    let secret = issuer.1["secret"].as_str().unwrap();
+    let child = |expiry| {
+        json!({"display_name":"expiry child","inheritance":{"mode":"all_snapshot"},
+               "expires_at":expiry})
+    };
+    let grant =
+        |expiry| json!({"source":"role","role_id":"Guest","scope":cap(),"expires_at":expiry});
+    let later = expected + Duration::microseconds(1);
+    let denied = f
+        .call("createChildAccount", &owner, secret, child(later), None)
+        .await;
+    assert_eq!(denied.0, 403, "{}", denied.1["error"]);
+    let child = f
+        .call("createChildAccount", &owner, secret, child(requested), None)
+        .await;
+    assert_eq!(child.0, 201, "{}", child.1["error"]);
+    let child_id = contracts::id(&child.1["account"], "id").unwrap();
+    let account = [("account_id", child_id.to_string())];
+    let revision = child.1["account"]["revision"].as_i64();
+    for (operation, exact, excessive, revision, accepted_status) in [
+        ("createGrant", grant(requested), grant(later), None, 201),
+        (
+            "updateAccount",
+            json!({"expires_at":requested}),
+            json!({"expires_at":later}),
+            revision,
+            200,
+        ),
+    ] {
+        let denied = f
+            .call(operation, &account, secret, excessive, revision)
+            .await;
+        assert_eq!(denied.0, 403, "{operation}: {}", denied.1["error"]);
+        let accepted = f.call(operation, &account, secret, exact, revision).await;
+        assert_eq!(
+            accepted.0, accepted_status,
+            "{operation}: {}",
+            accepted.1["error"]
+        );
+    }
+    let c = f.db.connect().await.unwrap();
+    for table in ["accounts", "grants"] {
+        let selector = if table == "accounts" {
+            "id"
+        } else {
+            "subject_id"
+        };
+        let stored: chrono::DateTime<Utc> = c
+            .query_one(
+                &format!("SELECT expires_at FROM {table} WHERE {selector}=$1"),
+                &[&child_id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(stored, expected);
+    }
+}
+
+#[tokio::test]
+async fn api_key_expiry_matches_postgres_for_derivation_and_rotation() {
+    use chrono::Timelike;
+
+    let Some(f) = Fixture::new().await else {
+        return;
+    };
+    let requested = (chrono::Utc::now() + chrono::Duration::hours(1))
+        .with_nanosecond(123_456_789)
+        .unwrap();
+    let expected = requested.with_nanosecond(123_456_000).unwrap();
+    let account = [("account_id", f.owner.to_string())];
+    let mut request = key_body(json!({"mode":"all_snapshot"}));
+    request["conditions"]["expires_at"] = json!(requested);
+    let issuer = f
+        .call("createApiKey", &account, &f.token, request.clone(), None)
+        .await;
+    assert_eq!(issuer.0, 201, "{}", issuer.1["error"]);
+    assert_eq!(
+        issuer.1["credential"]["conditions"]["expires_at"],
+        json!(expected)
+    );
+    let issuer_id = contracts::id(&issuer.1["credential"], "id").unwrap();
+    let c = f.db.connect().await.unwrap();
+    let row = c
+        .query_one(
+            "SELECT expires_at,conditions FROM credentials WHERE id=$1",
+            &[&issuer_id],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, chrono::DateTime<chrono::Utc>>(0), expected);
+    assert_eq!(row.get::<_, Value>(1)["expires_at"], json!(expected));
+
+    // Older keys retain the untruncated request in JSON and the effective
+    // expiry in the indexed column.
+    c.execute(
+        "UPDATE credentials SET conditions=$2 WHERE id=$1",
+        &[&issuer_id, &request["conditions"]],
+    )
+    .await
+    .unwrap();
+    let credential = [("credential_id", issuer_id.to_string())];
+    let inspected = f
+        .call("getApiKey", &credential, &f.token, Value::Null, None)
+        .await;
+    assert_eq!(inspected.0, 200, "{}", inspected.1["error"]);
+    assert_eq!(inspected.1["conditions"]["expires_at"], json!(expected));
+
+    let mut later = request.clone();
+    later["conditions"]["expires_at"] = json!(expected + chrono::Duration::microseconds(1));
+    let issuer_secret = issuer.1["secret"].as_str().unwrap();
+    for (operation, path, token, revision) in [
+        ("createApiKey", &account, issuer_secret, None),
+        ("rotateApiKey", &credential, f.token.as_str(), Some(1)),
+    ] {
+        let denied = f
+            .call(operation, path, token, later.clone(), revision)
+            .await;
+        assert_eq!(denied.0, 403, "{operation}: {}", denied.1["error"]);
+        assert_eq!(denied.1["error"]["code"], "PERMISSION_DENIED");
+        let accepted = f
+            .call(operation, path, token, request.clone(), revision)
+            .await;
+        assert_eq!(accepted.0, 201, "{operation}: {}", accepted.1["error"]);
+        assert_eq!(
+            accepted.1["credential"]["conditions"]["expires_at"],
+            json!(expected)
+        );
+    }
+}
+
 async fn grant_guest(f: &Fixture, account: Uuid, scope: Value) -> Uuid {
     let granted = f
         .call(

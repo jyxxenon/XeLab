@@ -18,6 +18,7 @@
 - [Rust SDK 与 mTLS 接入](rust-sdk.md)
 
 - [插件可选iframe窗口与桌面组件](ui-contributions.md)
+- [C++ SDK 与跨语言一致性测试](cpp-sdk.md)
 
 - [Micro Plugin Runtime与微插件](../preset-plugins/micro-plugin-runtime/README.md)
 
