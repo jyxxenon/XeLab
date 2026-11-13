@@ -186,10 +186,10 @@ export class ApiClient {
   }
 
   async invoke(name, options = {}) {
-    if (!plain(options) || Object.keys(options).some(key => !['params', 'query', 'body', 'etag', 'idempotencyKey', 'signal'].includes(key))) {
+    if (!plain(options) || Object.keys(options).some(key => !['params', 'query', 'body', 'etag', 'idempotencyKey', 'signal', 'waitBudgetMs'].includes(key))) {
       throw new ApiError('INVALID_ARGUMENT', '未声明的管理请求选项。');
     }
-    const { params = {}, query = {}, body, etag, idempotencyKey, signal } = options;
+    const { params = {}, query = {}, body, etag, idempotencyKey, signal, waitBudgetMs } = options;
     if (!Object.hasOwn(OPERATIONS, name)) throw new ApiError('METHOD_NOT_ALLOWED', '没有此公开管理操作。');
     const op = OPERATIONS[name];
     if (!plain(params) || !plain(query)) throw new ApiError('INVALID_ARGUMENT', '参数须为普通对象。');
@@ -224,9 +224,15 @@ export class ApiClient {
     const token = await this.#oauth.accessToken();
     if (typeof token !== 'string' || !token || token.length > 4096 || /[\u0000-\u0020\u007f]/.test(token)) throw new ApiError('AUTH_REQUIRED', '请通过可信核心登录。', 401);
     headers.set('Authorization', `Bearer ${token}`);
-    const budget = name === 'invokeSkill'
-      ? (Number.isInteger(body?.timeout_ms) && body.timeout_ms >= 100 && body.timeout_ms <= 300000 ? body.timeout_ms : 120000)
-      : 10000;
+    // The derived deadline is the caller-visible business budget. A caller
+    // that owns the surrounding pipeline may pass a longer HTTP wait budget
+    // (waitBudgetMs) so a slow core pipeline is not aborted at the business
+    // deadline; the deadline sent to core (body.timeout_ms) stays unchanged.
+    const budget = Number.isInteger(waitBudgetMs) && waitBudgetMs >= 100 && waitBudgetMs <= 600000
+      ? waitBudgetMs
+      : name === 'invokeSkill'
+        ? (Number.isInteger(body?.timeout_ms) && body.timeout_ms >= 100 && body.timeout_ms <= 300000 ? body.timeout_ms : 120000)
+        : 10000;
     const deadline = AbortSignal.timeout(budget);
     const effectiveSignal = signal ? AbortSignal.any([signal, deadline]) : deadline;
     let response;
