@@ -458,11 +458,6 @@ async fn echo_with(
     instance: Uuid,
     plugin: Echo,
 ) -> (Echo, tokio::task::JoinHandle<()>) {
-    let server = serve_echo(f, instance, plugin.clone()).await;
-    (plugin, server)
-}
-
-async fn serve_echo(f: &Fixture, instance: Uuid, plugin: Echo) -> tokio::task::JoinHandle<()> {
     let root = f.directory.path();
     let key = KeyPair::from_pem(&fs::read_to_string(root.join("ca.key")).unwrap()).unwrap();
     let ca = CertificateParams::from_ca_cert_pem(&fs::read_to_string(root.join("ca.crt")).unwrap())
@@ -505,9 +500,9 @@ async fn serve_echo(f: &Fixture, instance: Uuid, plugin: Echo) -> tokio::task::J
         .unwrap(),
     )
     .unwrap();
-    let service = rpc::capability_service_server::CapabilityServiceServer::new(plugin);
+    let service = rpc::capability_service_server::CapabilityServiceServer::new(plugin.clone());
     let identity = tonic::transport::Identity::from_pem(cert.pem(), leaf.serialize_pem());
-    tokio::spawn(async move {
+    let server = tokio::spawn(async move {
         tonic::transport::Server::builder()
             .tls_config(
                 tonic::transport::ServerTlsConfig::new()
@@ -519,7 +514,8 @@ async fn serve_echo(f: &Fixture, instance: Uuid, plugin: Echo) -> tokio::task::J
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
             .await
             .unwrap();
-    })
+    });
+    (plugin, server)
 }
 
 #[tokio::test]
@@ -531,7 +527,7 @@ async fn broker_rpc_keeps_the_admitted_deadline_past_thirty_seconds() {
     let (skill, _) = skill_with_timeout(&f, deployment, 60000).await;
     let source = f.source(b"long business call".to_vec()).await;
     let entered = Arc::new(tokio::sync::Notify::new());
-    let server = serve_echo(
+    let (_, server) = echo_with(
         &f,
         instance,
         Echo {
