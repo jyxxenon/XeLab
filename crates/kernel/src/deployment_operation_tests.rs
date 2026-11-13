@@ -10,6 +10,57 @@ use axum::{
 use tower::ServiceExt;
 
 #[tokio::test]
+async fn inactive_sweep_selects_historical_runtime_markers_until_stop_is_confirmed() {
+    let Some(mut f) = Fixture::new().await else {
+        return;
+    };
+    let app = Arc::get_mut(&mut f.app).unwrap();
+    let mut config = app.config.value.clone();
+    config["runtime"]["socket"] = json!(app.config.root().join("missing-fixture-containerd.sock"));
+    app.config = crate::config::Config::from_value(config).unwrap();
+    app.runtime = crate::runtime::Runtime::new(app.config.clone());
+    let c = app.db.connect().await.unwrap();
+    let deployment: Uuid = c
+        .query_one("SELECT id FROM deployments", &[])
+        .await
+        .unwrap()
+        .get(0);
+    c.execute(
+        "DELETE FROM deployment_storage_holds WHERE deployment_id=$1",
+        &[&deployment],
+    )
+    .await
+    .unwrap();
+    let instance = Uuid::new_v4();
+    c.execute("INSERT INTO instances(id,deployment_id,generation,ordinal,phase,health,limits,runtime_id,created_at,updated_at) VALUES($1,$2,1,0,'stopped','unknown','{}',$3,now(),now())", &[&instance,&deployment,&instance.to_string()]).await.unwrap();
+    let rows = deployment_page(&c, &mut Sweep::default(), false)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, Uuid>("id"), deployment);
+
+    // The fixture has no containerd on its private socket, so no physical
+    // stop proof can be obtained. The old marker must survive that failure.
+    let error = reconcile(app, deployment, &mut BTreeMap::new())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "NOT_READY");
+    let retained: Option<String> = c
+        .query_one("SELECT runtime_id FROM instances WHERE id=$1", &[&instance])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(retained, Some(instance.to_string()));
+    assert_eq!(
+        deployment_page(&c, &mut Sweep::default(), false)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn actual_postgres_deployment_operations_return_complete_objects_and_respect_intent() {
     let Some(f) = Fixture::new().await else {
         return;

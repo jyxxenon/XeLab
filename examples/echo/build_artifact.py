@@ -22,6 +22,8 @@ def build(root, publisher, platform="linux/amd64", implementation="rust", reques
         raise ValueError("The initialization crash probe requires the explicit version 1 business format")
     if migration_observe_apply and (data_schema is None or failed_startup):
         raise ValueError("The Apply observer requires an explicit business format")
+    if implementation == "cpp" and (request_secret or request_blob or volume_access):
+        raise ValueError("The C++ reference supports only the ordinary Echo capabilities")
     publisher = str(uuid.UUID(publisher))
     schema = {"type": "object", "properties": {"message": {"type": "string", "maxLength": 1024}}, "required": ["message"], "additionalProperties": False}
     input_schema = json.loads(json.dumps(schema))
@@ -41,10 +43,15 @@ def build(root, publisher, platform="linux/amd64", implementation="rust", reques
         (directory / file).write_bytes(raw)
         checks.append(f"{file} {hashlib.sha256(raw).hexdigest()}\n")
     contract = {"name": name, "version": version, "schema_digest": "sha256:" + hashlib.sha256("".join(checks).encode()).hexdigest()}
+    plugin_id, entrypoint = {
+        "rust": (name, ["/usr/local/bin/xelab-echo"]),
+        "python": (name if data_schema is not None else "org.xelab.echo-python", ["/usr/bin/python3", "/opt/plugin/server.py"]),
+        "cpp": ("org.xelab.echo-cpp", ["/usr/local/bin/xelab-echo-cpp"]),
+    }[implementation]
     manifest = {
-        "manifest_version": "1", "plugin_id": name if implementation == "rust" or data_schema is not None else "org.xelab.echo-python", "version": plugin_version,
+        "manifest_version": "1", "plugin_id": plugin_id, "version": plugin_version,
         "publisher_id": publisher, "host_api_major": 1, "platforms": [platform],
-        "entrypoint": ["/usr/local/bin/xelab-echo"] if implementation == "rust" else ["/usr/bin/python3", "/opt/plugin/server.py"],
+        "entrypoint": entrypoint,
         "capabilities": [{"contract": contract, "input_schema": input_schema, "output_schema": output_schema, "stream_item_schema": None, "side_effect": side_effect, "maximum_input_bytes": 65536, "maximum_output_bytes": 65536}],
         "dependencies": [], "requested_rules": [], "volumes": [], "routes": [],
         "minimum_resources": {"cpu_millis": 100, "memory_bytes": 67108864, "ephemeral_bytes": 1048576, "pids": 64},
@@ -69,7 +76,7 @@ def build(root, publisher, platform="linux/amd64", implementation="rust", reques
         "mapping": "identity", "maximum_timeout_ms": 10000,
         "input_blobs": request_blob, "tags": ["echo"],
     }]
-    if implementation == "rust":
+    if implementation in ("rust", "cpp"):
         # A separate signed business contract exercises the actual streaming
         # transport without changing the ordinary echo capability's schemas.
         stream_input = {"type": "object", "properties": {
@@ -102,6 +109,7 @@ def build(root, publisher, platform="linux/amd64", implementation="rust", reques
             "mapping": "identity", "maximum_timeout_ms": 120000,
             "input_blobs": False, "tags": ["echo", "stream"],
         })
+    if implementation == "rust":
         # Conservative ordinary side-effect classes use distinct immutable
         # contracts. They share the same bounded unary/stream transport shape,
         # with a real per-generation mutation counter for queryable and
@@ -177,7 +185,7 @@ if __name__ == "__main__":
     parser.add_argument("--publisher-id", required=True)
     parser.add_argument("--output", type=pathlib.Path, default=pathlib.Path("examples/generated"))
     parser.add_argument("--platform", choices=["linux/amd64", "linux/arm64"], default="linux/amd64")
-    parser.add_argument("--implementation", choices=["rust", "python"], default="rust")
+    parser.add_argument("--implementation", choices=["rust", "python", "cpp"], default="rust")
     parser.add_argument("--request-secret", action="store_true", help="Enable the explicit Secret lease acceptance probe")
     parser.add_argument("--volume-access", choices=["ro", "rw"], help="Enable explicit persistent-volume acceptance")
     parser.add_argument("--request-blob", action="store_true", help="Enable explicit Blob proxy acceptance with a separate contract")

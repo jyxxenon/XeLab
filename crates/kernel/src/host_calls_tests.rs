@@ -3,6 +3,9 @@
 use super::*;
 use crate::host_calls::{self, Workload};
 
+#[path = "broker_queue_tests.rs"]
+mod business_queue;
+
 #[tokio::test]
 async fn host_stream_deadline_covers_waiting_and_ready_queued_payloads() {
     use futures_util::StreamExt;
@@ -114,12 +117,29 @@ fn proxy_rules() -> Vec<Value> {
     ]
 }
 async fn skill(f: &Fixture, deployment: Uuid) -> (Uuid, Value) {
-    skill_with_health_updates(f, deployment, true).await
+    skill_with_timeout(f, deployment, 30000).await
 }
 
 async fn skill_with_health_updates(
     f: &Fixture,
     deployment: Uuid,
+    refresh_health: bool,
+) -> (Uuid, Value) {
+    register_test_skill(f, deployment, 30000, refresh_health).await
+}
+
+async fn skill_with_timeout(
+    f: &Fixture,
+    deployment: Uuid,
+    maximum_timeout_ms: u64,
+) -> (Uuid, Value) {
+    register_test_skill(f, deployment, maximum_timeout_ms, true).await
+}
+
+async fn register_test_skill(
+    f: &Fixture,
+    deployment: Uuid,
+    maximum_timeout_ms: u64,
     refresh_health: bool,
 ) -> (Uuid, Value) {
     let c = f.app.db.connect().await.unwrap();
@@ -141,7 +161,7 @@ async fn skill_with_health_updates(
         .unwrap()
         .get(0);
     let cap = &manifest["capabilities"][0];
-    let definition = json!({"name":"org.xelab.echo-python.host-test","version":"1.0.0","description":"Host component","target":{"kind":"capability","plugin_id":manifest["plugin_id"],"contract":cap["contract"]},"input_schema":cap["input_schema"],"output_schema":cap["output_schema"],"stream_item_schema":cap["stream_item_schema"],"mapping":"identity","maximum_timeout_ms":30000,"input_blobs":true,"tags":[]});
+    let definition = json!({"name":"org.xelab.echo-python.host-test","version":"1.0.0","description":"Host component","target":{"kind":"capability","plugin_id":manifest["plugin_id"],"contract":cap["contract"]},"input_schema":cap["input_schema"],"output_schema":cap["output_schema"],"stream_item_schema":cap["stream_item_schema"],"mapping":"identity","maximum_timeout_ms":maximum_timeout_ms,"input_blobs":true,"tags":[]});
     contracts::validate("SkillDefinition", &definition).unwrap();
     manifest["skills"] = json!([definition]);
     c.execute(
@@ -333,7 +353,9 @@ async fn host_signed_proxy_scope_and_current_approval_are_intersections() {
 struct Echo {
     calls: Arc<std::sync::atomic::AtomicUsize>,
     output_bytes: Arc<std::sync::atomic::AtomicUsize>,
-    fail_after_dispatch: Arc<std::sync::atomic::AtomicBool>,
+    unary_failure: Arc<std::sync::Mutex<Option<tonic::Status>>>,
+    unary_gate: Option<Arc<tokio::sync::Semaphore>>,
+    delay: Option<(Arc<tokio::sync::Notify>, Duration)>,
 }
 #[tonic::async_trait]
 impl rpc::capability_service_server::CapabilityService for Echo {
@@ -345,6 +367,11 @@ impl rpc::capability_service_server::CapabilityService for Echo {
         r: tonic::Request<rpc::InvokeRequest>,
     ) -> std::result::Result<tonic::Response<rpc::InvokeResponse>, tonic::Status> {
         assert!(r.peer_certs().is_some());
+        if let Some((entered, delay)) = &self.delay {
+            let response = tokio::time::sleep(*delay);
+            entered.notify_one();
+            response.await;
+        }
         let r = r.into_inner();
         assert!(!r
             .context
@@ -353,10 +380,11 @@ impl rpc::capability_service_server::CapabilityService for Echo {
             .delegation_token
             .starts_with("host:"));
         self.calls.fetch_add(1, Ordering::SeqCst);
-        if self.fail_after_dispatch.load(Ordering::SeqCst) {
-            return Err(tonic::Status::unavailable(
-                "Simulated transport failure after dispatch",
-            ));
+        if let Some(gate) = &self.unary_gate {
+            gate.acquire().await.unwrap().forget();
+        }
+        if let Some(failure) = self.unary_failure.lock().unwrap().clone() {
+            return Err(failure);
         }
         let size = self.output_bytes.load(Ordering::SeqCst);
         let message = if size == 0 {
@@ -427,6 +455,19 @@ impl rpc::capability_service_server::CapabilityService for Echo {
     }
 }
 async fn echo(f: &Fixture, instance: Uuid) -> (Echo, tokio::task::JoinHandle<()>) {
+    echo_with(f, instance, Echo::default()).await
+}
+
+async fn echo_with(
+    f: &Fixture,
+    instance: Uuid,
+    plugin: Echo,
+) -> (Echo, tokio::task::JoinHandle<()>) {
+    let server = serve_echo(f, instance, plugin.clone()).await;
+    (plugin, server)
+}
+
+async fn serve_echo(f: &Fixture, instance: Uuid, plugin: Echo) -> tokio::task::JoinHandle<()> {
     let root = f.directory.path();
     let key = KeyPair::from_pem(&fs::read_to_string(root.join("ca.key")).unwrap()).unwrap();
     let ca = CertificateParams::from_ca_cert_pem(&fs::read_to_string(root.join("ca.crt")).unwrap())
@@ -469,10 +510,9 @@ async fn echo(f: &Fixture, instance: Uuid) -> (Echo, tokio::task::JoinHandle<()>
         .unwrap(),
     )
     .unwrap();
-    let plugin = Echo::default();
-    let service = rpc::capability_service_server::CapabilityServiceServer::new(plugin.clone());
+    let service = rpc::capability_service_server::CapabilityServiceServer::new(plugin);
     let identity = tonic::transport::Identity::from_pem(cert.pem(), leaf.serialize_pem());
-    let server = tokio::spawn(async move {
+    tokio::spawn(async move {
         tonic::transport::Server::builder()
             .tls_config(
                 tonic::transport::ServerTlsConfig::new()
@@ -484,8 +524,69 @@ async fn echo(f: &Fixture, instance: Uuid) -> (Echo, tokio::task::JoinHandle<()>
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
             .await
             .unwrap();
+    })
+}
+
+#[tokio::test]
+async fn broker_rpc_keeps_the_admitted_deadline_past_thirty_seconds() {
+    let Some(f) = Fixture::new().await else {
+        return;
+    };
+    let (deployment, instance) = f.workload().await;
+    let (skill, _) = skill_with_timeout(&f, deployment, 60000).await;
+    let source = f.source(b"long business call".to_vec()).await;
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let server = serve_echo(
+        &f,
+        instance,
+        Echo {
+            delay: Some((entered.clone(), Duration::from_secs(31))),
+            ..Echo::default()
+        },
+    )
+    .await;
+    let input = json!({"input":{"source":source},"timeout_ms":60000});
+    let app = f.app.clone();
+    let token = f.token.clone();
+    let call = tokio::spawn(async move {
+        crate::broker::invoke_skill(
+            &app,
+            &token,
+            "127.0.0.1".parse().unwrap(),
+            Uuid::new_v4(),
+            skill,
+            &input,
+            "long-business-call",
+        )
+        .await
     });
-    (plugin, server)
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .expect("the authenticated provider must receive the admitted Call");
+
+    // Keep PostgreSQL, credential and TLS clocks real. Advance only the
+    // asynchronous transport timers after both ends have scheduled them.
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_millis(30500)).await;
+    tokio::time::resume();
+    let result = tokio::time::timeout(Duration::from_secs(5), call)
+        .await
+        .expect("the provider must return within the admitted deadline")
+        .unwrap()
+        .expect("the broker transport must allow this admitted business call");
+    assert_eq!(result["call"]["output"], json!({"message":"proxied"}));
+    let id = contracts::id(&result["call"], "call_id").unwrap();
+    let c = f.app.db.connect().await.unwrap();
+    let settled = c
+        .query_one(
+            "SELECT c.state,r.status FROM calls c JOIN reservations r ON r.id=c.id WHERE c.id=$1",
+            &[&id],
+        )
+        .await
+        .unwrap();
+    assert_eq!(settled.get::<_, &str>(0), "succeeded");
+    assert_eq!(settled.get::<_, &str>(1), "released");
+    server.abort();
 }
 
 #[tokio::test]

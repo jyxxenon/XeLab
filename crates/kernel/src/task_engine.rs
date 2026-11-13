@@ -214,15 +214,14 @@ pub async fn begin(tx: &Transaction<'_>, auth: &Auth, lease: &Lease) -> Result<I
     Ok(invocation)
 }
 
-/// Prepare a Task invocation inside the same transaction as the Broker Call.
-pub(crate) async fn begin_broker(
+/// Prepare a Task invocation with a proof bound to this transaction.
+pub(crate) async fn prepare_broker(
     tx: &Transaction<'_>,
     auth: &Auth,
     lease: &Lease,
 ) -> Result<(Invocation, Context)> {
-    let (invocation, prepared, now) = prepare_begin(tx, auth, lease).await?;
+    let (invocation, prepared, _) = prepare_begin(tx, auth, lease).await?;
     let context = prepared.into_broker_context(tx).await?;
-    set_live_attempt(tx, lease.attempt_id, "running", now, invocation.deadline).await?;
     Ok((invocation, context))
 }
 
@@ -255,7 +254,7 @@ async fn prepare_begin(
     Ok((invocation, prepared, now))
 }
 
-/// Link the already admitted Call while the attempt and admission are locked.
+/// Cross the dispatch boundary together with the admitted Call.
 pub(crate) async fn record_broker_call(
     tx: &Transaction<'_>,
     lease: &Lease,
@@ -263,18 +262,18 @@ pub(crate) async fn record_broker_call(
 ) -> Result<()> {
     let active = load(tx, lease).await?;
     active.require_running_step()?;
-    if active.state != "running" || active.broker_call_id.is_some() {
+    if active.state != "leased" || active.broker_call_id.is_some() {
         return Err(Error::conflict(
             "Task attempt no longer accepts a Broker Call",
         ));
     }
     let updated = tx.execute(
-        "UPDATE attempts a SET broker_call_id=c.id,revision=a.revision+1,updated_at=clock_timestamp()
+        "UPDATE attempts a SET state='running',broker_call_id=c.id,revision=a.revision+1,updated_at=clock_timestamp()
          FROM calls c JOIN instances i ON i.id=c.provider_instance_id
          JOIN deployments d ON d.id=i.deployment_id JOIN installations n ON n.id=d.installation_id
          JOIN task_steps s ON s.provider_deployment_id=d.id
          JOIN tasks t ON t.id=s.task_id JOIN execution_delegations e ON e.id=t.delegation_id
-         WHERE a.id=$1 AND c.id=$2 AND s.id=a.step_id AND a.state='running'
+         WHERE a.id=$1 AND c.id=$2 AND s.id=a.step_id AND a.state='leased'
            AND a.broker_call_id IS NULL AND c.state='running'
            AND LEAST(a.lease_expires_at,c.deadline_at,t.deadline_at,e.expires_at)>clock_timestamp()
            AND c.owner_id=t.owner_id AND c.credential_id=e.issuer_credential_id

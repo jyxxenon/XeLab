@@ -108,5 +108,157 @@ class WindowOpenDiagnostics(unittest.TestCase):
         self.assertNotIn(SECRET, json.dumps(self.report))
 
 
+class SkillCallDiagnostics(unittest.TestCase):
+    def setUp(self):
+        self.report = {"http": {"skill_post_attempts": 0, "actual_skill_successes": 0,
+                                "call_proof_statuses": [], "contribution_recheck_statuses": []},
+                       "observation": {}}
+        self.bodies = SimpleNamespace(requests={})
+        self.audit = DRIVER.SkillCallAudit(self.report, self.bodies, "valid_call", 2)
+
+    def test_stage_timeline_is_bounded_and_uses_fixed_labels(self):
+        for stage in DRIVER.SKILL_STAGES:
+            self.audit.mark(stage)
+        entry = self.report["skill_call_diagnostics"][-1]
+        self.assertEqual([item["stage"] for item in entry["timeline"]], list(DRIVER.SKILL_STAGES))
+        self.assertLessEqual(entry["elapsed_ms"], 300000)
+        self.assertEqual(self.report["step"], "valid_call_complete")
+        with self.assertRaises(DRIVER.CheckFailed):
+            self.audit.mark(SECRET)
+
+    def test_old_entries_are_evicted_and_stage_count_is_bounded(self):
+        for index in range(12):
+            DRIVER.SkillCallAudit(self.report, self.bodies, f"call_{index}", 1)
+        entries = self.report["skill_call_diagnostics"]
+        self.assertEqual(len(entries), DRIVER.SkillCallAudit.limit)
+        self.assertEqual(entries[0]["label"], "call_4")
+        self.assertEqual(entries[-1]["label"], "call_11")
+
+    def test_snapshot_filters_untrusted_values(self):
+        class Frame:
+            def is_detached(self):
+                return False
+
+            def locator(self, selector):
+                return self
+
+            def evaluate(self, script, arg, timeout=None):
+                return {"state_class": SECRET, "result_matches": True, "result_empty": True,
+                        "result_context_matches": SECRET, "call_disabled": False,
+                        "call_visible": True, "connected": True, "document_visible": False,
+                        "raw_text": SECRET}
+
+        self.audit.snapshot(Frame(), "expected")
+        snapshot = self.report["skill_call_diagnostics"][-1]["iframe"]
+        self.assertEqual(snapshot["state_class"], "other_nonempty")
+        self.assertIs(snapshot["result_matches"], True)
+        self.assertIs(snapshot["result_empty"], True)
+        self.assertIsNone(snapshot["result_context_matches"])
+        self.assertIs(snapshot["call_disabled"], False)
+        self.assertIs(snapshot["document_visible"], False)
+        self.assertNotIn(SECRET, json.dumps(self.report))
+
+    def test_first_mismatch_reports_one_fixed_stage(self):
+        self.assertEqual(self.audit.mismatch(), "submit_not_observed")
+        self.report["http"]["skill_post_attempts"] = 1
+        self.assertEqual(self.audit.mismatch(), "request_not_correlated")
+        state = {"expected_at_start": 2, "response_ms": None, "verified": False}
+        self.bodies.requests[1] = state
+        self.assertEqual(self.audit.mismatch(), "response_not_observed")
+        state["response_ms"] = 10
+        self.assertEqual(self.audit.mismatch(), "response_not_verified")
+        state["verified"] = True
+        self.assertEqual(self.audit.mismatch(), "iframe_unavailable")
+        self.audit.entry["iframe"] = {"dom_available": True, "state_class": "waiting"}
+        self.assertEqual(self.audit.mismatch(), "iframe_state_waiting")
+        self.audit.entry["iframe"] = {"dom_available": True, "state_class": "completed", "result_matches": False}
+        self.assertEqual(self.audit.mismatch(), "result_mismatch")
+        self.audit.entry["iframe"]["result_matches"] = True
+        self.assertEqual(self.audit.mismatch(), "call_proof_not_observed")
+        self.report["http"]["call_proof_statuses"] = [503]
+        self.assertEqual(self.audit.mismatch(), "call_proof_not_successful")
+        self.report["http"]["call_proof_statuses"].append(200)
+        self.assertEqual(self.audit.mismatch(), "contribution_recheck_not_observed")
+        self.report["http"]["contribution_recheck_statuses"] = [500]
+        self.assertEqual(self.audit.mismatch(), "contribution_recheck_not_successful")
+        self.report["http"]["contribution_recheck_statuses"].append(200)
+        self.assertEqual(self.audit.mismatch(), "none")
+        self.assertEqual(self.audit.entry["attempts_delta"], 1)
+        self.assertEqual(self.audit.entry["successes_delta"], 0)
+
+    def test_observer_pump_reports_fixed_inner_stages(self):
+        class Page:
+            def evaluate(self, expression):
+                self.expression = expression
+
+        class Bodies:
+            def read_completed(self):
+                self.read = True
+
+            def complete(self):
+                return True
+
+        stages = []
+        bodies = Bodies()
+        DRIVER.wait_for_observers(Page(), {"active_request_observers": 0, "active_response_observers": 0},
+                                  bodies, stages.append)
+        self.assertEqual(stages, ["audit_pump", "audit_read"])
+        self.assertTrue(bodies.read)
+
+    def test_observation_timeout_is_not_reported_as_a_semantic_mismatch(self):
+        class Frame:
+            def is_detached(self):
+                return False
+
+            def locator(self, selector):
+                return self
+
+            def evaluate(self, script, arg, timeout=None):
+                return {"state_class": "completed", "result_matches": True, "result_empty": False,
+                        "result_context_matches": True, "call_disabled": False,
+                        "call_visible": True, "connected": True, "document_visible": True}
+
+        self.report["http"]["skill_post_attempts"] = 1
+        self.report["http"]["actual_skill_successes"] = 1
+        self.report["http"]["call_proof_statuses"] = [200]
+        self.report["http"]["contribution_recheck_statuses"] = [200]
+        self.bodies.requests[1] = {"expected_at_start": 2, "response_ms": 10, "verified": True}
+        with patch.object(DRIVER, "wait_for_observers", side_effect=RuntimeError(SECRET)):
+            self.audit.mark("audit_pump")
+            self.audit.failure(Frame(), SimpleNamespace(), RuntimeError(SECRET), "expected")
+        entry = self.report["skill_call_diagnostics"][-1]
+        self.assertEqual(entry["mismatch"], "observation_incomplete")
+        self.assertEqual(self.report["step"], "valid_call_audit_pump")
+
+    def test_skill_result_wait_passes_expected_without_reading_text(self):
+        class Frame:
+            def wait_for_function(self, expression, *, arg=None, timeout=None):
+                self.expression, self.arg = expression, arg
+
+        frame = Frame()
+        DRIVER.wait_for_skill_result(frame, "expected component result")
+        self.assertEqual(frame.arg, "expected component result")
+        self.assertIn("Skill call completed.", frame.expression)
+        for code in ("DEADLINE_EXCEEDED", "CHANNEL_CLOSED", "BACKEND_ERROR", "PROTOCOL_ERROR",
+                     "PERMISSION_DENIED", "BINDING_UNAVAILABLE", "RATE_LIMITED"):
+            self.assertIn(code, frame.expression)
+
+    def test_failure_keeps_fixed_step_and_never_leaks_error_text(self):
+        class Frame:
+            def is_detached(self):
+                return True
+
+        with patch.object(DRIVER, "wait_for_observers", side_effect=RuntimeError(SECRET)):
+            self.audit.mark("wait_iframe_result")
+            self.audit.failure(Frame(), SimpleNamespace(), RuntimeError(SECRET), SECRET)
+        entry = self.report["skill_call_diagnostics"][-1]
+        self.assertEqual(entry["status"], "failed")
+        self.assertEqual(entry["error_type"], "OtherError")
+        self.assertEqual(entry["mismatch"], "submit_not_observed")
+        self.assertIs(entry["iframe"]["detached"], True)
+        self.assertEqual(self.report["step"], "valid_call_wait_iframe_result")
+        self.assertNotIn(SECRET, json.dumps(self.report))
+
+
 if __name__ == "__main__":
     unittest.main()

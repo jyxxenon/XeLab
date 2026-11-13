@@ -3,6 +3,9 @@ use super::*;
 use chrono::{DateTime, Utc};
 use tokio_postgres::Row;
 
+const QUEUE_PROFILE: &str =
+    r#"{"max_active_requests":1,"max_queue_requests":2,"queue_timeout_ms":5000}"#;
+
 struct TaskFixture {
     host: Fixture,
     task: Uuid,
@@ -13,13 +16,14 @@ struct TaskFixture {
 
 impl TaskFixture {
     async fn new(side_effect: &str, use_blob: bool) -> Option<Self> {
-        Self::with_health_updates(side_effect, use_blob, true).await
+        Self::with_options(side_effect, use_blob, true, false).await
     }
 
-    async fn with_health_updates(
+    async fn with_options(
         side_effect: &str,
         use_blob: bool,
         refresh_health: bool,
+        queued: bool,
     ) -> Option<Self> {
         let host = Fixture::new().await?;
         let (deployment, instance) = host.workload().await;
@@ -48,7 +52,12 @@ impl TaskFixture {
                 baseline["capabilities"][0]["input_schema"].clone();
         }
         manifest["capabilities"][0]["side_effect"] = json!(side_effect);
-        crate::artifact::validate_profile(&manifest).unwrap();
+        if queued {
+            manifest["business_entry"] = json!("skill_required");
+            manifest["concurrency"] = serde_json::from_str(QUEUE_PROFILE).unwrap();
+        } else {
+            crate::artifact::validate_profile(&manifest).unwrap();
+        }
         c.execute(
             "UPDATE installations SET manifest=$2 WHERE id=$1",
             &[&installation, &manifest],
@@ -56,6 +65,17 @@ impl TaskFixture {
         .await
         .unwrap();
         let (skill, _) = skill_with_health_updates(&host, deployment, refresh_health).await;
+        if queued {
+            let manifest: Value = c
+                .query_one(
+                    "SELECT manifest FROM installations WHERE id=$1",
+                    &[&installation],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            crate::artifact::validate_profile(&manifest).unwrap();
+        }
 
         let (field, input) = if use_blob {
             let source = host.source(b"task fixture Blob".to_vec()).await;
@@ -199,6 +219,92 @@ impl TaskFixture {
 }
 
 #[tokio::test]
+async fn postgres_task_waits_for_the_shared_skill_slot_without_admitting_a_call() {
+    let Some(f) = TaskFixture::with_options("none", false, true, true).await else {
+        return;
+    };
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let (plugin, server) = echo_with(
+        &f.host,
+        f.instance,
+        Echo {
+            unary_gate: Some(gate.clone()),
+            ..Echo::default()
+        },
+    )
+    .await;
+    let app = f.host.app.clone();
+    let token = f.host.token.clone();
+    let skill = f.skill;
+    let direct = tokio::spawn(async move {
+        crate::broker::invoke_skill(
+            &app,
+            &token,
+            "127.0.0.1".parse().unwrap(),
+            Uuid::new_v4(),
+            skill,
+            &json!({"input":{"message":"occupy the slot"},"timeout_ms":15000}),
+            "queue-occupied",
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while plugin.calls.load(Ordering::SeqCst) != 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("direct Skill must occupy the provider slot");
+
+    let app = f.host.app.clone();
+    let worker = tokio::spawn(async move { crate::task_worker::run_once(&app).await });
+    let provider = crate::broker_queue::Instance {
+        id: f.instance,
+        generation: 7,
+    };
+    let queue = &f.host.app.runtime.business_queue;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while queue.len(provider) != 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Task must wait behind the direct Skill");
+    let c = f.host.app.db.connect().await.unwrap();
+    let row = c
+        .query_one(
+            "SELECT a.state,a.broker_call_id,q.daily_calls_used,q.concurrent_calls_used,
+                    (SELECT count(*) FROM calls) AS calls
+             FROM tasks t JOIN task_steps s ON s.task_id=t.id JOIN attempts a ON a.step_id=s.id
+             JOIN quotas q ON q.account_id=t.owner_id WHERE t.id=$1",
+            &[&f.task],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, String>("state"), "leased");
+    assert!(row.get::<_, Option<Uuid>>("broker_call_id").is_none());
+    assert_eq!(row.get::<_, i64>("calls"), 1);
+    assert_eq!(row.get::<_, i64>("daily_calls_used"), 1);
+    assert_eq!(row.get::<_, i64>("concurrent_calls_used"), 1);
+    assert_eq!(plugin.calls.load(Ordering::SeqCst), 1);
+
+    gate.add_permits(2);
+    direct.await.unwrap().unwrap();
+    assert!(worker.await.unwrap().unwrap());
+    let row = f.journal().await;
+    for column in ["task_state", "step_state", "attempt_state", "call_state"] {
+        assert_eq!(row.get::<_, String>(column), "succeeded", "{column}");
+    }
+    assert_eq!(row.get::<_, i64>("daily_calls_used"), 2);
+    assert_eq!(row.get::<_, i64>("concurrent_calls_used"), 0);
+    assert_eq!(row.get::<_, i64>("issuer_charges"), 1);
+    assert_eq!(row.get::<_, String>("reservation_status"), "released");
+    assert_eq!(plugin.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(queue.len(provider), 0);
+    server.abort();
+}
+
+#[tokio::test]
 async fn postgres_task_broker_success_is_journaled_and_charged_once() {
     let Some(f) = TaskFixture::new("none", false).await else {
         return;
@@ -232,7 +338,9 @@ async fn postgres_task_broker_lost_reply_records_unknown_without_redispatch() {
         return;
     };
     let (plugin, server) = echo(&f.host, f.instance).await;
-    plugin.fail_after_dispatch.store(true, Ordering::SeqCst);
+    *plugin.unary_failure.lock().unwrap() = Some(tonic::Status::unavailable(
+        "Simulated transport failure after dispatch",
+    ));
     assert!(crate::task_worker::run_once(&f.host.app).await.unwrap());
     let row = f.journal().await;
     f.assert_admission(&row);
@@ -294,7 +402,7 @@ async fn postgres_task_broker_requires_current_provider_generation_at_admission(
 async fn postgres_task_broker_provider_freshness_expires_during_admission_lock_wait() {
     // The fixture starts with a fresh observation, then this test owns its
     // clock. A concurrent heartbeat would legitimately make admission safe.
-    let Some(f) = TaskFixture::with_health_updates("none", false, false).await else {
+    let Some(f) = TaskFixture::with_options("none", false, false, false).await else {
         return;
     };
     let (plugin, server) = echo(&f.host, f.instance).await;
