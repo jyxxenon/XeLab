@@ -47,11 +47,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 url = "2"
 uuid = { version = "1", features = ["serde", "v4"] }
+xelab-plugin-sdk = { path = "../plugin-sdk" }
 x509-parser = "0.16"
-
-[build-dependencies]
-tonic-build = "0.12"
-protoc-bin-vendored = "3"
 
 [dev-dependencies]
 tempfile = "3"
