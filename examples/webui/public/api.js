@@ -224,18 +224,14 @@ export class ApiClient {
     const token = await this.#oauth.accessToken();
     if (typeof token !== 'string' || !token || token.length > 4096 || /[\u0000-\u0020\u007f]/.test(token)) throw new ApiError('AUTH_REQUIRED', '请通过可信核心登录。', 401);
     headers.set('Authorization', `Bearer ${token}`);
-    // The business deadline applies inside core. Waiting exactly that long can
-    // abort a Call that succeeded but whose authorization reads and response
-    // settlement crossed the deadline (#82). A caller that owns a longer
-    // surrounding pipeline may pass an explicit HTTP wait budget; either way
-    // the deadline sent to core (body.timeout_ms) stays unchanged.
-    const businessBudget = Number.isInteger(body?.timeout_ms) && body.timeout_ms >= 100 && body.timeout_ms <= 300000
-      ? body.timeout_ms
-      : 120000;
+    // The derived deadline is the caller-visible business budget. A caller
+    // that owns the surrounding pipeline may pass a longer HTTP wait budget
+    // (waitBudgetMs) so a slow core pipeline is not aborted at the business
+    // deadline; the deadline sent to core (body.timeout_ms) stays unchanged.
     const budget = Number.isInteger(waitBudgetMs) && waitBudgetMs >= 100 && waitBudgetMs <= 600000
       ? waitBudgetMs
       : name === 'invokeSkill'
-        ? Math.min(businessBudget + 3 * 10000 + 2000, 600000)
+        ? (Number.isInteger(body?.timeout_ms) && body.timeout_ms >= 100 && body.timeout_ms <= 300000 ? body.timeout_ms : 120000)
         : 10000;
     const deadline = AbortSignal.timeout(budget);
     const effectiveSignal = signal ? AbortSignal.any([signal, deadline]) : deadline;
