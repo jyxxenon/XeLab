@@ -443,55 +443,22 @@ pub(crate) async fn grant_http_call(
     Ok(())
 }
 
+/// Resolve declared input Blobs with the same authority used at dispatch.
 #[allow(clippy::too_many_arguments)]
-async fn grant_call_inner(
+pub(crate) async fn authorize_skill_blob_inputs(
     c: &(impl GenericClient + Sync),
     app: &App,
     ctx: &Context,
-    call: Uuid,
     deployment: Uuid,
     manifest: &Value,
     definition: &Value,
     input: &Value,
     allow_input_resources: bool,
-    current_paths: Option<&[Path]>,
-) -> Result<Vec<Path>> {
-    let context = c
-        .query_one(
-            "SELECT skill_id,http_binding FROM calls WHERE id=$1",
-            &[&call],
-        )
-        .await?;
-    let skill = context.get::<_, Option<Uuid>>("skill_id");
-    let http = context.get::<_, Option<Value>>("http_binding");
+) -> Result<BTreeSet<Uuid>> {
     let has_blobs = requested(manifest, "blob.read") || requested(manifest, "blob.create");
-    let has_proxy = manifest["requested_rules"].as_array().is_some_and(|rs| {
-        rs.iter().any(|r| {
-            proxy_action(
-                r["rule"]["action"].as_str().unwrap_or(""),
-                r["rule"]["resource"]["kind"].as_str().unwrap_or(""),
-            )
-        })
-    });
-    let effectful = definition["side_effect"]
-        .as_str()
-        .is_some_and(|effect| effect != "none");
-    if !has_proxy && skill.is_none() && http.is_none() && !effectful && ctx.proxy_paths.is_none() {
-        return Ok(Vec::new());
-    }
-    if has_proxy {
-        check_approval(c, app, deployment, manifest).await?;
-    }
     let mut ids = BTreeSet::new();
     if has_blobs && allow_input_resources {
         resources(&definition["input_schema"], input, &mut ids)?;
-    }
-    let (action, resource) = crate::broker::business_target(c, call).await?;
-    let mut bounds = vec![json!({"action":action,"resource":resource.json()})];
-    let pinned =
-        skill.is_some() || http.is_some() || effectful || has_proxy || ctx.proxy_paths.is_some();
-    if let Some(skill) = skill {
-        bounds.push(json!({"action":"skill.invoke","resource":{"kind":"skill","match":"ids","ids":[skill]}}));
     }
     for id in &ids {
         let row = c
@@ -516,6 +483,65 @@ async fn grant_call_inner(
             ctx.peer,
         )
         .await?;
+    }
+    Ok(ids)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn grant_call_inner(
+    c: &(impl GenericClient + Sync),
+    app: &App,
+    ctx: &Context,
+    call: Uuid,
+    deployment: Uuid,
+    manifest: &Value,
+    definition: &Value,
+    input: &Value,
+    allow_input_resources: bool,
+    current_paths: Option<&[Path]>,
+) -> Result<Vec<Path>> {
+    let context = c
+        .query_one(
+            "SELECT skill_id,http_binding FROM calls WHERE id=$1",
+            &[&call],
+        )
+        .await?;
+    let skill = context.get::<_, Option<Uuid>>("skill_id");
+    let http = context.get::<_, Option<Value>>("http_binding");
+    let has_proxy = manifest["requested_rules"].as_array().is_some_and(|rs| {
+        rs.iter().any(|r| {
+            proxy_action(
+                r["rule"]["action"].as_str().unwrap_or(""),
+                r["rule"]["resource"]["kind"].as_str().unwrap_or(""),
+            )
+        })
+    });
+    let effectful = definition["side_effect"]
+        .as_str()
+        .is_some_and(|effect| effect != "none");
+    if !has_proxy && skill.is_none() && http.is_none() && !effectful && ctx.proxy_paths.is_none() {
+        return Ok(Vec::new());
+    }
+    if has_proxy {
+        check_approval(c, app, deployment, manifest).await?;
+    }
+    let ids = authorize_skill_blob_inputs(
+        c,
+        app,
+        ctx,
+        deployment,
+        manifest,
+        definition,
+        input,
+        allow_input_resources,
+    )
+    .await?;
+    let (action, resource) = crate::broker::business_target(c, call).await?;
+    let mut bounds = vec![json!({"action":action,"resource":resource.json()})];
+    let pinned =
+        skill.is_some() || http.is_some() || effectful || has_proxy || ctx.proxy_paths.is_some();
+    if let Some(skill) = skill {
+        bounds.push(json!({"action":"skill.invoke","resource":{"kind":"skill","match":"ids","ids":[skill]}}));
     }
     if !ids.is_empty() {
         bounds

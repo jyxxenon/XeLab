@@ -332,7 +332,7 @@ async fn execute_inner(
         // Task preparation and its transaction-bound proof must share the
         // physical Call admission transaction and its lock order.
         db::call_lock(&tx).await?;
-        let (invocation, ctx) = task_engine::begin_broker(&tx, &app.auth, lease).await?;
+        let (invocation, ctx) = task_engine::prepare_broker(&tx, &app.auth, lease).await?;
         input.skill = Some(invocation.skill_id);
         input.deployment = Some(invocation.deployment_id);
         input.skill_input = Some(json!({
