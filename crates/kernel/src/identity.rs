@@ -10,7 +10,7 @@ use crate::{
 use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use axum::http::{HeaderMap, StatusCode};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SubsecRound, Utc};
 use serde_json::{json, Value};
 use std::{
     collections::{BTreeSet, HashMap},
@@ -438,6 +438,10 @@ fn project(model: &str, raw: Value) -> Result<Value> {
     validate(model, &value)?;
     Ok(value)
 }
+fn effective_key_expiry(conditions: &Value, persisted: DateTime<Utc>) -> Result<DateTime<Utc>> {
+    Ok(policy::timestamp(&conditions["expires_at"])?.min(persisted))
+}
+
 pub async fn key_value(c: &impl GenericClient, key: Uuid) -> Result<Value> {
     let row = c
         .query_opt(
@@ -448,7 +452,9 @@ pub async fn key_value(c: &impl GenericClient, key: Uuid) -> Result<Value> {
         .ok_or_else(Error::not_found)?;
     let mut v: Value = row.get(0);
     v["inheritance"] = inheritance_value(string(&v, "inheritance_mode")?, v.get("maximum_rules"));
-    if v["status"] == "active" && policy::timestamp(&v["expires_at"])? <= Utc::now() {
+    let expiry = effective_key_expiry(&v["conditions"], policy::timestamp(&v["expires_at"])?)?;
+    v["conditions"]["expires_at"] = json!(expiry);
+    if v["status"] == "active" && expiry <= Utc::now() {
         v["status"] = json!("expired");
     }
     project("ApiKey", v)
@@ -501,6 +507,13 @@ async fn issuing_key(c: &impl GenericClient, ctx: &Context) -> Result<Option<Uui
         .get(0);
     Ok(matches!(kind.as_str(), "api_key" | "oauth_access").then_some(ctx.credential))
 }
+
+fn persisted_expiry(value: &Value) -> Result<DateTime<Utc>> {
+    // PostgreSQL timestamps have microsecond precision. Evaluate and store the
+    // same instant, truncating so the persisted deadline cannot be later.
+    Ok(policy::timestamp(value)?.trunc_subsecs(6))
+}
+
 async fn bounded_expiry(
     c: &impl GenericClient,
     ctx: &Context,
@@ -649,7 +662,7 @@ pub async fn execute(
                     return Err(denied_quota());
                 }
             }
-            let expiry = body.get("expires_at").map(policy::timestamp).transpose()?;
+            let expiry = body.get("expires_at").map(persisted_expiry).transpose()?;
             bounded_expiry(c, ctx, parent, expiry).await?;
             let mut policy = Policy::for_context(c, ctx);
             let mut paths = policy.select(ctx, &body["inheritance"]).await?;
@@ -721,7 +734,7 @@ pub async fn execute(
                 if v.is_null() {
                     None
                 } else {
-                    Some(policy::timestamp(v)?)
+                    Some(persisted_expiry(v)?)
                 }
             } else {
                 row.get("expires_at")
@@ -1203,11 +1216,13 @@ async fn issue_key(
         return Err(Error::denied());
     }
     lock_tree(c, owner).await?;
-    let expiry = policy::timestamp(&body["conditions"]["expires_at"])?;
+    let expiry = persisted_expiry(&body["conditions"]["expires_at"])?;
     if expiry > Utc::now() + chrono::Duration::days(365) {
         return Err(Error::invalid("API Key lifetime exceeds 365 days"));
     }
-    policy::validate_conditions(&body["conditions"])?;
+    let mut conditions = body["conditions"].clone();
+    conditions["expires_at"] = json!(expiry);
+    policy::validate_conditions(&conditions)?;
     bounded_expiry(c, ctx, owner, Some(expiry)).await?;
     let mode = string(&body["inheritance"], "mode")?;
     let mut policy = Policy::for_context(c, ctx);
@@ -1226,10 +1241,14 @@ async fn issue_key(
         {
             return Err(Error::denied());
         }
-        let old_conditions: Value = row.get("conditions");
-        let combined = policy::intersect_conditions(&old_conditions, &body["conditions"])
-            .ok_or_else(Error::denied)?;
-        let mut proposed = body["conditions"].clone();
+        let mut old_conditions: Value = row.get("conditions");
+        old_conditions["expires_at"] = json!(effective_key_expiry(
+            &old_conditions,
+            row.get("expires_at")
+        )?);
+        let combined =
+            policy::intersect_conditions(&old_conditions, &conditions).ok_or_else(Error::denied)?;
+        let mut proposed = conditions.clone();
         proposed.as_object_mut().unwrap().remove("max_calls");
         if combined != proposed {
             return Err(Error::denied());
@@ -1261,7 +1280,7 @@ async fn issue_key(
     } else {
         Some(policy::rules(&paths))
     };
-    c.execute("INSERT INTO credentials(id,owner_id,kind,name,prefix,hmac_key_id,verification_digest,issuer_credential_id,status,inheritance_mode,maximum_rules,conditions,expires_at,created_at,updated_at) VALUES($1,$2,'api_key',$3,$4,$5,$6,$7,'active',$8,$9,$10,$11,now(),now())", &[&key,&owner,&string(body,"name")?,&prefix,&auth.key_id.as_str(),&digest,&issuer,&mode,&maximum,&body["conditions"],&expiry]).await?;
+    c.execute("INSERT INTO credentials(id,owner_id,kind,name,prefix,hmac_key_id,verification_digest,issuer_credential_id,status,inheritance_mode,maximum_rules,conditions,expires_at,created_at,updated_at) VALUES($1,$2,'api_key',$3,$4,$5,$6,$7,'active',$8,$9,$10,$11,now(),now())", &[&key,&owner,&string(body,"name")?,&prefix,&auth.key_id.as_str(),&digest,&issuer,&mode,&maximum,&conditions,&expiry]).await?;
     if mode != "follow_parent" {
         policy::save_sources(c, &paths, None, Some(key)).await?;
     }
@@ -1343,7 +1362,7 @@ async fn create_grant(
             "Grant has no action for the selected resource kind",
         ));
     }
-    let expires = body.get("expires_at").map(policy::timestamp).transpose()?;
+    let expires = body.get("expires_at").map(persisted_expiry).transpose()?;
     if let Some(expiry) = expires {
         if expiry <= Utc::now() {
             return Err(Error::invalid("Grant is already expired"));

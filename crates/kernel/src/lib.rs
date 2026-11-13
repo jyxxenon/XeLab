@@ -8,6 +8,7 @@ pub mod backups;
 pub mod blobs;
 pub mod broker;
 pub(crate) mod broker_query;
+mod broker_queue;
 mod compact_http;
 mod compact_rpc;
 pub mod config;

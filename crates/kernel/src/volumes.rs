@@ -6,7 +6,7 @@ use crate::{
     auth::{self, Context, Resource},
     db,
     error::{Error, Result},
-    storage::xfs::{Limits, ProjectStatus, ProjectStore},
+    storage::xfs::{Limits, ProjectStatus, ProjectStore, ROOT_LOCK_BUSY},
 };
 use axum::http::HeaderMap;
 use serde_json::{json, Value};
@@ -1163,8 +1163,20 @@ pub async fn mounts(
     generation: i64,
     manifest: &Value,
 ) -> Result<Vec<Mount>> {
+    try_mounts(app, deployment, instance, generation, manifest)
+        .await?
+        .ok_or_else(|| Error::conflict(ROOT_LOCK_BUSY))
+}
+
+pub(crate) async fn try_mounts(
+    app: &App,
+    deployment: Uuid,
+    instance: Uuid,
+    generation: i64,
+    manifest: &Value,
+) -> Result<Option<Vec<Mount>>> {
     if manifest["volumes"].as_array().unwrap().is_empty() {
-        return Ok(Vec::new());
+        return Ok(Some(Vec::new()));
     }
     let mut c = app.db.connect().await?;
     let tx = c.transaction().await?;
@@ -1279,16 +1291,23 @@ pub async fn mounts(
         };
         let path = app.config.root().join("volumes");
         let source = blocking(move || {
-            let mut store = ProjectStore::open(&path)?;
+            let Some(mut store) = ProjectStore::try_open(&path)? else {
+                return Ok(None);
+            };
             store.namespace_identity(bound.filesystem, bound.id, false)?;
             if store.inspect(id, project)?.limits != expected {
                 return Err(Error::unavailable(
                     "Volume quota differs from admitted limits",
                 ));
             }
-            store.data_path(id, project)
+            store.data_path(id, project).map(Some)
         })
         .await?;
+        let Some(source) = source else {
+            // Any attachment inserted earlier in this attempt is provisional.
+            tx.rollback().await?;
+            return Ok(None);
+        };
         mounts.push(Mount {
             volume: id,
             source,
@@ -1301,7 +1320,7 @@ pub async fn mounts(
         return Err(Error::unavailable("Controller leadership is lost"));
     }
     tx.commit().await?;
-    Ok(mounts)
+    Ok(Some(mounts))
 }
 /// Only call after Runtime::stop confirms task, cgroup and container removal.
 pub async fn release_stopped(c: &impl GenericClient, instance: Option<Uuid>) -> Result<()> {
