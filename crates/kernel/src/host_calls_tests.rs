@@ -3,6 +3,9 @@
 use super::*;
 use crate::host_calls::{self, Workload};
 
+#[path = "broker_queue_tests.rs"]
+mod business_queue;
+
 #[tokio::test]
 async fn host_stream_deadline_covers_waiting_and_ready_queued_payloads() {
     use futures_util::StreamExt;
@@ -332,6 +335,7 @@ struct Echo {
     calls: Arc<std::sync::atomic::AtomicUsize>,
     output_bytes: Arc<std::sync::atomic::AtomicUsize>,
     unary_failure: Arc<std::sync::Mutex<Option<tonic::Status>>>,
+    unary_gate: Option<Arc<tokio::sync::Semaphore>>,
     delay: Option<(Arc<tokio::sync::Notify>, Duration)>,
 }
 #[tonic::async_trait]
@@ -357,6 +361,9 @@ impl rpc::capability_service_server::CapabilityService for Echo {
             .delegation_token
             .starts_with("host:"));
         self.calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(gate) = &self.unary_gate {
+            gate.acquire().await.unwrap().forget();
+        }
         if let Some(failure) = self.unary_failure.lock().unwrap().clone() {
             return Err(failure);
         }
@@ -429,7 +436,14 @@ impl rpc::capability_service_server::CapabilityService for Echo {
     }
 }
 async fn echo(f: &Fixture, instance: Uuid) -> (Echo, tokio::task::JoinHandle<()>) {
-    let plugin = Echo::default();
+    echo_with(f, instance, Echo::default()).await
+}
+
+async fn echo_with(
+    f: &Fixture,
+    instance: Uuid,
+    plugin: Echo,
+) -> (Echo, tokio::task::JoinHandle<()>) {
     let server = serve_echo(f, instance, plugin.clone()).await;
     (plugin, server)
 }
