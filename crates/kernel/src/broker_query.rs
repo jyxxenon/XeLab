@@ -147,11 +147,14 @@ async fn resolve_binding(
     call: Uuid,
 ) -> Result<Option<Binding>> {
     let row = tx.query_opt(
-        "SELECT c.owner_id,c.credential_id,c.contract,c.idempotency_key,c.deadline_at,c.skill_id,c.skill_definition_digest,c.provider_instance_id,c.state,c.http_binding,i.generation,i.phase,d.installation_id,d.spec,d.archived_at,n.manifest,n.state AS installation_state,p.status AS publisher_status,r.generation AS original_generation,x.source_paths,x.browser_origin FROM calls c LEFT JOIN instances i ON i.id=c.provider_instance_id LEFT JOIN deployments d ON d.id=i.deployment_id LEFT JOIN installations n ON n.id=d.installation_id LEFT JOIN publishers p ON p.id=n.publisher_id LEFT JOIN rpc_delegations r ON r.execution_delegation_id=c.delegation_id AND r.call_id=c.id AND r.instance_id=c.provider_instance_id AND r.subject_id=c.owner_id AND r.issuer_credential_id=c.credential_id LEFT JOIN host_rpc_contexts x ON x.call_id=c.id WHERE c.id=$1",
+        "SELECT c.owner_id,c.credential_id,c.contract,c.idempotency_key,c.deadline_at,c.skill_id,c.skill_definition_digest,c.provider_instance_id,c.state,c.http_binding,i.generation,i.phase,d.installation_id,d.spec,d.archived_at,n.manifest,n.state AS installation_state,p.status AS publisher_status,r.generation AS original_generation,x.source_paths,x.browser_origin,
+                EXISTS(SELECT 1 FROM attempts a WHERE a.broker_call_id=c.id AND a.dispatch_started IS FALSE) AS unsent
+         FROM calls c LEFT JOIN instances i ON i.id=c.provider_instance_id LEFT JOIN deployments d ON d.id=i.deployment_id LEFT JOIN installations n ON n.id=d.installation_id LEFT JOIN publishers p ON p.id=n.publisher_id LEFT JOIN rpc_delegations r ON r.execution_delegation_id=c.delegation_id AND r.call_id=c.id AND r.instance_id=c.provider_instance_id AND r.subject_id=c.owner_id AND r.issuer_credential_id=c.credential_id LEFT JOIN host_rpc_contexts x ON x.call_id=c.id WHERE c.id=$1",
         &[&call],
     ).await?.ok_or_else(Error::not_found)?;
     if row.get::<_, String>("state") != "unknown"
         || row.get::<_, Option<Value>>("http_binding").is_some()
+        || row.get::<_, bool>("unsent")
     {
         return Ok(None);
     }

@@ -38,6 +38,7 @@ fn collection(name: &str) -> Result<Collection> {
         "listDeployments" => ("deployments", "Deployment", "plugin.read", "deployment", "SELECT t.id,t.created_at,t.id::text AS resource_id,t.owner_id,NULL::text AS plugin_id,t.id AS deployment_id FROM deployments t WHERE t.archived_at IS NULL"),
         "listInstances" => ("instances", "Instance", "plugin.read", "instance", "SELECT t.id,t.created_at,t.id::text AS resource_id,d.owner_id,NULL::text AS plugin_id,t.deployment_id FROM instances t JOIN deployments d ON d.id=t.deployment_id WHERE d.archived_at IS NULL"),
         "listWorkflows" => ("workflows", "Workflow", "workflow.read", "workflow", "SELECT t.id,t.created_at,t.id::text AS resource_id,t.owner_id,NULL::text AS plugin_id,NULL::uuid AS deployment_id FROM workflows t"),
+        "listSchedules" => ("schedules", "Schedule", "schedule.read", "schedule", "SELECT t.id,t.created_at,t.id::text AS resource_id,t.owner_id,NULL::text AS plugin_id,NULL::uuid AS deployment_id FROM schedules t WHERE t.admission IS NOT NULL AND t.deleted_at IS NULL"),
         "listTasks" => ("tasks", "Task", "task.read", "task", "SELECT t.id,t.created_at,t.id::text AS resource_id,t.owner_id,NULL::text AS plugin_id,NULL::uuid AS deployment_id,t.state FROM tasks t"),
         "listTaskSteps" => ("task_steps", "TaskStep", "task.read", "task", "SELECT s.id,s.created_at,t.id::text AS resource_id,t.owner_id,NULL::text AS plugin_id,NULL::uuid AS deployment_id,s.task_id FROM task_steps s JOIN tasks t ON t.id=s.task_id"),
         _ => return Err(Error::invalid("Unknown plugin catalog operation")),
@@ -439,17 +440,16 @@ async fn list(
             more = true;
             break;
         }
-        let value = if name == "listTasks" {
-            // A task may change state after the ID scan in a READ COMMITTED
-            // transaction. Recheck against the same snapshot as the payload.
-            let Some(value) = read_task(c, id, state.as_deref()).await? else {
-                cursor.last_time = row.get("created_at");
-                cursor.last_id = id.to_string();
-                continue;
-            };
-            value
-        } else {
-            read_object(c, selected.table, id, selected.model).await?
+        // Recheck mutable filters and soft deletion in the payload's snapshot.
+        let value = match name {
+            "listTasks" => read_task(c, id, state.as_deref()).await?,
+            "listSchedules" => crate::schedules::read(c, id).await?,
+            _ => Some(read_object(c, selected.table, id, selected.model).await?),
+        };
+        let Some(value) = value else {
+            cursor.last_time = row.get("created_at");
+            cursor.last_id = id.to_string();
+            continue;
         };
         let size = serde_json::to_vec(&value)?.len();
         if bytes + size > MAX_PAGE_BYTES {

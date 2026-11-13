@@ -79,6 +79,21 @@ pub(crate) async fn reset_rows(
         &[],
     )
     .await?;
+    // A restored Schedule needs fresh owner approval before it can fire.
+    // Existing Task links and pre-admission history remain intact.
+    c.execute(
+        "UPDATE schedules SET next_fire_at=NULL,revision=revision+1,updated_at=clock_timestamp()
+         WHERE admission IS NOT NULL AND deleted_at IS NULL AND next_fire_at IS NOT NULL",
+        &[],
+    )
+    .await?;
+    c.execute(
+        "UPDATE schedule_fires f SET outcome='paused' FROM schedules s
+         WHERE f.schedule_id=s.id AND s.admission IS NOT NULL AND s.deleted_at IS NULL
+           AND f.outcome='pending' AND f.task_id IS NULL",
+        &[],
+    )
+    .await?;
     c.execute(
         "UPDATE rpc_delegations SET status='revoked' WHERE status='active'",
         &[],
@@ -139,9 +154,23 @@ pub(crate) async fn reset_rows(
         &[&unknown],
     )
     .await?;
+    crate::task_engine::reconcile_stopped(c).await?;
+    let paused = Error::new(
+        "PERMISSION_DENIED",
+        "Task execution authority was revoked during platform recovery",
+        axum::http::StatusCode::FORBIDDEN,
+    )
+    .detail();
+    c.execute(
+        "UPDATE tasks SET state='paused_authorization',error=$1,revision=revision+1,
+                updated_at=clock_timestamp() WHERE state IN ('queued','running','waiting_dependency')",
+        &[&paused],
+    )
+    .await?;
     c.execute("UPDATE operations SET state='failed',error=$1,revision=revision+1,updated_at=now() WHERE state IN ('pending','running','cancel_requested')",&[&unknown]).await?;
     c.execute("UPDATE reservations SET status='released'", &[])
         .await?;
+    crate::task_engine::finish_stopped_cancellations(c).await?;
     c.execute("UPDATE node_budget SET admission_enabled=false,reserved_cpu_millis=0,reserved_memory_bytes=0,revision=revision+1,updated_at=now()",&[]).await?;
     c.execute("UPDATE quotas SET concurrent_calls_used=0,api_keys_used=0,revision=revision+1,updated_at=now()",&[]).await?;
     c.execute("DELETE FROM idempotency_records", &[]).await?;
@@ -210,6 +239,25 @@ pub(crate) async fn ensure_m4_authority_reset(c: &(impl GenericClient + Sync)) -
     if unsafe_state {
         return Err(Error::conflict(
             "Historical Host ticket or request binding survived recovery",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) async fn ensure_task_authority_reset(c: &(impl GenericClient + Sync)) -> Result<()> {
+    let active: bool = c
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM attempts WHERE state IN ('leased','running'))
+               OR EXISTS(SELECT 1 FROM tasks WHERE state IN ('queued','running','waiting_dependency','cancel_requested'))
+               OR EXISTS(SELECT 1 FROM tasks t JOIN execution_delegations e ON e.id=t.delegation_id
+                         WHERE e.status='active')",
+            &[],
+        )
+        .await?
+        .get(0);
+    if active {
+        return Err(Error::conflict(
+            "Historical Task execution survived recovery",
         ));
     }
     Ok(())

@@ -1,6 +1,11 @@
 // An iframe-side protocol client. It never receives a core credential or URL
 // proxy and can request only this signed page's fixed echo/window operations.
 const PROTOCOL = 'xelab.ui/1';
+const MANAGEMENT_TIMEOUT_MS = 10_000;
+const ECHO_TIMEOUT_MS = 10_000;
+// The host checks the contribution before invocation, reads the original Call,
+// and rechecks the contribution before delivery. Each read has its own budget.
+const ECHO_RESPONSE_WAIT_MS = ECHO_TIMEOUT_MS + 3 * MANAGEMENT_TIMEOUT_MS;
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
 const DIGEST = /^sha256:[a-f0-9]{64}$/;
 const plain = value => value !== null && typeof value === 'object' && Object.getPrototypeOf(value) === Object.prototype;
@@ -142,12 +147,12 @@ export class BridgeClient {
       pending.reject(Object.assign(new Error(error.message), error));
     }
   }
-  #request(method, params) {
+  #request(method, params, responseWaitMs = MANAGEMENT_TIMEOUT_MS) {
     if (!this.ready) return Promise.reject(failure('CHANNEL_CLOSED', 'Open this page from an approved XeLab WebUI.'));
     if (this.#pending.size >= 4) return Promise.reject(failure('RATE_LIMITED', 'At most four requests may be pending.'));
     const request_id = ++this.#highest;
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { this.#pending.delete(request_id); reject(failure('DEADLINE_EXCEEDED', 'Outcome is unknown. Keep the same intent key when checking it.')); }, 10000);
+      const timer = setTimeout(() => { this.#pending.delete(request_id); reject(failure('DEADLINE_EXCEEDED', 'Outcome is unknown. Keep the same intent key when checking it.')); }, responseWaitMs);
       this.#pending.set(request_id, {method, resolve, reject, timer});
       try { this.#send('request', {request_id, method, params}); }
       catch (error) { clearTimeout(timer); this.#pending.delete(request_id); reject(error); }
@@ -156,7 +161,7 @@ export class BridgeClient {
   callEcho(message, idempotencyKey) {
     if (!this.canCall) return Promise.reject(failure('BINDING_UNAVAILABLE', 'No approved echo Skill binding is available.'));
     if (typeof message !== 'string' || [...message].length > 1024 || !text(idempotencyKey, 128)) return Promise.reject(failure('PROTOCOL_ERROR', 'Message or stable intent key is invalid.'));
-    return this.#request('skill.call', {binding_alias: 'echo', input: {message}, idempotency_key: idempotencyKey, timeout_ms: 10000});
+    return this.#request('skill.call', {binding_alias: 'echo', input: {message}, idempotency_key: idempotencyKey, timeout_ms: ECHO_TIMEOUT_MS}, ECHO_RESPONSE_WAIT_MS);
   }
   openWindow() { return this.#request('window.open', {contribution_id: 'echo_window'}); }
   close(message = 'Channel closed.') {

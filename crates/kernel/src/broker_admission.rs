@@ -1,5 +1,8 @@
 //! Authorization and the active-slot transaction for Capability RPCs.
-use super::{business_slot_available, reserve_call_quota, skill_result};
+use super::{
+    business_slot_available, check_task_manifest, reserve_call_quota, skill_result, CallRequest,
+    CallSource,
+};
 use crate::{
     api::App,
     auth::{authorize, Context, CurrentAuthority, Resource},
@@ -10,26 +13,23 @@ use crate::{
     host_blobs, host_calls,
     policy::Path,
     skills::ResolvedSkill,
+    task_engine,
 };
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
-use std::{net::IpAddr, time::Duration};
+use std::{borrow::Cow, time::Duration};
 use tokio::time::{timeout_at, Instant};
 use tokio_postgres::{GenericClient, Row, Transaction};
 use uuid::Uuid;
 
 pub(super) struct Request<'a> {
     pub app: &'a App,
-    pub token: &'a str,
-    pub peer: IpAddr,
+    pub request: CallRequest<'a>,
     pub request_id: Uuid,
-    pub input: &'a Value,
     pub key: &'a str,
-    pub skill_id: Option<Uuid>,
     pub stream: Option<&'a crate::skill_streams::Output>,
     pub started: DateTime<Utc>,
     pub deadline_bound: Instant,
-    pub browser_origin: Option<&'a str>,
 }
 
 pub(super) enum Admission {
@@ -50,6 +50,7 @@ pub(super) struct Call {
     pub id: Uuid,
     pub delegation: String,
     pub accounts: Vec<Uuid>,
+    pub business_key: String,
 }
 
 struct WaitingCall {
@@ -60,6 +61,14 @@ struct WaitingCall {
     installation: Uuid,
     deployment: Uuid,
     sources: Vec<Path>,
+}
+
+struct ProviderQuery {
+    deployment: Option<Uuid>,
+    installation: Option<Uuid>,
+    pinned: Option<Instance>,
+    lock_instance: bool,
+    require_generation: bool,
 }
 
 struct Candidate<'tx, 'db> {
@@ -74,6 +83,10 @@ struct Candidate<'tx, 'db> {
     deadline: DateTime<Utc>,
     protected: bool,
     authority: Option<CurrentAuthority<'tx, 'db>>,
+    input: Cow<'db, Value>,
+    business_key: String,
+    path: String,
+    fingerprint: String,
 }
 
 enum Decision<'tx, 'db> {
@@ -94,25 +107,32 @@ enum Attempt {
 
 impl Request<'_> {
     pub(super) async fn admit(&self) -> Result<Admission> {
-        validate(
-            if self.skill_id.is_some() {
-                "SkillInvokeRequest"
-            } else {
-                "InvokeRequest"
-            },
-            self.input,
-        )?;
-        let input_bytes = serde_json::to_vec(&self.input["input"])?.len();
-        let fingerprint = digest(&serde_json::to_vec(self.input)?);
-        let path = self.skill_id.map_or_else(
-            || "/api/platform/v1/calls".to_owned(),
-            |id| {
-                format!(
-                    "/api/platform/v1/skills/{id}/calls{}",
-                    if self.stream.is_some() { ":stream" } else { "" }
-                )
-            },
-        );
+        let token_input = if let CallRequest::Token { input, skill, .. } = self.request {
+            validate(
+                if skill.is_some() {
+                    "SkillInvokeRequest"
+                } else {
+                    "InvokeRequest"
+                },
+                input,
+            )?;
+            let path = skill.map_or_else(
+                || "/api/platform/v1/calls".to_owned(),
+                |id| {
+                    format!(
+                        "/api/platform/v1/skills/{id}/calls{}",
+                        if self.stream.is_some() { ":stream" } else { "" }
+                    )
+                },
+            );
+            Some((
+                path,
+                digest(&serde_json::to_vec(input)?),
+                serde_json::to_vec(&input["input"])?.len(),
+            ))
+        } else {
+            None
+        };
         let mut waiting: Option<WaitingCall> = None;
         let mut inspect_queue = self.can_enqueue_without_ledger();
         let mut enqueue = false;
@@ -156,7 +176,7 @@ impl Request<'_> {
                 .map_err(|_| expired())??;
             let decision = timeout_at(
                 until,
-                self.prepare(&tx, &mut waiting, &path, &fingerprint, input_bytes, attempt),
+                self.prepare(&tx, &mut waiting, attempt, token_input.as_ref()),
             )
             .await
             .map_err(|_| expired())??;
@@ -188,7 +208,7 @@ impl Request<'_> {
 
             // Keep the signed wait deadline through staging. A timed-out
             // transaction rolls back without a Call or any quota charge.
-            let call = timeout_at(until, self.record(&tx, *candidate, &path, &fingerprint))
+            let call = timeout_at(until, self.record(&tx, *candidate))
                 .await
                 .map_err(|_| expired())??;
             if waiting.is_some() {
@@ -203,16 +223,25 @@ impl Request<'_> {
     }
 
     fn can_enqueue_without_ledger(&self) -> bool {
-        self.skill_id.is_some() && self.stream.is_none() && !self.token.starts_with("host:")
+        self.stream.is_none()
+            && match self.request {
+                CallRequest::Task(_) => true,
+                CallRequest::Token { token, skill, .. } => {
+                    skill.is_some() && !token.starts_with("host:")
+                }
+            }
     }
 
     /// This lookup only chooses the read-only waiting path. All selections and
     /// permissions are checked in the following authorization transaction.
     async fn queue_busy(&self, c: &(impl GenericClient + Sync)) -> Result<bool> {
+        let CallRequest::Token { input, skill, .. } = self.request else {
+            return Ok(false);
+        };
         let row = c.query_opt(
             "SELECT s.definition,s.installation_id,n.manifest->'concurrency'->'max_queue_requests' AS queue_limit
                FROM skills s JOIN installations n ON n.id=s.installation_id WHERE s.id=$1",
-            &[&self.skill_id],
+            &[&skill],
         ).await?;
         let Some(row) = row else { return Ok(false) };
         if row
@@ -225,19 +254,21 @@ impl Request<'_> {
         }
         let definition: Value = row.get("definition");
         let contract = &definition["target"]["contract"];
-        let fixed = self
-            .input
+        let fixed = input
             .get("provider_deployment_id")
-            .map(|_| id(self.input, "provider_deployment_id"))
+            .map(|_| id(input, "provider_deployment_id"))
             .transpose()?;
         let row = provider(
             c,
             string(contract, "name")?,
             string(contract, "version")?,
-            fixed,
-            Some(row.get("installation_id")),
-            None,
-            false,
+            ProviderQuery {
+                deployment: fixed,
+                installation: Some(row.get("installation_id")),
+                pinned: None,
+                lock_instance: false,
+                require_generation: false,
+            },
         )
         .await?;
         let instance = Instance {
@@ -248,13 +279,7 @@ impl Request<'_> {
             || !business_slot_available(c, instance.id, &row.get("manifest")).await?)
     }
 
-    async fn record(
-        &self,
-        tx: &Transaction<'_>,
-        candidate: Candidate<'_, '_>,
-        path: &str,
-        fingerprint: &str,
-    ) -> Result<Call> {
+    async fn record(&self, tx: &Transaction<'_>, candidate: Candidate<'_, '_>) -> Result<Call> {
         let Candidate {
             ctx,
             skill,
@@ -267,7 +292,12 @@ impl Request<'_> {
             deadline,
             protected,
             authority,
+            input,
+            business_key,
+            path,
+            fingerprint,
         } = candidate;
+        let source = self.request.source();
         let (accounts, charged) = reserve_call_quota(
             tx,
             &ctx,
@@ -277,12 +307,14 @@ impl Request<'_> {
             authority.as_ref(),
         )
         .await?;
-        let call = host_calls::new_call(tx, self.app, self.token).await?;
+        let call = match source.token() {
+            Some(token) => host_calls::new_call(tx, self.app, token).await?,
+            None => Uuid::new_v4(),
+        };
         if deadline <= Utc::now() {
             return Err(call_expired());
         }
-        let bytes = serde_json::to_vec(&self.input["input"])?;
-        let business_key = self.input["idempotency_key"].as_str().unwrap_or(self.key);
+        let bytes = serde_json::to_vec(input.as_ref())?;
         tx.execute("INSERT INTO calls(id,owner_id,credential_id,provider_instance_id,contract,input_digest,idempotency_key,state,deadline_at,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,'running',$8,now())",&[&call,&ctx.subject,&ctx.credential,&instance.id,&contract,&digest(&bytes),&business_key,&deadline]).await?;
         if let Some(skill) = &skill {
             tx.execute(
@@ -299,7 +331,9 @@ impl Request<'_> {
             .await?;
         }
         tx.execute("INSERT INTO reservations(id,account_id,kind,expires_at,status,created_at) VALUES($1,$2,'call',$3,'active',now())", &[&call,&ctx.subject,&deadline]).await?;
-        host_calls::bind_child(tx, self.app, self.token, call, instance.id).await?;
+        if let Some(token) = source.token() {
+            host_calls::bind_child(tx, self.app, token, call, instance.id).await?;
+        }
         let delegation = self
             .app
             .auth
@@ -313,7 +347,7 @@ impl Request<'_> {
             deployment,
             &manifest,
             &definition,
-            &self.input["input"],
+            &input,
             skill
                 .as_ref()
                 .is_none_or(|s| s.definition["input_blobs"] == true),
@@ -321,6 +355,10 @@ impl Request<'_> {
         .await?;
         if protected {
             host_blobs::check_call_sources(tx, &ctx, call).await?;
+        }
+        if let CallSource::Task(lease) = source {
+            task_engine::record_broker_call(tx, lease, call).await?;
+            crate::skill_streams::ensure_active(self.app)?;
         }
         tx.execute("DELETE FROM idempotency_records WHERE subject_id=$1 AND credential_id=$2 AND method='POST' AND path=$4 AND key=$3 AND expires_at<=now()",&[&ctx.subject,&ctx.credential,&self.key,&path]).await?;
         tx.execute("INSERT INTO idempotency_records(subject_id,credential_id,method,path,key,fingerprint,resource_id,expires_at,created_at) VALUES($1,$2,'POST',$6,$3,$4,$5,now()+interval '24 hours',now())",&[&ctx.subject,&ctx.credential,&self.key,&fingerprint,&call.to_string(),&path]).await?;
@@ -340,17 +378,16 @@ impl Request<'_> {
             id: call,
             delegation,
             accounts,
+            business_key,
         })
     }
 
     async fn prepare<'tx, 'db>(
-        &self,
+        &'db self,
         tx: &'tx Transaction<'db>,
         waiting: &mut Option<WaitingCall>,
-        path: &str,
-        fingerprint: &str,
-        input_bytes: usize,
         attempt: Attempt,
+        token_input: Option<&(String, String, usize)>,
     ) -> Result<Decision<'tx, 'db>> {
         let app = self.app;
         if waiting.is_some() {
@@ -374,12 +411,52 @@ impl Request<'_> {
             // serializing behind the durable Call ledger.
             db::auth_lock(tx, false).await?;
         }
-        let mut ctx =
-            host_calls::authenticate(tx, app, self.token, self.peer, self.request_id).await?;
-        ctx.browser_origin = self.browser_origin.map(str::to_owned);
-        let skill = if let Some(id) = self.skill_id {
+        let origin = self.request.source();
+        let (ctx, body, skill_id, task_deadline, path, fingerprint, input_bytes) = match self
+            .request
+        {
+            CallRequest::Token { input, skill, .. } => {
+                let (path, fingerprint, input_bytes) = token_input.expect("validated token call");
+                (
+                    origin.authenticate(tx, app, self.request_id, None).await?,
+                    Cow::Borrowed(input),
+                    skill,
+                    None,
+                    path.clone(),
+                    fingerprint.clone(),
+                    *input_bytes,
+                )
+            }
+            CallRequest::Task(lease) => {
+                let (invocation, ctx) = task_engine::prepare_broker(tx, &app.auth, lease).await?;
+                let body = json!({
+                    "input":invocation.input,
+                    "provider_deployment_id":invocation.deployment_id,
+                    "idempotency_key":invocation.idempotency_key,
+                });
+                validate("SkillInvokeRequest", &body)?;
+                let fingerprint = digest(&serde_json::to_vec(&body)?);
+                let input_bytes = serde_json::to_vec(&body["input"])?.len();
+                (
+                    ctx,
+                    Cow::Owned(body),
+                    Some(invocation.skill_id),
+                    Some(
+                        invocation
+                            .deadline
+                            .min(self.started + chrono::Duration::seconds(300)),
+                    ),
+                    super::task_call_path(lease),
+                    fingerprint,
+                    input_bytes,
+                )
+            }
+        };
+        let task = task_deadline.is_some();
+        let skill = if let Some(id) = skill_id {
             match crate::skills::resolve_for_invoke(tx, &ctx, id).await {
                 Ok(skill) => Some(skill),
+                Err(error) if task => return Err(error),
                 Err(error) => {
                     db::audit(
                         tx,
@@ -398,8 +475,8 @@ impl Request<'_> {
         } else {
             None
         };
-        let input = &self.input["input"];
-        let timeout = self.input.get("timeout_ms").map(unsigned).transpose()?;
+        let input = &body["input"];
+        let timeout = body.get("timeout_ms").map(unsigned).transpose()?;
         let (contract, timeout) = if let Some(skill) = &skill {
             let maximum = unsigned(&skill.definition["maximum_timeout_ms"])?;
             let timeout = timeout.unwrap_or(120000.min(maximum));
@@ -413,13 +490,16 @@ impl Request<'_> {
             }
             (&skill.definition["target"]["contract"], timeout)
         } else {
-            (&self.input["contract"], timeout.unwrap_or(30000))
+            (&body["contract"], timeout.unwrap_or(30000))
         };
         let name = string(contract, "name")?;
         let version = string(contract, "version")?;
         let schema_digest = string(contract, "schema_digest")?;
         let capability = Resource::new("capability", format!("{name}@{version}"), None);
         if let Err(error) = authorize(tx, &ctx, "capability.invoke", &capability).await {
+            if task {
+                return Err(error);
+            }
             db::audit(
                 tx,
                 ctx.subject,
@@ -459,11 +539,12 @@ impl Request<'_> {
         }
         let mut protected = skill.is_some()
             || definition["side_effect"] != "none"
-            || self.token.starts_with("host:");
-        let fixed = self
-            .input
+            || origin
+                .token()
+                .is_some_and(|token| token.starts_with("host:"));
+        let fixed = body
             .get("provider_deployment_id")
-            .map(|_| id(self.input, "provider_deployment_id"))
+            .map(|_| id(&body, "provider_deployment_id"))
             .transpose()?;
         let installation = skill.as_ref().map(|s| s.installation_id);
 
@@ -495,10 +576,13 @@ impl Request<'_> {
                 tx,
                 name,
                 version,
-                Some(waiter.deployment),
-                installation,
-                Some(waiter.ticket.instance),
-                front,
+                ProviderQuery {
+                    deployment: Some(waiter.deployment),
+                    installation,
+                    pinned: Some(waiter.ticket.instance),
+                    lock_instance: front,
+                    require_generation: task,
+                },
             )
             .await?;
             crate::dependencies::check_ready(tx, app, row.get("deployment_id")).await?;
@@ -526,6 +610,9 @@ impl Request<'_> {
             None
         };
         if let Some(r) = prior {
+            if task {
+                return Err(Error::conflict("Task attempt already has a Broker record"));
+            }
             if r.get::<_, String>("fingerprint") != fingerprint {
                 return Err(Error::new(
                     "IDEMPOTENCY_CONFLICT",
@@ -588,7 +675,19 @@ impl Request<'_> {
         let row = if let Some(row) = pinned {
             row
         } else {
-            let row = provider(tx, name, version, fixed, installation, None, can_admit).await?;
+            let row = provider(
+                tx,
+                name,
+                version,
+                ProviderQuery {
+                    deployment: fixed,
+                    installation,
+                    pinned: None,
+                    lock_instance: can_admit,
+                    require_generation: task,
+                },
+            )
+            .await?;
             crate::dependencies::check_ready(tx, app, row.get("deployment_id")).await?;
             row
         };
@@ -598,6 +697,9 @@ impl Request<'_> {
         };
         let deployment = row.get("deployment_id");
         let manifest: Value = row.get("manifest");
+        if task {
+            check_task_manifest(&manifest)?;
+        }
         protected |= manifest["dependencies"]
             .as_array()
             .is_some_and(|d| !d.is_empty());
@@ -638,13 +740,18 @@ impl Request<'_> {
             })
         });
         protected |= has_proxy;
-        let deadline = host_calls::bound_deadline(
-            tx,
-            app,
-            self.token,
-            self.started + chrono::Duration::milliseconds(timeout as i64),
-        )
-        .await?;
+        let deadline = match origin.token() {
+            Some(token) => {
+                host_calls::bound_deadline(
+                    tx,
+                    app,
+                    token,
+                    self.started + chrono::Duration::milliseconds(timeout as i64),
+                )
+                .await?
+            }
+            None => task_deadline.ok_or_else(Error::denied)?,
+        };
         if deadline <= Utc::now() {
             return Err(call_expired());
         }
@@ -688,7 +795,9 @@ impl Request<'_> {
             if waiting.is_none() {
                 let maximum =
                     Duration::from_millis(unsigned(&manifest["concurrency"]["queue_timeout_ms"])?);
-                host_calls::check_queued_child(tx, app, self.token, instance.id).await?;
+                if let Some(token) = origin.token() {
+                    host_calls::check_queued_child(tx, app, token, instance.id).await?;
+                }
                 let proof = CurrentAuthority::new(tx, &ctx).await?;
                 let skill_resource = skill_resource(skill);
                 let sources = proof
@@ -740,8 +849,17 @@ impl Request<'_> {
         if preview {
             return Ok(Decision::Retry);
         }
+        let contract = contract.clone();
+        let business_key = body["idempotency_key"]
+            .as_str()
+            .unwrap_or(self.key)
+            .to_owned();
+        let input = match body {
+            Cow::Borrowed(body) => Cow::Borrowed(&body["input"]),
+            Cow::Owned(mut body) => Cow::Owned(body["input"].take()),
+        };
         Ok(Decision::Ready(Box::new(Candidate {
-            contract: contract.clone(),
+            contract,
             ctx,
             skill,
             instance,
@@ -752,6 +870,10 @@ impl Request<'_> {
             deadline,
             protected,
             authority,
+            input,
+            business_key,
+            path,
+            fingerprint,
         })))
     }
 }
@@ -764,14 +886,11 @@ async fn provider(
     c: &(impl GenericClient + Sync),
     name: &str,
     version: &str,
-    fixed: Option<Uuid>,
-    installation: Option<Uuid>,
-    pinned: Option<Instance>,
-    lock_instance: bool,
+    query: ProviderQuery,
 ) -> Result<Row> {
-    let instance = pinned.map(|instance| instance.id);
-    let generation = pinned.map(|instance| instance.generation);
-    let lock = if lock_instance {
+    let instance = query.pinned.map(|instance| instance.id);
+    let generation = query.pinned.map(|instance| instance.generation);
+    let lock = if query.lock_instance {
         " FOR UPDATE OF i"
     } else {
         ""
@@ -787,6 +906,7 @@ async fn provider(
             AND i.phase='ready' AND d.spec->>'enabled'='true' AND d.archived_at IS NULL
             AND ($3::uuid IS NULL OR d.id=$3) AND ($4::uuid IS NULL OR n.id=$4)
             AND ($5::uuid IS NULL OR (i.id=$5 AND i.generation=$6 AND p.observed_generation=$6))
+            AND (NOT $7::boolean OR p.observed_generation=i.generation)
           ORDER BY i.id LIMIT 1{lock}",
     );
     c.query_opt(
@@ -794,10 +914,11 @@ async fn provider(
         &[
             &name,
             &version,
-            &fixed,
-            &installation,
+            &query.deployment,
+            &query.installation,
             &instance,
             &generation,
+            &query.require_generation,
         ],
     )
     .await?
