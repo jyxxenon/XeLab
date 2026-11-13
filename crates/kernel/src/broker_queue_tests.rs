@@ -1,11 +1,7 @@
 //! Real PostgreSQL admission and mTLS dispatch with a controllable provider.
 use super::*;
 use crate::{broker, broker_queue::Instance, error::Result};
-use tokio::{
-    sync::Semaphore,
-    task::JoinHandle,
-    time::{timeout, Instant},
-};
+use tokio::{sync::Semaphore, task::JoinHandle, time::timeout};
 
 struct Component {
     fixture: Fixture,
@@ -141,21 +137,23 @@ impl Component {
     }
 
     async fn pending(&self, count: usize) {
-        self.until(&format!("{count} waiters"), || {
+        self.until(&format!("{count} waiters"), Duration::from_secs(3), || {
             self.fixture.app.runtime.business_queue.len(self.provider) == count
         })
         .await;
     }
 
     async fn entered(&self, count: usize) {
-        self.until(&format!("{count} dispatches"), || {
-            self.plugin.calls.load(Ordering::SeqCst) == count
-        })
+        self.until(
+            &format!("{count} dispatches"),
+            Duration::from_secs(3),
+            || self.plugin.calls.load(Ordering::SeqCst) == count,
+        )
         .await;
     }
 
-    async fn until(&self, expected: &str, ready: impl Fn() -> bool) {
-        timeout(Duration::from_secs(3), async {
+    async fn until(&self, expected: &str, limit: Duration, ready: impl Fn() -> bool) {
+        timeout(limit, async {
             while !ready() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
@@ -265,28 +263,52 @@ impl Component {
 
 #[tokio::test]
 async fn object_limits_share_fifo_across_skills_and_subjects_without_queue_charges() {
-    let Some(c) = Component::new(object_concurrency()).await else {
+    let mut concurrency = object_concurrency();
+    // Capacity depends on the number of admitted waiters. Keep their window
+    // open while PostgreSQL admits each batch. A separate test verifies the
+    // signed five-second wait and the original Call deadline on a real clock.
+    concurrency["queue_timeout_ms"] = json!(30000);
+    let Some(c) = Component::new(concurrency).await else {
         return;
     };
     let (caller, token) = c.caller().await;
     c.grant(caller, "first-caller-skill").await;
     let active: Vec<_> = (0..4)
-        .map(|n| c.owner_call(&format!("active-{n}"), 15000))
+        .map(|n| c.owner_call(&format!("active-{n}"), 30000))
         .collect();
     c.entered(4).await;
-    // Fill the pool in one burst. Sequential admission batches would spend
-    // the first tickets' signed wait budget while later batches start.
-    let mut waiting: Vec<_> = (0..32)
-        .map(|n| c.owner_call(&format!("pending-{n}"), 15000))
-        .collect();
-    c.pending(32).await;
+    let mut waiting = Vec::with_capacity(32);
+    timeout(Duration::from_secs(15), async {
+        for batch in 0..4 {
+            waiting.extend(
+                (batch * 8..(batch + 1) * 8).map(|n| c.owner_call(&format!("pending-{n}"), 30000)),
+            );
+            let expected = waiting.len();
+            c.until(
+                &format!("{expected} waiters"),
+                Duration::from_secs(6),
+                || {
+                    c.fixture.app.runtime.business_queue.len(c.provider) == expected
+                        || waiting.iter().any(JoinHandle::is_finished)
+                },
+            )
+            .await;
+            if let Some(index) = waiting.iter().position(JoinHandle::is_finished) {
+                let result = waiting.swap_remove(index).await.unwrap();
+                panic!("Pending call ended before the pool filled: {result:?}");
+            }
+        }
+    })
+    .await
+    .expect("capacity fixture took too long to enroll its waiters");
     let full = c
-        .start(&token, c.secondary, "full-queue", 15000)
+        .start(&token, c.secondary, "full-queue", 30000)
         .await
         .unwrap()
         .unwrap_err();
     assert_eq!(full.code, "RESOURCE_EXHAUSTED");
     assert!(full.resource_id.is_none());
+    c.pending(32).await;
     assert_eq!(c.ledger().await, (4, 4, 4));
     assert_eq!(c.plugin.calls.load(Ordering::SeqCst), 4);
 
@@ -317,9 +339,9 @@ async fn object_limits_share_fifo_across_skills_and_subjects_without_queue_charg
 
     // The same saturated instance takes the oldest queued Skill from another
     // subject before a later request for its original Skill.
-    let mut first = c.start(&token, c.secondary, "first-waiter", 15000);
+    let mut first = c.start(&token, c.secondary, "first-waiter", 30000);
     c.pending(1).await;
-    let second = c.owner_call("second-waiter", 15000);
+    let second = c.owner_call("second-waiter", 30000);
     c.pending(2).await;
     c.gate.add_permits(1);
     tokio::select! {
@@ -424,7 +446,7 @@ async fn queued_calls_expire_at_the_smaller_absolute_deadline_without_dispatch()
     };
     let active = c.owner_call("held-deadline", 15000);
     c.entered(1).await;
-    let before = Instant::now();
+    let before = std::time::Instant::now();
     let short = c.owner_call("short-caller", 400);
     c.pending(1).await;
     let error = short.await.unwrap().unwrap_err();
@@ -433,7 +455,7 @@ async fn queued_calls_expire_at_the_smaller_absolute_deadline_without_dispatch()
     assert!(before.elapsed() < Duration::from_secs(3));
     c.pending(0).await;
 
-    let before = Instant::now();
+    let before = std::time::Instant::now();
     let signed = c.owner_call("signed-timeout", 15000);
     c.pending(1).await;
     let mut db = c.fixture.app.db.connect().await.unwrap();
