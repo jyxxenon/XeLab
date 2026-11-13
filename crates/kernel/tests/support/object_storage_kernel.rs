@@ -1,39 +1,68 @@
 //! Real kernel integration for the signed release image.
 use super::*;
+use axum::{body::Bytes, http::request::Builder, response::Response};
 use ed25519_dalek::{pkcs8::EncodePublicKey, SigningKey};
-use std::{collections::BTreeMap, path::Path, sync::atomic::Ordering};
+use futures_util::StreamExt;
+use sha2::{Digest, Sha256};
+use std::{collections::BTreeMap, convert::Infallible, path::Path, sync::atomic::Ordering};
 use xelab_kernel::{controller, host, schema_jobs};
 
-async fn blob(f: &Fixture, id: Option<Uuid>, data: &[u8]) -> (u16, Vec<u8>) {
-    let request = Request::builder()
+const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
+
+async fn send_blob(f: &Fixture, request: Builder, body: Body) -> Response {
+    let mut request = request
         .header("host", http_host::authority(None))
-        .header("authorization", format!("Bearer {}", f.token));
-    let request = if let Some(id) = id {
-        request
-            .method("GET")
-            .uri(format!("/api/platform/v1/blobs/{id}/content"))
-    } else {
-        let digest = contracts::digest(data);
-        request
-            .method("POST")
-            .uri("/api/platform/v1/blobs?content_type=application%2Foctet-stream")
-            .header("content-type", "application/octet-stream")
-            .header("content-length", data.len())
-            .header("x-content-sha256", &digest)
-            .header("idempotency-key", format!("object-source-{digest}"))
-    };
-    let mut request = request.body(Body::from(data.to_vec())).unwrap();
+        .header("authorization", format!("Bearer {}", f.token))
+        .body(body)
+        .unwrap();
     request.extensions_mut().insert(ConnectInfo(
         "127.0.0.1:30000".parse::<SocketAddr>().unwrap(),
     ));
-    let response = f.router.clone().oneshot(request).await.unwrap();
+    f.router.clone().oneshot(request).await.unwrap()
+}
+
+async fn upload_blob(f: &Fixture, size: usize, digest: &str, body: Body) -> (u16, Value) {
+    let request = Request::post("/api/platform/v1/blobs?content_type=application%2Foctet-stream")
+        .header("content-type", "application/octet-stream")
+        .header("content-length", size)
+        .header("x-content-sha256", digest)
+        .header("idempotency-key", format!("object-source-{digest}"));
+    let response = send_blob(f, request, body).await;
     (
         response.status().as_u16(),
-        to_bytes(response.into_body(), 1048576)
-            .await
-            .unwrap()
-            .to_vec(),
+        serde_json::from_slice(&to_bytes(response.into_body(), 1048576).await.unwrap()).unwrap(),
     )
+}
+
+async fn download_blob(f: &Fixture, id: Uuid) -> Response {
+    send_blob(
+        f,
+        Request::get(format!("/api/platform/v1/blobs/{id}/content")),
+        Body::empty(),
+    )
+    .await
+}
+
+async fn assert_blob(f: &Fixture, id: Uuid, size: usize, digest: &str) {
+    let response = download_blob(f, id).await;
+    assert_eq!(response.status(), 200, "download {id}");
+    assert_eq!(response.headers()["content-length"], size.to_string());
+    assert_eq!(response.headers()["x-content-sha256"], digest);
+    let mut body = response.into_body().into_data_stream();
+    let mut sha = Sha256::new();
+    let mut received = 0;
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.unwrap();
+        received += chunk.len();
+        assert!(received <= size, "download {id} exceeded {size} bytes");
+        sha.update(chunk);
+    }
+    assert_eq!(received, size, "download {id}");
+    assert_eq!(
+        format!("sha256:{:x}", sha.finalize()),
+        digest,
+        "download {id}"
+    );
 }
 
 async fn invoke_skill(f: &Fixture, id: Uuid, input: Value, key: &str) -> (u16, Value) {
@@ -58,11 +87,134 @@ async fn invoke_skill_as(
     .await
 }
 
+async fn transfer_skill(f: &Fixture, id: Uuid, input: Value, key: &str) -> Value {
+    let result = f
+        .api(
+            "invokeSkill",
+            Some(id),
+            json!({"input":input,"timeout_ms":300000}),
+            key,
+            None,
+            None,
+        )
+        .await;
+    completed_skill(id, key, result)
+}
+
 async fn skill(f: &Fixture, id: Uuid, input: Value, key: &str) -> Value {
     let result = invoke_skill(f, id, input, key).await;
+    completed_skill(id, key, result)
+}
+
+fn completed_skill(id: Uuid, key: &str, result: (u16, Value)) -> Value {
     assert_eq!(result.0, 200, "{key}: {}", result.1);
     assert_eq!(result.1["skill_id"], id.to_string());
     result.1["call"].clone()
+}
+
+async fn round_trip_blob_size(f: &Fixture, put: Uuid, export: Uuid, key: &str, size: usize) {
+    const CHUNK_BYTES: usize = 256 * 1024;
+    // Distinct chunks expose reordered data without buffering the file.
+    let chunks = (0..size.div_ceil(CHUNK_BYTES)).map(move |index| {
+        Bytes::from(vec![
+            index as u8;
+            (size - index * CHUNK_BYTES).min(CHUNK_BYTES)
+        ])
+    });
+    let mut sha = Sha256::new();
+    for chunk in chunks.clone() {
+        sha.update(chunk);
+    }
+    let digest = format!("sha256:{:x}", sha.finalize());
+    let body = Body::from_stream(futures_util::stream::iter(chunks.map(Ok::<_, Infallible>)));
+    let (status, source) = upload_blob(f, size, &digest, body).await;
+    assert_eq!(status, 201, "{key} upload: {source}");
+    assert_eq!(source["size_bytes"], size);
+    assert_eq!(source["digest"], digest);
+    let added = transfer_skill(
+        f,
+        put,
+        json!({"key":key,"blob_id":source["id"],"size_bytes":size,"digest":digest,
+               "content_type":"application/octet-stream","mode":"create"}),
+        &format!("{key}-put"),
+    )
+    .await;
+    let object = &added["output"]["object"];
+    assert_eq!(object["size_bytes"], size);
+    assert_eq!(object["digest"], digest);
+    let exported = transfer_skill(
+        f,
+        export,
+        json!({"key":key,"expected_revision":1}),
+        &format!("{key}-export"),
+    )
+    .await;
+    let output = &exported["output"];
+    assert_eq!(output["object_id"], object["id"]);
+    assert_eq!(output["size_bytes"], size);
+    assert_eq!(output["digest"], digest);
+    assert_ne!(output["blob_id"], source["id"]);
+    assert_blob(f, contracts::id(output, "blob_id").unwrap(), size, &digest).await;
+    println!("Object storage: verified {size} bytes through Blob upload, signed put/export and Blob download");
+}
+
+async fn expire_blob(f: &Fixture, c: &tokio_postgres::Client, id: Uuid) {
+    assert_eq!(
+        c.execute(
+            "UPDATE blobs SET expires_at=clock_timestamp()-interval '1 second'
+             WHERE id=$1 AND pin_count=0 AND expires_at>clock_timestamp()",
+            &[&id],
+        )
+        .await
+        .unwrap(),
+        1,
+        "only the fixture's live, unpinned Blob should be aged"
+    );
+    assert_eq!(download_blob(f, id).await.status(), 404);
+}
+
+async fn verify_export_expiry(
+    f: &Fixture,
+    c: &tokio_postgres::Client,
+    export: Uuid,
+    object: &Value,
+) {
+    let target = json!({"key":object["key"],"expected_revision":object["revision"]});
+    let original = skill(f, export, target.clone(), "object-export-before-expiry").await;
+    let output = &original["output"];
+    assert_eq!(output["object_id"], object["id"]);
+    assert_eq!(output["revision"], object["revision"]);
+    assert_eq!(output["digest"], object["digest"]);
+    let blob = contracts::id(output, "blob_id").unwrap();
+    expire_blob(f, c, blob).await;
+    let replay = skill(f, export, target.clone(), "object-export-before-expiry").await;
+    assert_eq!(replay, original);
+    assert_eq!(download_blob(f, blob).await.status(), 404);
+    assert_eq!(
+        c.query_one(
+            "SELECT count(*) FROM host_blob_outputs WHERE call_id=$1",
+            &[&contracts::id(&original, "call_id").unwrap()],
+        )
+        .await
+        .unwrap()
+        .get::<_, i64>(0),
+        1,
+    );
+    let fresh = skill(f, export, target, "object-export-after-expiry").await;
+    let fresh_output = &fresh["output"];
+    assert_eq!(fresh_output["object_id"], output["object_id"]);
+    assert_eq!(fresh_output["revision"], output["revision"]);
+    assert_eq!(fresh_output["digest"], output["digest"]);
+    let fresh_blob = contracts::id(fresh_output, "blob_id").unwrap();
+    assert_ne!(fresh_blob, blob);
+    assert_blob(
+        f,
+        fresh_blob,
+        object["size_bytes"].as_u64().unwrap() as usize,
+        output["digest"].as_str().unwrap(),
+    )
+    .await;
+    println!("Object storage: source Blob expiry preserved the object, and only a fresh export key published a new Blob");
 }
 
 async fn rejected_skill(
@@ -276,7 +428,9 @@ async fn disable(f: &Fixture, deployment: Uuid, key: &str) {
 }
 
 pub(super) async fn exercise() {
-    const TEST_QUOTA_BYTES: usize = 700_000;
+    // Keep the boundary object in the volume so the same account can
+    // exercise quota refusal after the concurrent replace requests.
+    const TEST_QUOTA_BYTES: usize = MAX_BLOB_BYTES + 700_000;
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
     assert_eq!(unsafe { libc::geteuid() }, 0);
     assert_eq!(std::env::var("XELAB_XFS_TEST").unwrap(), "1");
@@ -420,13 +574,13 @@ pub(super) async fn exercise() {
     assert_eq!(bare.0, 403, "{}", bare.1);
 
     let bytes: Vec<_> = (0..600_123).map(|i| (i % 251) as u8).collect();
-    let source = blob(&f, None, &bytes).await;
-    assert_eq!(source.0, 201, "{}", String::from_utf8_lossy(&source.1));
-    let source: Value = serde_json::from_slice(&source.1).unwrap();
+    let digest = contracts::digest(&bytes);
+    let (status, source) = upload_blob(&f, bytes.len(), &digest, Body::from(bytes.clone())).await;
+    assert_eq!(status, 201, "{source}");
     let key = "acceptance/multi-chunk";
     let input = json!({
         "key":key,"blob_id":source["id"],"size_bytes":bytes.len(),
-        "digest":contracts::digest(&bytes),"content_type":"application/octet-stream","mode":"create"
+        "digest":digest,"content_type":"application/octet-stream","mode":"create"
     });
     let put = skill(&f, skills["data.object.put"], input.clone(), "object-put").await;
     let object = &put["output"]["object"];
@@ -522,9 +676,7 @@ pub(super) async fn exercise() {
     assert_ne!(output["blob_id"], source["id"]);
     assert_eq!(output["object_id"], object["id"]);
     assert_eq!(output["digest"], source["digest"]);
-    let (status, downloaded) = blob(&f, Some(result_blob), b"").await;
-    assert_eq!(status, 200);
-    assert!(downloaded == bytes, "exported Blob content differed");
+    assert_blob(&f, result_blob, bytes.len(), &digest).await;
     let metadata = f
         .api(
             "getBlob",
@@ -578,9 +730,15 @@ pub(super) async fn exercise() {
         .unwrap()
         .get(0);
     let other_bytes: Vec<_> = bytes.iter().map(|byte| *byte ^ 0x5a).collect();
-    let other_source = blob(&f, None, &other_bytes).await;
-    assert_eq!(other_source.0, 201);
-    let other_source: Value = serde_json::from_slice(&other_source.1).unwrap();
+    let other_digest = contracts::digest(&other_bytes);
+    let (status, other_source) = upload_blob(
+        &f,
+        other_bytes.len(),
+        &other_digest,
+        Body::from(other_bytes),
+    )
+    .await;
+    assert_eq!(status, 201, "{other_source}");
     let mut replace = input.clone();
     replace["mode"] = json!("replace");
     replace["expected_revision"] = json!(1);
@@ -628,6 +786,28 @@ pub(super) async fn exercise() {
     let after_cas = skill(&f, stat_id, json!({"key":key}), "object-stat-after-cas").await;
     assert_eq!(after_cas["output"]["object"], winning_object);
 
+    let export = skills["data.object.export"];
+    let boundary_key = "acceptance/maximum";
+    let empty_key = "acceptance/zero";
+    let too_large = MAX_BLOB_BYTES + 1;
+    let never_read = futures_util::stream::poll_fn::<Result<Bytes, Infallible>, _>(|_| {
+        panic!("over-limit Blob upload must reject before reading its body")
+    });
+    let (status, oversized) =
+        upload_blob(&f, too_large, &digest, Body::from_stream(never_read)).await;
+    assert_eq!(status, 400, "{oversized}");
+    assert_eq!(oversized["error"]["code"], "INVALID_ARGUMENT");
+    let mut oversized = input.clone();
+    oversized["key"] = json!("acceptance/too-large");
+    oversized["size_bytes"] = json!(too_large);
+    let (status, rejected) = invoke_skill(&f, put_id, oversized, "object-oversized-put").await;
+    assert_eq!(status, 400, "{rejected}");
+    assert_eq!(rejected["error"]["code"], "INVALID_ARGUMENT");
+    assert!(rejected["error"]["resource_id"].is_null());
+
+    round_trip_blob_size(&f, put_id, export, empty_key, 0).await;
+    round_trip_blob_size(&f, put_id, export, boundary_key, MAX_BLOB_BYTES).await;
+
     let mut overflow = input.clone();
     overflow["key"] = json!("acceptance/over-quota");
     let quota_response = invoke_skill(&f, put_id, overflow.clone(), "object-over-quota").await;
@@ -644,7 +824,7 @@ pub(super) async fn exercise() {
     let listed = skill(
         &f,
         skills["data.object.list"],
-        json!({}),
+        json!({"prefix":key}),
         "object-list-after-quota-rejection",
     )
     .await;
@@ -656,8 +836,25 @@ pub(super) async fn exercise() {
         "object-usage-after-quota-rejection",
     )
     .await;
-    assert_eq!(usage["output"]["logical_bytes"], bytes.len());
+    assert_eq!(
+        usage["output"]["logical_bytes"],
+        MAX_BLOB_BYTES + bytes.len()
+    );
+    assert_eq!(usage["output"]["object_count"], 3);
     assert_eq!(usage["output"]["reserved_bytes"], 0);
+
+    // Age the source Blobs only after the concurrent replacements finish.
+    expire_blob(&f, &c, contracts::id(&source, "id").unwrap()).await;
+    expire_blob(&f, &c, contracts::id(&other_source, "id").unwrap()).await;
+    let stat = skill(
+        &f,
+        stat_id,
+        json!({"key":key}),
+        "object-stat-after-source-expiry",
+    )
+    .await;
+    assert_eq!(stat["output"]["object"], winning_object);
+    verify_export_expiry(&f, &c, export, &winning_object).await;
 
     let deleted = skill(
         &f,
@@ -667,6 +864,19 @@ pub(super) async fn exercise() {
     )
     .await;
     assert_eq!(deleted["output"]["deleted_revision"], 3);
+    for (key, deletion_key) in [
+        (empty_key, "object-delete-empty"),
+        (boundary_key, "object-delete-maximum"),
+    ] {
+        let deleted = skill(
+            &f,
+            skills["data.object.delete"],
+            json!({"key":key,"expected_revision":1}),
+            deletion_key,
+        )
+        .await;
+        assert_eq!(deleted["output"]["deleted_revision"], 2);
+    }
     let listed = skill(
         &f,
         skills["data.object.list"],
