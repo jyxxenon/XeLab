@@ -25,6 +25,7 @@ const RTINHERIT: u32 = 0x100;
 const QUOTA_FLAGS: u16 = (1 << 4) | (1 << 5);
 const LIMIT_FIELDS: u16 = 0x3f;
 const MAX_BYTES: u64 = 9_007_199_254_740_991;
+pub(crate) const ROOT_LOCK_BUSY: &str = "Storage backend is already in use";
 
 #[repr(C)]
 #[derive(Default)]
@@ -326,19 +327,35 @@ pub struct ProjectStore {
     block_size: u64,
     inode_size: u64,
 }
+
+fn try_lock_root(root: &File) -> io::Result<bool> {
+    // SAFETY: flock holds the lock until the owning file description is closed.
+    if unsafe { libc::flock(root.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if error.kind() == io::ErrorKind::WouldBlock {
+        return Ok(false);
+    }
+    Err(error)
+}
+
 impl ProjectStore {
     pub fn open(path: &Path) -> Result<Self> {
+        Self::try_open(path)?.ok_or_else(|| Error::conflict(ROOT_LOCK_BUSY))
+    }
+
+    pub(crate) fn try_open(path: &Path) -> Result<Option<Self>> {
         let root = trusted_root(path)?;
-        // SAFETY: flock holds an advisory exclusive lock until root is dropped.
-        if unsafe { libc::flock(root.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } < 0 {
-            return Err(Error::conflict("Storage backend is already in use"));
+        if !try_lock_root(&root)? {
+            return Ok(None);
         }
         let status = check_fd(&root)?;
-        Ok(Self {
+        Ok(Some(Self {
             root,
             block_size: status.block_size,
             inode_size: status.inode_size_bytes,
-        })
+        }))
     }
     fn validate_id(id: u32) -> Result<()> {
         if id == 0 || id > i32::MAX as u32 {
@@ -1121,6 +1138,29 @@ mod tests {
         assert!(ProjectStore::validate_id(0).is_err());
         assert!(ProjectStore::validate_id(u32::MAX).is_err());
     }
+    #[test]
+    fn root_lock_distinguishes_contention_from_io_failure() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let held = File::open(dir.path()).unwrap();
+        let other = File::open(dir.path()).unwrap();
+        assert!(try_lock_root(&held).unwrap());
+        assert!(!try_lock_root(&other).unwrap());
+        drop(held);
+        assert!(try_lock_root(&other).unwrap());
+
+        let path_only = File::options()
+            .read(true)
+            .custom_flags(libc::O_PATH)
+            .open(dir.path())
+            .unwrap();
+        assert_eq!(
+            try_lock_root(&path_only).unwrap_err().raw_os_error(),
+            Some(libc::EBADF)
+        );
+    }
+
     #[test]
     fn rejects_unsafe_or_non_xfs_roots_without_mutation() {
         for p in ["relative", "/", "/etc/../etc", "/tmp", "/proc"] {

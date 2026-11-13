@@ -184,6 +184,8 @@ async config => {
         params: {skill_id: config.skill},
         body: {input: {message: config.message}, timeout_ms: config.deadline ? 100 : 10000, idempotency_key: key},
         idempotencyKey: key, signal: controller.signal,
+        // The transport deadline cases exercise the explicit HTTP wait budget.
+        waitBudgetMs: config.deadline ? 100 : undefined,
       })).data;
       status = 200;
       if (config.afterCancel) controller.abort();

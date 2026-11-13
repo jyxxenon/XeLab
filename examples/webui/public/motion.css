@@ -1,0 +1,19 @@
+/* ==========================================================================
+   Shell motion layer
+   Window appearance and toast entry get one short, finite fade each. Only
+   opacity and a 6px transform are animated, so no layout or pointer target
+   moves; nothing loops or runs while idle. The existing reduced-motion rules
+   (`reduced-motion` class and the prefers-reduced-motion media query) remove
+   both, and reduced transparency is unaffected because neither surface adds
+   blur.
+   ========================================================================== */
+@keyframes shell-window-in{
+  from{opacity:0}
+  to{opacity:1}
+}
+@keyframes shell-toast-in{
+  from{opacity:0;transform:translateY(-6px)}
+  to{opacity:1;transform:none}
+}
+.window:not([hidden]){animation:shell-window-in .16s var(--ease-shell)}
+#toast:not(:empty){animation:shell-toast-in .18s var(--ease-shell)}
