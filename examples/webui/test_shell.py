@@ -397,6 +397,52 @@ class ShellBrowser(unittest.TestCase):
         self.assertEqual([widget["contribution"]["contribution_id"] for widget in widgets], ["late_widget"])
         self.page.locator("#widgets iframe[src]").wait_for()
 
+    def test_closed_launcher_cannot_send_widget_after_credential_refresh(self):
+        value = contribution("late_refresh", "widget")
+        self.fixture.contributions["late_refresh"] = value
+        self.page.clock.set_fixed_time("2026-11-01T12:00:00Z")
+        self.fixture.refresh_enabled = True
+        self.fixture.open(expires_ms=45000, refresh_token="component-refresh")
+        self.open_launcher()
+        launcher = self.page.locator("#launcher")
+        launch = launcher.get_by_role("button", name="启动贡献 " + value["spec"]["title"], exact=True)
+        original_button = launch.element_handle()
+        self.fixture.hold_preferences = True
+        original_button.click()
+        for _ in range(250):
+            if self.fixture.pending_preferences:
+                break
+            self.page.wait_for_timeout(20)
+        self.assertEqual(len(self.fixture.pending_preferences), 1)
+        self.assertTrue(original_button.is_disabled())
+
+        # The preflight already holds a response, but the PUT now needs a
+        # credential refresh before ApiClient can start the request.
+        self.page.clock.set_fixed_time("2026-11-01T12:00:16Z")
+        self.fixture.hold_preferences = False
+        self.fixture.hold_refresh = True
+        self.fixture.route(self.fixture.pending_preferences.pop())
+        for _ in range(250):
+            if self.fixture.pending_refresh:
+                break
+            self.page.wait_for_timeout(20)
+        self.assertEqual(len(self.fixture.pending_refresh), 1)
+        self.page.keyboard.press("Escape")
+        launcher.wait_for(state="hidden")
+        self.open_launcher()
+        self.fixture.hold_refresh = False
+        self.fixture.route(self.fixture.pending_refresh.pop())
+        self.page.wait_for_function("button => !button.disabled", arg=original_button)
+        self.assertEqual(len(self.custom_calls), 0)
+        self.assertEqual(self.fixture.saved["spec"]["widgets"], [])
+        self.assertTrue(launcher.is_visible())
+        self.assertTrue(self.page.get_by_role("button", name="退出", exact=True).is_visible())
+        launch.click()
+        launcher.wait_for(state="hidden")
+        self.assertEqual(len(self.custom_calls), 1)
+        widgets = self.fixture.saved["spec"]["widgets"]
+        self.assertEqual([widget["contribution"]["contribution_id"] for widget in widgets], ["late_refresh"])
+
     def test_pinned_digest_change_cannot_silently_open_new_version(self):
         value = self.window_contribution()
         self.fixture.open()
