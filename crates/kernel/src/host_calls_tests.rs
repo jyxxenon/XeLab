@@ -331,7 +331,7 @@ async fn host_signed_proxy_scope_and_current_approval_are_intersections() {
 struct Echo {
     calls: Arc<std::sync::atomic::AtomicUsize>,
     output_bytes: Arc<std::sync::atomic::AtomicUsize>,
-    fail_after_dispatch: Arc<std::sync::atomic::AtomicBool>,
+    unary_failure: Arc<std::sync::Mutex<Option<tonic::Status>>>,
     delay: Option<(Arc<tokio::sync::Notify>, Duration)>,
 }
 #[tonic::async_trait]
@@ -357,10 +357,8 @@ impl rpc::capability_service_server::CapabilityService for Echo {
             .delegation_token
             .starts_with("host:"));
         self.calls.fetch_add(1, Ordering::SeqCst);
-        if self.fail_after_dispatch.load(Ordering::SeqCst) {
-            return Err(tonic::Status::unavailable(
-                "Simulated transport failure after dispatch",
-            ));
+        if let Some(failure) = self.unary_failure.lock().unwrap().clone() {
+            return Err(failure);
         }
         let size = self.output_bytes.load(Ordering::SeqCst);
         let message = if size == 0 {

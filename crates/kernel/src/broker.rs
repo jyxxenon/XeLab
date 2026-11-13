@@ -634,7 +634,11 @@ fn invoke_inner<'a>(
                     Error::conflict("Plugin stream ended without a terminal result")
                 })?
             } else {
-                client.invoke(request).await?.into_inner()
+                client
+                    .invoke(request)
+                    .await
+                    .map_err(unary_capability_error)?
+                    .into_inner()
             };
             if response.call_id != call.to_string()
                 || digest(&response.output_json) != response.output_digest
@@ -757,6 +761,48 @@ fn invoke_inner<'a>(
         tx.commit().await?;
         skill_result(skill.as_ref(), result.map_err(|e| e.with_resource(call))?)
     })
+}
+
+/// Classify only the authenticated unary provider reply. The Call ledger
+/// handles uncertainty and owns the public message, reference and retry policy.
+fn unary_capability_error(status: tonic::Status) -> Error {
+    use prost::Message;
+    use tonic::Code;
+
+    let trailers = status.metadata().get_all_bin("xelab-error-bin");
+    let mut values = trailers.iter();
+    let detail = values
+        .next()
+        .filter(|value| value.as_encoded_bytes().len() <= 8192 && values.next().is_none())
+        .and_then(|value| value.to_bytes().ok())
+        .and_then(|bytes| rpc::ErrorDetail::decode(bytes).ok());
+    match (status.code(), detail.as_ref().map(|d| d.code.as_str())) {
+        (Code::InvalidArgument, Some("INVALID_ARGUMENT")) => {
+            Error::invalid("Plugin rejected the business input")
+        }
+        (Code::PermissionDenied, Some("PERMISSION_DENIED")) => Error::denied(),
+        (Code::NotFound, Some("RESOURCE_NOT_FOUND")) => Error::not_found(),
+        (Code::FailedPrecondition, Some("STATE_CONFLICT")) => {
+            Error::conflict("Plugin rejected the current business state")
+        }
+        (Code::ResourceExhausted, Some("RESOURCE_EXHAUSTED")) => Error::exhausted(),
+        (Code::DeadlineExceeded, Some("DEADLINE_EXCEEDED")) => Error::new(
+            "DEADLINE_EXCEEDED",
+            "Plugin deadline elapsed; inspect the Call",
+            axum::http::StatusCode::GATEWAY_TIMEOUT,
+        ),
+        (Code::Unknown, Some("OUTCOME_UNKNOWN")) => Error::new(
+            "OUTCOME_UNKNOWN",
+            "Plugin outcome is unknown; inspect the Call",
+            axum::http::StatusCode::CONFLICT,
+        ),
+        (Code::Internal, Some("INTERNAL")) => Error::new(
+            "INTERNAL",
+            "Plugin reported an internal failure",
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        ),
+        _ => status.into(),
+    }
 }
 
 async fn race_live_call<T>(
@@ -1080,4 +1126,69 @@ pub(crate) async fn invoke_host(
         ctx.browser_origin.as_deref(),
     )
     .await
+}
+
+#[cfg(test)]
+mod unary_error_tests {
+    use super::*;
+    use prost::Message;
+    use tonic::{metadata::MetadataValue, Code, Status};
+
+    fn failure(code: Code, detail: &str, message: &str) -> Status {
+        let mut status = Status::new(code, "provider failure");
+        let bytes = rpc::ErrorDetail {
+            code: detail.into(),
+            message: message.into(),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        status
+            .metadata_mut()
+            .insert_bin("xelab-error-bin", MetadataValue::from_bytes(&bytes));
+        status
+    }
+
+    #[test]
+    fn unary_business_errors_have_stable_http_statuses() {
+        for (grpc, code, http) in [
+            (Code::InvalidArgument, "INVALID_ARGUMENT", 400),
+            (Code::PermissionDenied, "PERMISSION_DENIED", 403),
+            (Code::NotFound, "RESOURCE_NOT_FOUND", 404),
+            (Code::FailedPrecondition, "STATE_CONFLICT", 409),
+            (Code::ResourceExhausted, "RESOURCE_EXHAUSTED", 503),
+            (Code::DeadlineExceeded, "DEADLINE_EXCEEDED", 504),
+            (Code::Unknown, "OUTCOME_UNKNOWN", 409),
+            (Code::Internal, "INTERNAL", 500),
+        ] {
+            let error = unary_capability_error(failure(grpc, code, ""));
+            assert_eq!((error.code, error.status.as_u16()), (code, http));
+        }
+    }
+
+    #[test]
+    fn invalid_or_unsupported_trailers_preserve_transport_failure() {
+        let mut malformed = Status::not_found("provider failure");
+        malformed
+            .metadata_mut()
+            .insert_bin("xelab-error-bin", MetadataValue::from_bytes(&[0xff]));
+        let mut duplicate = failure(Code::NotFound, "RESOURCE_NOT_FOUND", "");
+        let extra = duplicate
+            .metadata()
+            .get_bin("xelab-error-bin")
+            .unwrap()
+            .clone();
+        duplicate
+            .metadata_mut()
+            .append_bin("xelab-error-bin", extra);
+        for status in [
+            Status::not_found("provider failure"),
+            failure(Code::Unavailable, "RESOURCE_NOT_FOUND", ""),
+            failure(Code::Cancelled, "CANCELED", ""),
+            failure(Code::NotFound, "RESOURCE_NOT_FOUND", &"a".repeat(7000)),
+            malformed,
+            duplicate,
+        ] {
+            assert_eq!(unary_capability_error(status).code, "NOT_READY");
+        }
+    }
 }
