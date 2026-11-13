@@ -30,6 +30,7 @@ pub fn context(subject: Option<Uuid>) -> rpc::RpcContext {
 }
 
 pub async fn run(app: Arc<App>) {
+    let mut workers = tokio::task::JoinSet::new();
     let mut state = ControllerState::default();
     let mut rotate = tokio::time::Instant::now();
     loop {
@@ -62,9 +63,26 @@ pub async fn run(app: Arc<App>) {
                 );
             }
         }
+        while let Some(result) = workers.try_join_next() {
+            if let Err(error) = result {
+                tracing::error!(
+                    reason_code = "TASK_WORKER_EXIT",
+                    panicked = error.is_panic(),
+                    "Task worker stopped unexpectedly"
+                );
+            }
+        }
+        if app.ready.load(Ordering::SeqCst)
+            && workers.is_empty()
+            && !app.shutdown.load(Ordering::SeqCst)
+            && !app.leader.is_closed()
+        {
+            workers.spawn(crate::task_worker::run(app.clone()));
+        }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
     app.ready.store(false, Ordering::SeqCst);
+    workers.shutdown().await;
 }
 
 #[derive(Default)]
