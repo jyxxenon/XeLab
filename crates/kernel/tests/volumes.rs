@@ -601,6 +601,27 @@ async fn actual_volume_operations_recover_enforce_capacity_and_fence_writers() {
         deployments.push((d, instance.get::<_, Uuid>(0), instance.get::<_, i64>(1)));
     }
     let (d, i, g) = deployments[0];
+    let held_root = ProjectStore::open(&f.app.config.root().join("volumes")).unwrap();
+    let busy = volumes::mounts(&f.app, d, i, g, &manifest)
+        .await
+        .unwrap_err();
+    assert_eq!(busy.code, "STATE_CONFLICT");
+    assert_eq!(busy.message, "Storage backend is already in use");
+    let unattached: bool = c
+        .query_one(
+            "SELECT writer_instance_id IS NULL
+                 AND NOT EXISTS(SELECT 1 FROM volume_attachments WHERE volume_id=$1)
+               FROM volumes WHERE id=$1",
+            &[&id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(
+        unattached,
+        "a mount must not claim a writer while the root is locked"
+    );
+    drop(held_root);
     let mounts = volumes::mounts(&f.app, d, i, g, &manifest).await.unwrap();
     assert_eq!(mounts.len(), 1);
     assert_eq!(mounts[0].source, data);
