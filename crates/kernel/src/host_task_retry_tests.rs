@@ -231,7 +231,9 @@ async fn postgres_task_retry_rejects_sent_and_legacy_ambiguous_attempts() {
         return;
     };
     let (plugin, server) = echo(&f.host, f.instance).await;
-    plugin.fail_after_dispatch.store(true, Ordering::SeqCst);
+    *plugin.unary_failure.lock().unwrap() = Some(tonic::Status::unavailable(
+        "Simulated transport failure after dispatch",
+    ));
     assert!(crate::task_worker::run_once(&f.host.app).await.unwrap());
     let mut c = f.host.app.db.connect().await.unwrap();
     let rows = attempts(&c, f.task).await;
