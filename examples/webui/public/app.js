@@ -259,7 +259,31 @@ function fit(win) {
   }
   win.bridge?.viewportChanged();
 }
-function focus(win) {
+function focusTitle(win) {
+  win?.element.querySelector('.window-title')?.focus();
+}
+function dockButton(attribute, datasetKey, value) {
+  for (const entry of $('#dock').querySelectorAll(`button[${attribute}]`)) {
+    if (entry.dataset[datasetKey] === value) return entry;
+  }
+  return null;
+}
+function hideMinimizedWindow(win) {
+  win.minimized = true;
+  win.element.hidden = true;
+  win.element.dataset.focused = 'false';
+  win.bridge?.setVisible(false);
+  renderDock();
+}
+function topmostWindow(exclude = null) {
+  let top = null;
+  for (const win of windows.values()) {
+    if (win === exclude || win.minimized) continue;
+    if (!top || Number(win.element.style.zIndex) >= Number(top.element.style.zIndex)) top = win;
+  }
+  return top;
+}
+function focus(win, persist = true) {
   if (matchMedia('(max-width:650px)').matches) for (const other of windows.values()) {other.element.hidden = other !== win;other.bridge?.setVisible(other===win&&document.visibilityState==='visible');}
   win.minimized = false;
   win.bridge?.setVisible(document.visibilityState==='visible');
@@ -269,25 +293,47 @@ function focus(win) {
   win.element.style.zIndex = String(layer);
   $('#active-app').textContent = win.app.title;
   renderDock();
-  saveLayout();
+  if (persist) saveLayout();
+}
+function focusWindow(win) {
+  focus(win);
+  focusTitle(win);
+}
+function handOffFocus(win, {hadFocus, wasFocused, persist = true}) {
+  const next = topmostWindow();
+  if (next) {
+    if (wasFocused || hadFocus) focus(next, persist);
+    else if (persist) saveLayout();
+    if (hadFocus) focusTitle(next);
+    return;
+  }
+  $('#active-app').textContent = '桌面';
+  if (hadFocus) {
+    // Windows opened from the launcher or plugins lack a permanent Dock icon;
+    // when minimized, keep keyboard focus on their temporary restore entry.
+    const target = dockButton('data-app-id', 'appId', win.app.id)
+      || dockButton('data-restore-id', 'restoreId', win.id)
+      || $('#desktop');
+    target?.focus();
+  }
+  if (persist) saveLayout();
+}
+function minimizeWindow(win) {
+  const hadFocus = win.element.contains(document.activeElement);
+  const wasFocused = win.element.dataset.focused === 'true';
+  hideMinimizedWindow(win);
+  handOffFocus(win, {hadFocus, wasFocused});
 }
 function closeWindow(win, persist = true) {
   // Keep keyboard focus inside the desktop instead of dropping it on the document body.
   const hadFocus = win.element.contains(document.activeElement);
+  const wasFocused = win.element.dataset.focused === 'true';
   win.controller?.abort();
   win.dispose?.();
   win.element.remove();
   windows.delete(win.id);
   renderDock();
-  const next = [...windows.values()].filter(value => !value.minimized).at(-1);
-  if (next) focus(next); else $('#active-app').textContent = '桌面';
-  if (hadFocus) {
-    const target = next
-      ? next.element.querySelector('.window-title')
-      : $('#dock').querySelector(`[data-app-id="${win.app.id}"]`);
-    (target || $('#desktop')).focus();
-  }
-  if (persist) saveLayout();
+  handOffFocus(win, {hadFocus, wasFocused, persist});
 }
 function pointerMove(win, handle, resize) {
   handle.addEventListener('pointerdown', event => {
@@ -316,16 +362,8 @@ function openWindow(app, options = {}) {
   const content = node('div', {class:'window-content'});
   const element = node('section', {class:'window', role:'dialog', 'aria-labelledby':`title-${id}`, 'data-view-id':id, 'data-app':app.id}, titlebar, content);
   const win = {id, app, content, element, rect:options.rect || {x:40+windows.size*24,y:24+windows.size*20,width:680,height:520}, minimized:false,maximized:Boolean(options.maximized),ephemeral:Boolean(options.ephemeral),restoreRef:options.restoreRef,controller:null};
-  const minimize = () => {
-    // Hand focus to the Dock button instead of leaving it on a now-hidden control.
-    const hadFocus = element.contains(document.activeElement);
-    win.minimized = true; element.hidden = true; win.bridge?.setVisible(false);
-    renderDock();
-    if (hadFocus) $('#dock').querySelector(`[data-app-id="${app.id}"]`)?.focus();
-    saveLayout();
-  };
   const maximize = () => { win.maximized = !win.maximized; fit(win); saveLayout(); };
-  titlebar.append(node('div', {class:'window-controls'}, button('×',()=>closeWindow(win),{'aria-label':`关闭${app.title}`}),button('−',minimize,{'aria-label':`最小化${app.title}`}),button('□',maximize,{'aria-label':`最大化或恢复${app.title}`})),heading);
+  titlebar.append(node('div', {class:'window-controls'}, button('×',()=>closeWindow(win),{'aria-label':`关闭${app.title}`}),button('−',()=>minimizeWindow(win),{'aria-label':`最小化${app.title}`}),button('□',maximize,{'aria-label':`最大化或恢复${app.title}`})),heading);
   titlebar.addEventListener('dblclick', event => { if (!event.target.closest('button')) maximize(); });
   titlebar.addEventListener('keydown', event => {
     if (!event.altKey || !['ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].includes(event.key)) return;
@@ -353,19 +391,23 @@ function openWindow(app, options = {}) {
   pointerMove(win,titlebar,false);
   pointerMove(win,resize,true);
   fit(win);
-  focus(win);
+  if (options.minimized) {
+    // Restored minimized windows stay out of the foreground so they never
+    // steal focus or leave data-focused on a hidden element.
+    hideMinimizedWindow(win);
+    saveLayout();
+  } else {
+    focusWindow(win);
+  }
   loadApp(win);
-  titlebar.focus();
-  if(options.minimized)minimize();
   return win;
 }
 window.addEventListener('resize',()=> {
   const narrow=matchMedia('(max-width:650px)').matches;
   const available=[...windows.values()].filter(win=>!win.minimized);
-  // A minimized window can still retain data-focused; fall back to the
-  // topmost remaining window without changing focus or its saved layout.
-  const active=available.find(win=>win.element.dataset.focused==='true')
-    || available.reduce((top,win)=>!top||Number(win.element.style.zIndex)>Number(top.element.style.zIndex)?win:top,null);
+  // Fall back to the topmost remaining window if no open window holds focus,
+  // without changing its saved layout.
+  const active=available.find(win=>win.element.dataset.focused==='true') || topmostWindow();
   if(narrow&&(!active||active.element.dataset.focused!=='true')){
     for(const win of windows.values())win.element.dataset.focused=String(win===active);
     $('#active-app').textContent=active?.app.title||'桌面';
@@ -1043,7 +1085,7 @@ function renderDock() {
   const dock=$('#dock');dock.replaceChildren();
   for (const app of apps.filter(value=>!['clients','contributions','tasks'].includes(value.id))) {
     const active=[...windows.values()].filter(win=>win.app.id===app.id);
-    dock.append(button('',()=> { const minimized=active.find(win=>win.minimized||win.element.hidden);if(minimized){focus(minimized);minimized.element.querySelector('.window-title')?.focus();}else openWindow(app); },{'aria-label':`打开${app.title}`,'data-app-id':app.id,'data-active':String(active.length>0)}));
+    dock.append(button('',()=> { const minimized=active.find(win=>win.minimized||win.element.hidden);if(minimized)focusWindow(minimized);else openWindow(app); },{'aria-label':`打开${app.title}`,'data-app-id':app.id,'data-active':String(active.length>0)}));
     dock.lastChild.append(appIcon(app.icon),node('span',{},app.title));
   }
   for(const key of preview.dock.pinned){
@@ -1059,7 +1101,7 @@ function renderDock() {
     dock.append(group);
   }
   for (const win of windows.values()) if(win.minimized) {
-    const restore=button('',()=>{focus(win);win.element.querySelector('.window-title')?.focus();},{'aria-label':`恢复${win.app.title}`,class:'dock-restore'});
+    const restore=button('',()=>focusWindow(win),{'aria-label':`恢复${win.app.title}`,class:'dock-restore','data-restore-id':win.id});
     restore.append(icon('restore'),node('span',{},win.app.title));
     dock.append(restore);
   }
@@ -1074,7 +1116,7 @@ function renderLauncher() {
     const matching=apps.filter(app=>app.title.toLowerCase().includes(search)||app.id.includes(search))[index];
     entry.append(appIcon(matching.icon),node('span',{},matching.title));
   }
-  for(const[ index,win]of[...windows.values()].entries())if(win.app.title.toLowerCase().includes(search))$('#app-grid').append(button(`↥ ${win.app.title}`,()=>{launcher.close();focus(win);win.element.querySelector('.window-title')?.focus();},{'aria-label':`聚焦窗口${index+1} ${win.app.title}`}));
+  for(const[ index,win]of[...windows.values()].entries())if(win.app.title.toLowerCase().includes(search))$('#app-grid').append(button(`↥ ${win.app.title}`,()=>{launcher.close();focusWindow(win);},{'aria-label':`聚焦窗口${index+1} ${win.app.title}`}));
   if(!oauth.loggedIn)return;
   const found=launcherItems.filter(item=>`${item.spec.title} ${item.spec.id} ${item.plugin_id}`.toLowerCase().includes(search));
   for(const item of found){
@@ -1089,7 +1131,7 @@ function renderLauncher() {
         else win=await openContribution(item,current);
         if(current()){
           launcher.close();
-          win?.element.querySelector('.window-title')?.focus();
+          focusTitle(win);
         }
       }catch(error){if(current())toastError(error);}
       finally{launch.disabled=item.availability!=='ready';}

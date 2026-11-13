@@ -8,6 +8,7 @@ visual layer can evolve as long as the contract holds. They run the actual
 desktop shell with the explicit core response fixtures from test_browser, not
 Core/OCI acceptance.
 """
+import json
 import unittest
 
 import test_browser as desktop
@@ -111,6 +112,113 @@ class ShellVisual(unittest.TestCase):
         window.wait_for(state="visible")
         self.assertIn("window-title", self.page.evaluate("document.activeElement.className"))
 
+    def test_minimizing_focused_window_hands_focus_to_remaining_window(self):
+        self.open()
+        self.fixture.app("系统状态")
+        self.fixture.app("设置")
+        resources = self.page.locator('.window[data-app="resources"]')
+        settings = self.page.locator('.window[data-app="settings"]')
+        settings.get_by_role("button", name="最小化设置", exact=True).click()
+        settings.wait_for(state="hidden")
+        self.assertEqual(settings.get_attribute("data-focused"), "false")
+        self.assertEqual(resources.get_attribute("data-focused"), "true")
+        self.assertTrue(resources.is_visible())
+        self.assertEqual(self.page.locator("#active-app").inner_text(), "系统状态")
+        self.assertEqual(
+            self.page.evaluate(
+                "() => document.activeElement?.closest('.window')?.getAttribute('data-app')"),
+            "resources",
+        )
+        self.assertIn("window-title", self.page.evaluate("document.activeElement.className"))
+
+        self.page.set_viewport_size({"width": 390, "height": 760})
+        self.page.locator(".dock-restore", has_text="设置").click()
+        settings.wait_for(state="visible")
+        self.assertTrue(resources.is_hidden())
+        settings.get_by_role("button", name="最小化设置", exact=True).click()
+        resources.wait_for(state="visible")
+        self.assertEqual(resources.get_attribute("data-focused"), "true")
+        self.assertEqual(self.page.locator("#active-app").inner_text(), "系统状态")
+        self.assertEqual(
+            self.page.evaluate(
+                "() => document.activeElement?.closest('.window')?.getAttribute('data-app')"),
+            "resources",
+        )
+        self.assertEqual(self.page.locator(".dock-restore").count(), 1)
+
+    def test_minimizing_last_non_dock_window_focuses_its_dock_restore_button(self):
+        self.open()
+        tasks = self.open_builtin("任务与知识库", launcher=True)
+        tasks_id = tasks.get_attribute("data-view-id")
+        tasks.get_by_role("button", name="最小化任务与知识库", exact=True).click()
+        tasks.wait_for(state="hidden")
+        self.assertEqual(self.page.locator("#active-app").inner_text(), "桌面")
+        self.assertEqual(
+            self.page.evaluate("() => document.activeElement?.getAttribute('data-restore-id')"),
+            tasks_id,
+        )
+        self.page.keyboard.press("Enter")
+        tasks.wait_for(state="visible")
+        self.assertEqual(self.page.locator("#active-app").inner_text(), "任务与知识库")
+        self.assertEqual(
+            self.page.evaluate(
+                "() => document.activeElement?.closest('.window')?.getAttribute('data-app')"),
+            "tasks",
+        )
+        self.assertIn("window-title", self.page.evaluate("document.activeElement.className"))
+
+    def test_restoring_saved_minimized_window_keeps_foreground_window_focused(self):
+        key = f"xelab:windows:{desktop.CORE}:browser-component:{desktop.ACCOUNT}"
+        saved = [
+            {"app": "resources", "rect": {"x": 40, "y": 24, "width": 520, "height": 380},
+             "minimized": False, "maximized": False},
+            {"app": "settings", "rect": {"x": 80, "y": 60, "width": 520, "height": 380},
+             "minimized": True, "maximized": False},
+        ]
+        self.fixture.context.add_init_script(
+            f"if(location.origin === {json.dumps(desktop.SHELL)}) "
+            f"localStorage.setItem({json.dumps(key)}, {json.dumps(json.dumps(saved))});"
+        )
+        self.open()
+        self.page.wait_for_function("() => document.querySelectorAll('.window').length === 2")
+        resources = self.page.locator('.window[data-app="resources"]')
+        settings = self.page.locator('.window[data-app="settings"]')
+        self.assertTrue(resources.is_visible())
+        self.assertTrue(settings.is_hidden())
+        self.assertEqual(resources.get_attribute("data-focused"), "true")
+        self.assertEqual(settings.get_attribute("data-focused"), "false")
+        self.assertEqual(self.page.locator("#active-app").inner_text(), "系统状态")
+        self.assertEqual(
+            self.page.evaluate(
+                "() => document.activeElement?.closest('.window')?.getAttribute('data-app')"),
+            "resources",
+        )
+        self.assertTrue(self.page.get_by_role("button", name="恢复设置", exact=True).is_visible())
+
+    def test_closing_stacked_window_focuses_topmost_remaining_z_order(self):
+        self.open()
+        self.fixture.app("系统状态")
+        self.fixture.app("设置")
+        self.fixture.app("插件中心")
+        resources = self.page.locator('.window[data-app="resources"]')
+        settings = self.page.locator('.window[data-app="settings"]')
+        # Click each exposed top titlebar strip to raise settings above plugins,
+        # then resources above settings, so z-order (settings > plugins) differs
+        # from insertion order.
+        settings.locator(".window-title").click(position={"x": 160, "y": 8})
+        resources.locator(".window-title").click(position={"x": 160, "y": 8})
+        self.assertEqual(self.page.locator("#active-app").inner_text(), "系统状态")
+        resources.get_by_role("button", name="关闭系统状态", exact=True).click()
+        self.page.wait_for_function("() => document.querySelectorAll('.window').length === 2")
+        self.assertEqual(settings.get_attribute("data-focused"), "true")
+        self.assertEqual(self.page.locator("#active-app").inner_text(), "设置")
+        self.assertEqual(
+            self.page.evaluate(
+                "() => document.activeElement?.closest('.window')?.getAttribute('data-app')"),
+            "settings",
+        )
+        self.assertIn("window-title", self.page.evaluate("document.activeElement.className"))
+
     def test_closing_a_window_hands_focus_back_to_the_desktop(self):
         self.open()
         self.fixture.app("系统状态")
@@ -155,6 +263,23 @@ class ShellVisual(unittest.TestCase):
         self.page.locator("#launcher").wait_for(state="visible")
         self.page.get_by_role("button", name="聚焦窗口2 系统状态", exact=True).click()
         window.wait_for(state="visible")
+        self.assertIn("window-title", self.page.evaluate("document.activeElement.className"))
+
+    def test_launcher_window_switcher_focuses_open_window_title(self):
+        self.open()
+        self.fixture.app("系统状态")
+        self.fixture.app("设置")
+        self.page.get_by_role("button", name="打开应用启动器", exact=True).click()
+        self.page.locator("#launcher").wait_for(state="visible")
+        self.page.get_by_role("button", name="聚焦窗口1 系统状态", exact=True).click()
+        self.page.wait_for_function("() => !document.querySelector('#launcher').open")
+        self.page.wait_for_timeout(50)
+        self.assertEqual(self.page.locator("#active-app").inner_text(), "系统状态")
+        self.assertEqual(
+            self.page.evaluate(
+                "() => document.activeElement?.closest('.window')?.getAttribute('data-app')"),
+            "resources",
+        )
         self.assertIn("window-title", self.page.evaluate("document.activeElement.className"))
 
     def test_desktop_wallpaper_is_served_and_applied(self):
