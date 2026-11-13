@@ -63,6 +63,14 @@ struct WaitingCall {
     sources: Vec<Path>,
 }
 
+struct ProviderQuery {
+    deployment: Option<Uuid>,
+    installation: Option<Uuid>,
+    pinned: Option<Instance>,
+    lock_instance: bool,
+    require_generation: bool,
+}
+
 struct Candidate<'tx, 'db> {
     ctx: Context,
     skill: Option<ResolvedSkill>,
@@ -254,11 +262,13 @@ impl Request<'_> {
             c,
             string(contract, "name")?,
             string(contract, "version")?,
-            fixed,
-            Some(row.get("installation_id")),
-            None,
-            false,
-            false,
+            ProviderQuery {
+                deployment: fixed,
+                installation: Some(row.get("installation_id")),
+                pinned: None,
+                lock_instance: false,
+                require_generation: false,
+            },
         )
         .await?;
         let instance = Instance {
@@ -566,11 +576,13 @@ impl Request<'_> {
                 tx,
                 name,
                 version,
-                Some(waiter.deployment),
-                installation,
-                Some(waiter.ticket.instance),
-                front,
-                task,
+                ProviderQuery {
+                    deployment: Some(waiter.deployment),
+                    installation,
+                    pinned: Some(waiter.ticket.instance),
+                    lock_instance: front,
+                    require_generation: task,
+                },
             )
             .await?;
             crate::dependencies::check_ready(tx, app, row.get("deployment_id")).await?;
@@ -667,11 +679,13 @@ impl Request<'_> {
                 tx,
                 name,
                 version,
-                fixed,
-                installation,
-                None,
-                can_admit,
-                task,
+                ProviderQuery {
+                    deployment: fixed,
+                    installation,
+                    pinned: None,
+                    lock_instance: can_admit,
+                    require_generation: task,
+                },
             )
             .await?;
             crate::dependencies::check_ready(tx, app, row.get("deployment_id")).await?;
@@ -872,15 +886,11 @@ async fn provider(
     c: &(impl GenericClient + Sync),
     name: &str,
     version: &str,
-    fixed: Option<Uuid>,
-    installation: Option<Uuid>,
-    pinned: Option<Instance>,
-    lock_instance: bool,
-    require_generation: bool,
+    query: ProviderQuery,
 ) -> Result<Row> {
-    let instance = pinned.map(|instance| instance.id);
-    let generation = pinned.map(|instance| instance.generation);
-    let lock = if lock_instance {
+    let instance = query.pinned.map(|instance| instance.id);
+    let generation = query.pinned.map(|instance| instance.generation);
+    let lock = if query.lock_instance {
         " FOR UPDATE OF i"
     } else {
         ""
@@ -904,11 +914,11 @@ async fn provider(
         &[
             &name,
             &version,
-            &fixed,
-            &installation,
+            &query.deployment,
+            &query.installation,
             &instance,
             &generation,
-            &require_generation,
+            &query.require_generation,
         ],
     )
     .await?
