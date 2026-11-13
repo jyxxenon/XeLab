@@ -127,7 +127,13 @@ fn completed_skill(id: Uuid, key: &str, result: (u16, Value)) -> Value {
     result.1["call"].clone()
 }
 
-async fn round_trip_blob_size(f: &Fixture, put: Uuid, export: Uuid, key: &str, size: usize) {
+async fn round_trip_blob_size(
+    f: &Fixture,
+    put: Uuid,
+    export: Uuid,
+    key: &str,
+    size: usize,
+) -> Value {
     const CHUNK_BYTES: usize = 256 * 1024;
     // Distinct chunks expose reordered data without buffering the file.
     let chunks = (0..size.div_ceil(CHUNK_BYTES)).map(move |index| {
@@ -171,6 +177,7 @@ async fn round_trip_blob_size(f: &Fixture, put: Uuid, export: Uuid, key: &str, s
     assert_ne!(output["blob_id"], source["id"]);
     assert_blob(f, contracts::id(output, "blob_id").unwrap(), size, &digest).await;
     println!("Object storage: verified {size} bytes through Blob upload, signed put/export and Blob download");
+    source
 }
 
 async fn expire_blob(f: &Fixture, c: &tokio_postgres::Client, id: Uuid) {
@@ -699,6 +706,164 @@ async fn disable(f: &Fixture, deployment: Uuid, key: &str) {
     schema_bootstrap::terminal(f, contracts::id(&disabled.1, "id").unwrap(), "succeeded").await;
 }
 
+async fn cancel_import(
+    f: &Fixture,
+    c: &tokio_postgres::Client,
+    volume: &Path,
+    skills: &BTreeMap<&str, Uuid>,
+    provider: Uuid,
+    source: &Value,
+) {
+    let old_process = oci_process::running(&f.app, provider).await;
+    let put = skills["data.object.put"];
+    let key = "object-cancel-import";
+    let object_key = "acceptance/canceled";
+    let request = json!({
+        "input":{
+            "key":object_key,"blob_id":source["id"],"size_bytes":source["size_bytes"],
+            "digest":source["digest"],"content_type":"application/octet-stream","mode":"create"
+        },
+        "timeout_ms":300000
+    });
+    let content = volume
+        .join("users")
+        .join(f.owner.to_string())
+        .join("content");
+    let invoke = f.api("invokeSkill", Some(put), request.clone(), key, None, None);
+    let cancel = async {
+        let call = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let row = c.query_opt(
+                    "SELECT id,state,provider_instance_id FROM calls WHERE owner_id=$1 AND skill_id=$2 AND idempotency_key=$3",
+                    &[&f.owner, &put, &key],
+                ).await.unwrap();
+                if let Some(row) = row {
+                    assert_eq!(row.get::<_, String>("state"), "running");
+                    assert_eq!(row.get::<_, Uuid>("provider_instance_id"), provider);
+                    // A nonempty staging file proves the signed workload has
+                    // started copying real HostService bytes into the volume.
+                    let partial = fs::read_dir(&content).unwrap().any(|entry| {
+                        let entry = entry.unwrap();
+                        if entry.path().extension().is_none_or(|ext| ext != "pending") {
+                            return false;
+                        }
+                        entry
+                            .metadata()
+                            .is_ok_and(|metadata| (1..MAX_BLOB_BYTES as u64).contains(&metadata.len()))
+                    });
+                    if partial {
+                        break row.get::<_, Uuid>("id");
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("signed import did not reach a partial volume write");
+        let canceled = f
+            .api(
+                "cancelCall",
+                Some(call),
+                Value::Null,
+                "object-cancel-active-call",
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(canceled.0, 204, "{}", canceled.1);
+        call
+    };
+    let ((status, error), call) = tokio::time::timeout(Duration::from_secs(45), async {
+        tokio::join!(invoke, cancel)
+    })
+    .await
+    .expect("canceled import did not return promptly");
+    assert_eq!(status, 409, "{error}");
+    assert_eq!(error["error"]["code"], "CANCELED");
+    assert_eq!(contracts::id(&error["error"], "resource_id").unwrap(), call);
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let recovered: bool = c.query_one(
+                "SELECT r.status='released' AND i.phase='ready'
+                     AND EXISTS(SELECT 1 FROM provider_records p WHERE p.instance_id=i.id
+                         AND p.observed_generation=i.generation AND p.availability='ready')
+                     AND NOT EXISTS(SELECT 1 FROM rpc_delegations d WHERE d.call_id=c.id AND d.status='active')
+                     AND NOT EXISTS(SELECT 1 FROM execution_delegations e WHERE e.id=c.delegation_id AND e.status='active')
+                   FROM calls c JOIN instances i ON i.id=c.provider_instance_id
+                   JOIN reservations r ON r.id=c.id AND r.kind='call' WHERE c.id=$1",
+                &[&call],
+            ).await.unwrap().get(0);
+            if recovered && oci_process::exited(&old_process) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("canceled import did not fence the old process and restore its provider");
+    assert_ne!(oci_process::running(&f.app, provider).await, old_process);
+
+    let inspected = f
+        .api(
+            "getCall",
+            Some(call),
+            Value::Null,
+            "inspect-canceled-import",
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(inspected.0, 200, "{}", inspected.1);
+    assert_eq!(inspected.1["state"], "unknown");
+    assert_eq!(inspected.1["error"]["code"], "CANCELED");
+    assert!(inspected.1["result"].is_null());
+    let (status, replay) = f
+        .api("invokeSkill", Some(put), request, key, None, None)
+        .await;
+    assert_eq!(status, 409, "{replay}");
+    assert_eq!(replay["error"]["code"], "OUTCOME_UNKNOWN");
+    assert_eq!(
+        contracts::id(&replay["error"], "resource_id").unwrap(),
+        call
+    );
+    assert_eq!(
+        c.query_one(
+            "SELECT concurrent_calls_used,(SELECT count(*) FROM calls
+                 WHERE owner_id=$1 AND skill_id=$2 AND idempotency_key=$3)
+               FROM quotas WHERE account_id=$1",
+            &[&f.owner, &put, &key],
+        )
+        .await
+        .map(|row| (row.get::<_, i64>(0), row.get::<_, i64>(1)))
+        .unwrap(),
+        (0, 1),
+    );
+    let listed = skill(
+        f,
+        skills["data.object.list"],
+        json!({"prefix":object_key}),
+        "object-list-canceled",
+    )
+    .await;
+    assert_eq!(listed["output"]["items"], json!([]));
+    let usage = skill(
+        f,
+        skills["data.object.usage.get"],
+        json!({}),
+        "object-usage-after-cancel",
+    )
+    .await;
+    assert_eq!(usage["output"]["logical_bytes"], 0);
+    assert_eq!(usage["output"]["object_count"], 0);
+    assert_eq!(usage["output"]["reserved_bytes"], 0);
+    assert!(!fs::read_dir(content).unwrap().any(|entry| entry
+        .unwrap()
+        .path()
+        .extension()
+        .is_some_and(|ext| ext == "pending")));
+    println!("Object storage: canceled a partially copied import, fenced its OCI process, and blocked duplicate effects under the original key");
+}
+
 pub(super) async fn exercise() {
     // Keep the boundary object in the volume so the same account can
     // exercise quota refusal after the concurrent replace requests.
@@ -982,6 +1147,11 @@ pub(super) async fn exercise() {
     );
 
     disable(&f, deployment, "object-disable").await;
+    let (status, unavailable) =
+        invoke_skill(&f, stat_id, json!({"key":key}), "object-stat-disabled").await;
+    assert_eq!(status, 503, "{unavailable}");
+    assert_eq!(unavailable["error"]["code"], "NOT_READY");
+    assert!(unavailable["error"]["resource_id"].is_null());
     let (operation, _) = schema_bootstrap::enable(&f, deployment, "object-reenable").await;
     schema_bootstrap::terminal(&f, operation, "succeeded").await;
     let stat = skill(
@@ -1079,7 +1249,8 @@ pub(super) async fn exercise() {
     assert!(rejected["error"]["resource_id"].is_null());
 
     round_trip_blob_size(&f, put_id, export, empty_key, 0).await;
-    round_trip_blob_size(&f, put_id, export, boundary_key, MAX_BLOB_BYTES).await;
+    let boundary_source =
+        round_trip_blob_size(&f, put_id, export, boundary_key, MAX_BLOB_BYTES).await;
 
     let mut overflow = input.clone();
     overflow["key"] = json!("acceptance/over-quota");
@@ -1179,6 +1350,7 @@ pub(super) async fn exercise() {
         .unwrap();
     assert_eq!(current.get::<_, i32>("restart_count"), restart_count);
     assert_eq!(current.get::<_, String>("phase"), "ready");
+    cancel_import(&f, &c, &data, &skills, provider, &boundary_source).await;
     disable(&f, deployment, "object-final-disable").await;
 
     f.app.shutdown.store(true, Ordering::SeqCst);

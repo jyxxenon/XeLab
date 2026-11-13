@@ -36,6 +36,8 @@ mod aws_format_transitions;
 mod kernel_process_death;
 #[path = "support/object_storage_kernel.rs"]
 mod object_storage_kernel;
+#[path = "support/oci_process.rs"]
+mod oci_process;
 #[path = "support/schema_bootstrap.rs"]
 mod schema_bootstrap;
 #[path = "support/schema_same_format.rs"]
