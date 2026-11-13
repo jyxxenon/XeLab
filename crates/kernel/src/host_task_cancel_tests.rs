@@ -292,13 +292,25 @@ async fn postgres_task_cancel_holds_physical_reservations_until_fenced() {
     let Some(f) = TaskFixture::new("non_repeatable", false).await else {
         return;
     };
-    let gate = Arc::new(EchoGate::default());
-    let (plugin, server) = echo_with_gate(&f.host, f.instance, Some(gate.clone())).await;
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let (plugin, server) = echo_with(
+        &f.host,
+        f.instance,
+        Echo {
+            unary_gate: Some(gate.clone()),
+            ..Echo::default()
+        },
+    )
+    .await;
     let app = f.host.app.clone();
     let dispatch = tokio::spawn(async move { crate::task_worker::run_once(&app).await });
-    tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
-        .await
-        .expect("The real mTLS provider must enter Invoke");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while plugin.calls.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("The real mTLS provider must enter Invoke");
     let held = f.journal().await;
     let call = held.get::<_, Uuid>("broker_call_id");
     assert_eq!(held.get::<_, String>("call_state"), "running");
@@ -337,7 +349,7 @@ async fn postgres_task_cancel_holds_physical_reservations_until_fenced() {
         assert_eq!(row.get::<_, String>("status"), "active");
     }
 
-    gate.release.notify_one();
+    gate.add_permits(1);
     tokio::time::timeout(Duration::from_secs(5), dispatch)
         .await
         .expect("Canceled dispatch must finish")
