@@ -26,6 +26,7 @@ use uuid::Uuid;
 #[derive(Clone)]
 pub struct Runtime {
     pub config: Config,
+    pub(crate) business_queue: crate::broker_queue::Queue,
 }
 pub struct Observation {
     pub running: bool,
@@ -178,7 +179,10 @@ fn strs(args: &[&str]) -> Vec<String> {
 
 impl Runtime {
     pub fn new(config: Config) -> Self {
-        Self { config }
+        Self {
+            config,
+            business_queue: Default::default(),
+        }
     }
     pub async fn ctr(&self, args: &[String]) -> Result<Vec<u8>> {
         let mut all = strs(&[

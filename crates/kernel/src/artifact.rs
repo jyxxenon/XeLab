@@ -219,8 +219,11 @@ fn validate_profile_inner(manifest: &Value, allow_versioned: bool) -> Result<()>
     if manifest
         .get("concurrency")
         .is_some_and(|c| c["max_queue_requests"] != 0)
+        && !crate::broker_queue::supports_manifest(manifest)
     {
-        return Err(Error::invalid("This profile requires max_queue_requests=0"));
+        return Err(Error::invalid(
+            "Business waiting queues require unary capability Skills without routes",
+        ));
     }
     crate::contracts::compile_business(&manifest["config_schema"])?;
     for cap in manifest["capabilities"].as_array().unwrap() {
@@ -564,6 +567,34 @@ mod tests {
             }
             assert!(validate_runtime_profile(&wrong).is_err(), "{variant}");
         }
+    }
+
+    #[test]
+    fn waiting_slots_require_an_exclusively_unary_capability_skill_profile() {
+        let mut manifest: Value = serde_json::from_str(include_str!(
+            "../../../docs/preset-plugins/object-storage/manifest.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            validate_profile(&manifest).unwrap_err().message,
+            "Unsupported plugin profile"
+        );
+        manifest["data_schema_version"] = json!("none");
+        manifest["volumes"] = json!([]);
+        validate_profile(&manifest).unwrap();
+        let mut streaming = manifest.clone();
+        streaming["capabilities"][0]["stream_item_schema"] = json!({"type":"string"});
+        assert_eq!(
+            validate_profile(&streaming).unwrap_err().message,
+            "Business waiting queues require unary capability Skills without routes"
+        );
+        manifest["business_entry"] = json!("direct");
+        assert_eq!(
+            validate_profile(&manifest).unwrap_err().message,
+            "Business waiting queues require unary capability Skills without routes"
+        );
+        manifest["concurrency"]["max_queue_requests"] = json!(0);
+        validate_profile(&manifest).unwrap();
     }
 
     #[test]
