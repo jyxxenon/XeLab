@@ -1,7 +1,7 @@
 //! Authorization and the active-slot transaction for Capability RPCs.
 use super::{
-    business_slot_available, check_task_manifest, reserve_call_quota, skill_result, CallRequest,
-    CallSource,
+    business_slot_available, check_task_manifest, reserve_call_quota, skill_result, unary_failure,
+    CallRequest, CallSource,
 };
 use crate::{
     api::App,
@@ -47,10 +47,12 @@ pub(super) struct Call {
     pub bytes: Vec<u8>,
     pub deadline: DateTime<Utc>,
     pub protected: bool,
+    pub terminal: Option<unary_failure::Binding>,
     pub id: Uuid,
     pub delegation: String,
     pub accounts: Vec<Uuid>,
     pub business_key: String,
+    pub path: String,
 }
 
 struct WaitingCall {
@@ -82,6 +84,7 @@ struct Candidate<'tx, 'db> {
     capability: Resource,
     deadline: DateTime<Utc>,
     protected: bool,
+    terminal: Option<unary_failure::Binding>,
     authority: Option<CurrentAuthority<'tx, 'db>>,
     input: Cow<'db, Value>,
     business_key: String,
@@ -291,6 +294,7 @@ impl Request<'_> {
             capability,
             deadline,
             protected,
+            terminal,
             authority,
             input,
             business_key,
@@ -375,10 +379,12 @@ impl Request<'_> {
             bytes,
             deadline,
             protected,
+            terminal,
             id: call,
             delegation,
             accounts,
             business_key,
+            path,
         })
     }
 
@@ -631,9 +637,13 @@ impl Request<'_> {
                 .with_resource(call));
             }
             let row = tx
-                .query_one("SELECT state,result FROM calls WHERE id=$1", &[&call])
+                .query_one("SELECT state,result,error FROM calls WHERE id=$1", &[&call])
                 .await?;
-            if row.get::<_, String>("state") == "succeeded" {
+            let state: String = row.get("state");
+            let failure = r
+                .get::<_, Option<i32>>("response_status")
+                .filter(|_| state == "failed");
+            if state == "succeeded" || failure.is_some() {
                 let deployment: Uuid = tx.query_one(
                     "SELECT i.deployment_id FROM calls c JOIN instances i ON i.id=c.provider_instance_id WHERE c.id=$1",
                     &[&call],
@@ -649,6 +659,10 @@ impl Request<'_> {
                         .get::<_, bool>(0)
                 {
                     super::check_skill_authority(tx, &ctx, call).await?;
+                }
+                if let Some(status) = failure {
+                    let error = unary_failure::replay(call, row.get("error"), status)?;
+                    return Ok(Decision::Rejected(error));
                 }
                 let value = row
                     .get::<_, Option<Value>>("result")
@@ -703,26 +717,10 @@ impl Request<'_> {
         protected |= manifest["dependencies"]
             .as_array()
             .is_some_and(|d| !d.is_empty());
+        let signed = front && unary_failure::signed_capability(&manifest, contract, &definition);
         if front && definition["side_effect"] != "none" {
             crate::artifact::validate_runtime_profile(&manifest)?;
-            if !manifest["capabilities"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|cap| {
-                    cap["contract"] == *contract
-                        && cap["side_effect"] == definition["side_effect"]
-                        && [
-                            "input_schema",
-                            "output_schema",
-                            "stream_item_schema",
-                            "maximum_input_bytes",
-                            "maximum_output_bytes",
-                        ]
-                        .iter()
-                        .all(|field| cap[*field] == definition[*field])
-                })
-            {
+            if !signed {
                 return Err(Error::invalid(
                     "Side-effecting execution requires its exact signed capability",
                 ));
@@ -849,6 +847,12 @@ impl Request<'_> {
         if preview {
             return Ok(Decision::Retry);
         }
+        let terminal = (self.stream.is_none() && signed && definition["contract"] == *contract)
+            .then(|| unary_failure::Binding {
+                installation: row.get("installation_id"),
+                manifest_digest: row.get("manifest_digest"),
+                has_proxy,
+            });
         let contract = contract.clone();
         let business_key = body["idempotency_key"]
             .as_str()
@@ -869,6 +873,7 @@ impl Request<'_> {
             capability,
             deadline,
             protected,
+            terminal,
             authority,
             input,
             business_key,
@@ -896,7 +901,7 @@ async fn provider(
         ""
     };
     let statement = format!(
-        "SELECT i.id,i.generation,d.id AS deployment_id,n.manifest
+        "SELECT i.id,i.generation,d.id AS deployment_id,n.manifest,n.id AS installation_id,n.manifest_digest
            FROM provider_records p JOIN instances i ON i.id=p.instance_id
            JOIN deployments d ON d.id=i.deployment_id JOIN installations n ON n.id=d.installation_id
           WHERE p.name=$1 AND p.version=$2 AND p.availability='ready'

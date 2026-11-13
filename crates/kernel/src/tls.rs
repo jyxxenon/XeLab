@@ -5,6 +5,7 @@ use crate::{
 use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, KeyPair, SanType};
 use std::{fs, os::unix::fs::PermissionsExt, path::Path};
 use uuid::Uuid;
+pub use xelab_plugin_sdk::transport::require_kernel;
 
 pub fn issue(config: &Config, instance: Option<(Uuid, i64)>, directory: &Path) -> Result<()> {
     fs::create_dir_all(directory)?;
@@ -142,33 +143,4 @@ pub(crate) async fn channel_with_timeout(
         .connect()
         .await
         .map_err(|_| Error::unavailable("Workload TLS connection failed"))
-}
-
-#[allow(clippy::result_large_err)] // Required by the Tonic interceptor interface.
-pub fn require_kernel<T>(
-    request: tonic::Request<T>,
-) -> std::result::Result<tonic::Request<T>, tonic::Status> {
-    let certs = request
-        .peer_certs()
-        .ok_or_else(|| tonic::Status::unauthenticated("mTLS required"))?;
-    let cert = certs
-        .first()
-        .ok_or_else(|| tonic::Status::unauthenticated("mTLS required"))?;
-    let (_, parsed) = x509_parser::parse_x509_certificate(cert.as_ref())
-        .map_err(|_| tonic::Status::unauthenticated("Invalid certificate"))?;
-    let san = parsed
-        .subject_alternative_name()
-        .map_err(|_| tonic::Status::unauthenticated("Invalid SAN"))?;
-    let kernel = san.is_some_and(|s| {
-        s.value.general_names.iter().any(|n| {
-            matches!(
-                n,
-                x509_parser::extensions::GeneralName::URI("spiffe://xelab.local/kernel")
-            )
-        })
-    });
-    if !kernel {
-        return Err(tonic::Status::permission_denied("Kernel identity required"));
-    }
-    Ok(request)
 }
