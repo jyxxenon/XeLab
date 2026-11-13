@@ -15,9 +15,22 @@ use uuid::Uuid;
 mod admission;
 #[path = "broker_http.rs"]
 mod http;
+#[path = "broker_unary_failure.rs"]
+mod unary_failure;
 pub(crate) use http::check_route_approval as check_http_approval;
 pub use http::invoke as invoke_http;
 pub(crate) use http::target_resource as business_target;
+
+enum CallReply {
+    Completed(Value),
+    Rejected(Error),
+}
+
+pub(crate) enum CallSettlement<'a> {
+    Completed(&'a Value),
+    Failed(&'a Error),
+    Unknown(&'a Error),
+}
 
 pub async fn invoke(
     app: &App,
@@ -237,7 +250,7 @@ fn invoke_inner<'a>(
 ) -> BoxFuture<'a, Result<Value>> {
     Box::pin(async move {
         let business_key = input["idempotency_key"].as_str().unwrap_or(key);
-        let admission = admission::Request {
+        let request = admission::Request {
             app,
             token,
             peer,
@@ -249,9 +262,9 @@ fn invoke_inner<'a>(
             started,
             deadline_bound,
             browser_origin,
-        }
-        .admit()
-        .await?;
+        };
+        let path = request.path();
+        let admission = request.admit(&path).await?;
         let admitted = match admission {
             admission::Admission::Replay(result) => return Ok(result),
             admission::Admission::Dispatch(call) => call,
@@ -266,6 +279,7 @@ fn invoke_inner<'a>(
             bytes,
             deadline,
             protected,
+            terminal,
             id: call,
             delegation,
             accounts,
@@ -275,6 +289,12 @@ fn invoke_inner<'a>(
         let name = string(&contract, "name")?;
         let version = string(&contract, "version")?;
         let schema_digest = string(&contract, "schema_digest")?;
+        let wire_contract = rpc::ContractRef {
+            name: name.to_owned(),
+            version: version.to_owned(),
+            schema_digest: schema_digest.to_owned(),
+        };
+        let terminal_version = terminal.as_ref().map_or(0, |_| unary_failure::VERSION);
         let execution_deadline = deadline_bound.min(
             tokio::time::Instant::now()
                 + (deadline - chrono::Utc::now()).to_std().unwrap_or_default(),
@@ -315,14 +335,11 @@ fn invoke_inner<'a>(
             let mut request = tonic::Request::new(rpc::InvokeRequest {
                 context: Some(context),
                 call_id: call.to_string(),
-                contract: Some(rpc::ContractRef {
-                    name: name.to_owned(),
-                    version: version.to_owned(),
-                    schema_digest: schema_digest.to_owned(),
-                }),
+                contract: Some(wire_contract.clone()),
                 input_digest: digest(&bytes),
                 input_json: bytes,
                 binding_id: String::new(),
+                terminal_failure_version: terminal_version,
             });
             if protected {
                 check_live_call(
@@ -405,6 +422,11 @@ fn invoke_inner<'a>(
                     .map_err(unary_capability_error)?
                     .into_inner()
             };
+            if let Some(error) =
+                unary_failure::decode(&response, call, &wire_contract, terminal_version)?
+            {
+                return Ok(CallReply::Rejected(error));
+            }
             if response.call_id != call.to_string()
                 || digest(&response.output_json) != response.output_digest
             {
@@ -430,7 +452,7 @@ fn invoke_inner<'a>(
             if let Some(stream) = stream {
                 stream.validate_completed(&out)?;
             }
-            Ok(out)
+            Ok(CallReply::Completed(out))
         };
         let monitor = async {
             if !protected {
@@ -505,11 +527,34 @@ fn invoke_inner<'a>(
                 "capability.invoke",
                 &Resource::new("capability", format!("{name}@{version}"), None),
             )
-            .await
+            .await?;
+            if matches!(&result, Ok(CallReply::Rejected(_))) {
+                let binding = terminal.as_ref().ok_or_else(Error::denied)?;
+                binding
+                    .verify(&tx, app, provider, deployment, &wire_contract, &definition)
+                    .await?;
+                crate::skill_streams::ensure_active(app)?;
+                if remaining().is_zero() {
+                    return Err(Error::new(
+                        "DEADLINE_EXCEEDED",
+                        "Call deadline elapsed; inspect the call record",
+                        axum::http::StatusCode::GATEWAY_TIMEOUT,
+                    ));
+                }
+            }
+            Ok(())
         };
         if let Err(e) = check.await {
             result = Err(e);
         }
+        let settlement = match &result {
+            Ok(CallReply::Completed(value)) => CallSettlement::Completed(value),
+            Ok(CallReply::Rejected(error)) => {
+                unary_failure::record(&tx, &ctx, call, &path, key, error).await?;
+                CallSettlement::Failed(error)
+            }
+            Err(error) => CallSettlement::Unknown(error),
+        };
         settle_business(
             &tx,
             &ctx,
@@ -520,14 +565,17 @@ fn invoke_inner<'a>(
             } else {
                 "capability.invoke"
             },
-            &result,
+            settlement,
         )
         .await?;
         tx.commit().await?;
         if result.is_ok() {
             app.runtime.business_queue.wake_head(provider);
         }
-        skill_result(skill.as_ref(), result.map_err(|e| e.with_resource(call))?)
+        match result {
+            Ok(CallReply::Completed(value)) => skill_result(skill.as_ref(), value),
+            Ok(CallReply::Rejected(error)) | Err(error) => Err(error.with_resource(call)),
+        }
     })
 }
 
@@ -545,15 +593,13 @@ fn unary_capability_error(status: tonic::Status) -> Error {
         .and_then(|value| value.to_bytes().ok())
         .and_then(|bytes| rpc::ErrorDetail::decode(bytes).ok());
     match (status.code(), detail.as_ref().map(|d| d.code.as_str())) {
-        (Code::InvalidArgument, Some("INVALID_ARGUMENT")) => {
-            Error::invalid("Plugin rejected the business input")
+        (Code::InvalidArgument, Some(code @ "INVALID_ARGUMENT"))
+        | (Code::PermissionDenied, Some(code @ "PERMISSION_DENIED"))
+        | (Code::NotFound, Some(code @ "RESOURCE_NOT_FOUND"))
+        | (Code::FailedPrecondition, Some(code @ "STATE_CONFLICT"))
+        | (Code::ResourceExhausted, Some(code @ "RESOURCE_EXHAUSTED")) => {
+            unary_failure::business_error(code).expect("matched business error")
         }
-        (Code::PermissionDenied, Some("PERMISSION_DENIED")) => Error::denied(),
-        (Code::NotFound, Some("RESOURCE_NOT_FOUND")) => Error::not_found(),
-        (Code::FailedPrecondition, Some("STATE_CONFLICT")) => {
-            Error::conflict("Plugin rejected the current business state")
-        }
-        (Code::ResourceExhausted, Some("RESOURCE_EXHAUSTED")) => Error::exhausted(),
         (Code::DeadlineExceeded, Some("DEADLINE_EXCEEDED")) => Error::new(
             "DEADLINE_EXCEEDED",
             "Plugin deadline elapsed; inspect the Call",
@@ -801,13 +847,16 @@ pub(crate) async fn settle_business(
     call: Uuid,
     accounts: &[Uuid],
     action: &str,
-    result: &Result<Value>,
+    result: CallSettlement<'_>,
 ) -> Result<()> {
-    let (state, value, error) = match &result {
-        Ok(v) => ("succeeded", Some(v.clone()), None),
-        Err(e) => ("unknown", None, Some(e.detail())),
+    let (state, value, error, reason) = match result {
+        CallSettlement::Completed(value) => ("succeeded", Some(value), None, "CALL_COMPLETED"),
+        CallSettlement::Failed(error) => ("failed", None, Some(error.detail()), error.code),
+        CallSettlement::Unknown(error) => {
+            ("unknown", None, Some(error.detail()), "OUTCOME_UNKNOWN")
+        }
     };
-    let changed = tx.execute("UPDATE calls SET state=$2,result=$3,error=$4,completed_at=CASE WHEN $2='succeeded' THEN now() ELSE NULL END WHERE id=$1 AND state='running'",&[&call,&state,&value,&error]).await?;
+    let changed = tx.execute("UPDATE calls SET state=$2,result=$3,error=$4,completed_at=CASE WHEN $2 IN ('succeeded','failed') THEN now() ELSE NULL END WHERE id=$1 AND state='running'",&[&call,&state,&value,&error]).await?;
     if changed != 1 {
         let saved = tx
             .query_one("SELECT error FROM calls WHERE id=$1", &[&call])
@@ -831,16 +880,16 @@ pub(crate) async fn settle_business(
         )
         .with_resource(call));
     }
-    // An error/timeout does not prove that the provider stopped executing.
-    // Recovery fences its process before returning the reserved call slot.
-    if result.is_ok() {
-        tx.execute(
-            "UPDATE reservations SET status='released' WHERE id=$1 AND kind='call'",
+    if state != "unknown" {
+        let released = tx.execute(
+            "UPDATE reservations SET status='released' WHERE id=$1 AND kind='call' AND status<>'released'",
             &[&call],
         )
         .await?;
-        for account in accounts {
-            tx.execute("UPDATE quotas SET concurrent_calls_used=greatest(0,concurrent_calls_used-1) WHERE account_id=$1", &[account]).await?;
+        if released == 1 {
+            for account in accounts {
+                tx.execute("UPDATE quotas SET concurrent_calls_used=greatest(0,concurrent_calls_used-1) WHERE account_id=$1", &[account]).await?;
+            }
         }
     }
     tx.execute(
@@ -856,16 +905,12 @@ pub(crate) async fn settle_business(
         ctx.request,
         action,
         &Resource::new("call", call, Some(ctx.subject)).json(),
-        if result.is_ok() {
+        if state == "succeeded" {
             "succeeded"
         } else {
             "failed"
         },
-        if result.is_ok() {
-            "CALL_COMPLETED"
-        } else {
-            "OUTCOME_UNKNOWN"
-        },
+        reason,
     )
     .await?;
     Ok(())

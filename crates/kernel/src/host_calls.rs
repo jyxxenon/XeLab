@@ -978,6 +978,9 @@ async fn prepare_capability(
     request: &rpc::InvokeRequest,
     streaming: bool,
 ) -> Result<Prepared> {
+    if request.terminal_failure_version != 0 {
+        return Err(Error::invalid("HostService uses the standard error status"));
+    }
     let context = context(request.context.as_ref())?;
     let call = uuid(&request.call_id)?;
     let contract = contract(
@@ -1161,6 +1164,7 @@ fn response(value: Value) -> Result<rpc::InvokeResponse> {
         call_id: contracts::string(value, "call_id")?.into(),
         output_digest: contracts::digest(&output),
         output_json: output,
+        terminal_failure: None,
     })
 }
 pub(crate) async fn invoke(
