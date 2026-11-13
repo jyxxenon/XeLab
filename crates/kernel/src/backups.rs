@@ -148,7 +148,7 @@ pub(crate) async fn freeze(app: &App, operation: Uuid, fence: &db::DeploymentFen
     tx.query_one("SELECT id FROM node_budget FOR UPDATE", &[])
         .await?;
     for instance in stopped {
-        tx.execute("UPDATE instances SET phase='stopped',health='unknown',revision=revision+1,updated_at=now() WHERE id=$1",&[&instance]).await?;
+        tx.execute("UPDATE instances SET phase='stopped',health='unknown',runtime_id=NULL,revision=revision+1,updated_at=now() WHERE id=$1",&[&instance]).await?;
         crate::volumes::release_stopped(&tx, Some(instance)).await?;
         crate::admission::release_stopped(&tx, instance).await?;
     }
@@ -1075,7 +1075,7 @@ async fn fail_stopped(
     }
     for instance in rows {
         let instance: Uuid = instance.get(0);
-        tx.execute("UPDATE instances SET phase='stopped',health='unknown',revision=revision+1,updated_at=now() WHERE id=$1",&[&instance]).await?;
+        tx.execute("UPDATE instances SET phase='stopped',health='unknown',runtime_id=NULL,revision=revision+1,updated_at=now() WHERE id=$1",&[&instance]).await?;
         crate::volumes::release_stopped(&tx, Some(instance)).await?;
         crate::admission::release_stopped(&tx, instance).await?;
     }
