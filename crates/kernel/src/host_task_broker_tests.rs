@@ -395,8 +395,7 @@ async fn postgres_task_broker_requires_unary_evidence_for_a_failed_call() {
     ));
     let error = task_engine::complete(&tx, &f.host.app.auth, &lease, Outcome::Failed(rejection))
         .await
-        .err()
-        .expect("unproven failure must not settle the Task");
+        .expect_err("unproven failure must not settle the Task");
     assert_eq!(error.code, "STATE_CONFLICT");
     tx.rollback().await.unwrap();
     assert_eq!(plugin.calls.load(Ordering::SeqCst), 1);

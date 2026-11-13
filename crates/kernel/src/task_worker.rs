@@ -12,7 +12,6 @@ use std::{
     time::Duration,
 };
 use tokio::time::{self, Instant, MissedTickBehavior};
-use uuid::Uuid;
 
 const IDLE_DELAY: Duration = Duration::from_secs(1);
 const HEARTBEAT: Duration = Duration::from_secs(10);
