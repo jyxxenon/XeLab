@@ -72,6 +72,8 @@ jobs:
           "$XELAB_OAUTH_BROWSER_PYTHON" -m unittest discover -s examples/webui -p 'test_browser.py' -v
           "$XELAB_OAUTH_BROWSER_PYTHON" -m unittest discover -s examples/webui -p 'test_shell.py' -v
           "$XELAB_OAUTH_BROWSER_PYTHON" -m unittest discover -s examples/webui -p 'test_bridge.py' -v
+          "$XELAB_OAUTH_BROWSER_PYTHON" -m unittest discover -s examples/webui -p 'test_shell_visual.py' -v
+          "$XELAB_OAUTH_BROWSER_PYTHON" -m unittest discover -s examples/webui -p 'test_overview.py' -v
           "$XELAB_OAUTH_BROWSER_PYTHON" -m unittest discover -s examples/http -p 'test_http.py' -v
           "$XELAB_OAUTH_BROWSER_PYTHON" -m unittest discover -s examples/ui-reference -p 'test_http.py' -v
           "$XELAB_OAUTH_BROWSER_PYTHON" examples/ui-reference/test_browser.py --webui-public examples/webui/public -v

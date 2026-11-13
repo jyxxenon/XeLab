@@ -135,7 +135,7 @@ async fn record_dispatch(
 ) -> Uuid {
     let tx = c.transaction().await.unwrap();
     db::call_lock(&tx).await.unwrap();
-    let (invocation, ctx) = task_engine::begin_broker(&tx, &app.auth, lease)
+    let (invocation, ctx) = task_engine::prepare_broker(&tx, &app.auth, lease)
         .await
         .unwrap();
     let skill = crate::skills::resolve_for_invoke(&tx, &ctx, provider.skill)

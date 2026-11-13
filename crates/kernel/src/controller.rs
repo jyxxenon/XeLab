@@ -143,11 +143,11 @@ async fn deployment_page(
     active: bool,
 ) -> Result<Vec<tokio_postgres::Row>> {
     // Settled disabled/archived records need no recurring runtime work. Pending
-    // operations and live instances still force cleanup, including after archive.
+    // operations or retained runtime state still require cleanup.
     let predicate = if active {
         "d.archived_at IS NULL AND d.spec->'enabled'='true'::jsonb"
     } else {
-        "(d.archived_at IS NOT NULL OR d.spec->'enabled' IS DISTINCT FROM 'true'::jsonb) AND (d.phase<>'disabled' OR EXISTS(SELECT 1 FROM instances i WHERE i.deployment_id=d.id AND i.phase<>'stopped') OR EXISTS(SELECT 1 FROM operations o WHERE o.resource_id=d.id::text AND o.kind IN ('createDeployment','setDeploymentEnabled') AND o.state IN ('pending','running')))"
+        "(d.archived_at IS NOT NULL OR d.spec->'enabled' IS DISTINCT FROM 'true'::jsonb) AND (d.phase<>'disabled' OR EXISTS(SELECT 1 FROM instances i WHERE i.deployment_id=d.id AND (i.phase<>'stopped' OR i.runtime_id IS NOT NULL)) OR EXISTS(SELECT 1 FROM operations o WHERE o.resource_id=d.id::text AND o.kind IN ('createDeployment','setDeploymentEnabled') AND o.state IN ('pending','running')))"
     };
     if sweep.through.is_none() {
         let end = c.query_opt(&format!("SELECT d.created_at,d.id FROM deployments d WHERE {predicate} ORDER BY d.created_at DESC,d.id DESC LIMIT 1"), &[]).await?;
@@ -586,7 +586,7 @@ async fn install(app: &App, request: &Value, operation: Uuid, payload: &Value) -
 async fn reconcile(app: &App, deployment: Uuid, probes: &mut BTreeMap<Uuid, Probe>) -> Result<()> {
     // Check holds after taking the runtime fence. A previous reconciliation
     // cannot create a writer after a backup worker has proved it stopped.
-    let Some(_runtime_fence) = db::deployment_fence(&app.db, deployment).await? else {
+    let Some(runtime_fence) = db::deployment_fence(&app.db, deployment).await? else {
         return Ok(());
     };
     let c = app.db.connect().await?;
@@ -606,16 +606,31 @@ async fn reconcile(app: &App, deployment: Uuid, probes: &mut BTreeMap<Uuid, Prob
     };
     let spec: Value = d.get("spec");
     let manifest: Value = d.get("manifest");
-    let instances=c.query("SELECT * FROM instances WHERE deployment_id=$1 AND phase<>'stopped' ORDER BY generation",&[&deployment]).await?;
     let archived = d
         .get::<_, Option<chrono::DateTime<chrono::Utc>>>("archived_at")
         .is_some();
     if spec["enabled"] != true || archived {
         probes.remove(&deployment);
+        let revision: i64 = d.get("revision");
         c.execute("UPDATE provider_records SET availability='unavailable' WHERE instance_id IN(SELECT id FROM instances WHERE deployment_id=$1)",&[&deployment]).await?;
+        let instances = c
+            .query(
+                "SELECT i.id,i.generation,i.phase FROM instances i JOIN deployments d ON d.id=i.deployment_id
+                 WHERE d.id=$1 AND d.revision=$2 AND (i.phase<>'stopped' OR i.runtime_id IS NOT NULL)
+                 ORDER BY i.generation",
+                &[&deployment, &revision],
+            )
+            .await?;
         for i in instances {
             let id: Uuid = i.get("id");
-            if let Ok(address) = app.runtime.address(id) {
+            // Historical stopped rows with a retained runtime ID also need
+            // a positive stop proof before their metadata can be cleared.
+            let drain_address = if i.get::<_, &str>("phase") == "stopped" {
+                None
+            } else {
+                app.runtime.address(id).ok()
+            };
+            if let Some(address) = drain_address {
                 if let Ok(channel) =
                     tls::channel(&app.config, id, i.get("generation"), &address).await
                 {
@@ -633,7 +648,7 @@ async fn reconcile(app: &App, deployment: Uuid, probes: &mut BTreeMap<Uuid, Prob
             let tx = c.transaction().await?;
             tx.query_one("SELECT id FROM node_budget FOR UPDATE", &[])
                 .await?;
-            tx.execute("UPDATE instances SET phase='stopped',health='unknown',updated_at=now(),revision=revision+1 WHERE id=$1",&[&id]).await?;
+            tx.execute("UPDATE instances SET phase='stopped',health='unknown',runtime_id=NULL,updated_at=now(),revision=revision+1 WHERE id=$1",&[&id]).await?;
             tx.execute(
                 "DELETE FROM plugin_http_requests WHERE instance_id=$1",
                 &[&id],
@@ -641,13 +656,27 @@ async fn reconcile(app: &App, deployment: Uuid, probes: &mut BTreeMap<Uuid, Prob
             .await?;
             crate::volumes::release_stopped(&tx, Some(id)).await?;
             admission::release_stopped(&tx, id).await?;
+            if app.leader.is_closed() || !runtime_fence.protects(deployment) {
+                return Err(Error::unavailable(
+                    "Controller lost the deployment runtime fence",
+                ));
+            }
             tx.commit().await?;
         }
-        c.execute(
-            "UPDATE deployments SET phase='disabled',conditions='[]',updated_at=now() WHERE id=$1",
-            &[&deployment],
+        if app.leader.is_closed() || !runtime_fence.protects(deployment) {
+            return Err(Error::unavailable(
+                "Controller lost the deployment runtime fence",
+            ));
+        }
+        // A new intent can arrive while the runtime stop is being checked.
+        let disabled = c.execute(
+            "UPDATE deployments SET phase='disabled',conditions='[]',updated_at=now() WHERE id=$1 AND revision=$2",
+            &[&deployment, &revision],
         )
         .await?;
+        if disabled == 0 {
+            return Ok(());
+        }
         if archived {
             c.execute("UPDATE operations SET state='failed',error=$2,revision=revision+1,updated_at=now() WHERE resource_id=$1 AND kind IN ('createDeployment','setDeploymentEnabled') AND state IN ('pending','running')", &[&deployment.to_string(), &Error::conflict("Deployment was archived").detail()]).await?;
         } else {
@@ -655,6 +684,7 @@ async fn reconcile(app: &App, deployment: Uuid, probes: &mut BTreeMap<Uuid, Prob
         }
         return Ok(());
     }
+    let instances=c.query("SELECT * FROM instances WHERE deployment_id=$1 AND phase<>'stopped' ORDER BY generation",&[&deployment]).await?;
     let dependency_state = {
         let mut connection = app.db.connect().await?;
         let tx = connection.transaction().await?;
@@ -702,8 +732,20 @@ async fn reconcile(app: &App, deployment: Uuid, probes: &mut BTreeMap<Uuid, Prob
     probe.bind(id, generation);
     let limits: Value = i.get("limits");
     let running = app.runtime.running(id).await?;
-    let mounts = match crate::volumes::mounts(app, deployment, id, generation, &manifest).await {
-        Ok(mounts) => mounts,
+    let mounts = match crate::volumes::try_mounts(app, deployment, id, generation, &manifest).await
+    {
+        Ok(Some(mounts)) => mounts,
+        Ok(None) => {
+            // A volume worker can hold the root lock during this sweep.
+            // Preserve the writer's fence and let the health observation age.
+            if app.leader.is_closed() {
+                return Err(Error::unavailable("Controller leadership is lost"));
+            }
+            if !running && i.get::<_, String>("phase") == "ready" {
+                mark_stopping(app, id).await?;
+            }
+            return Ok(());
+        }
         Err(error) => {
             mark_stopping(app, id).await?;
             app.runtime.stop(id).await?;

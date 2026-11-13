@@ -344,7 +344,9 @@ async fn postgres_task_resolution_refuses_a_linked_call_with_unknown_outcome() {
         return;
     };
     let (plugin, server) = echo(&f.host, f.instance).await;
-    plugin.fail_after_dispatch.store(true, Ordering::SeqCst);
+    *plugin.unary_failure.lock().unwrap() = Some(tonic::Status::unavailable(
+        "Simulated transport failure after dispatch",
+    ));
     assert!(crate::task_worker::run_once(&f.host.app).await.unwrap());
     let c = f.host.app.db.connect().await.unwrap();
     let before = f.journal().await;

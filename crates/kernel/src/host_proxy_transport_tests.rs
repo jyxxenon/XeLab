@@ -649,6 +649,94 @@ fn structured_error(status: &tonic::Status) -> rpc::ErrorDetail {
 }
 
 #[tokio::test]
+async fn unary_skill_preserves_typed_provider_error_and_unknown_call() {
+    use prost::Message;
+
+    let Some(f) = Fixture::new().await else {
+        return;
+    };
+    let (deployment, instance) = f.workload().await;
+    let c = f.app.db.connect().await.unwrap();
+    c.execute(
+        "UPDATE installations SET manifest=jsonb_set(manifest,'{capabilities,0,side_effect}','\"idempotent\"')
+          WHERE id=(SELECT installation_id FROM deployments WHERE id=$1)",
+        &[&deployment],
+    )
+    .await
+    .unwrap();
+    let (skill, _) = skill(&f, deployment).await;
+    let source = f.source(b"input".to_vec()).await;
+    let (plugin, server) = echo(&f, instance).await;
+    let untrusted_id = Uuid::new_v4();
+    let detail = rpc::ErrorDetail {
+        code: "STATE_CONFLICT".into(),
+        message: "opaque provider detail".into(),
+        retryable: true,
+        retry_after_ms: 17,
+        violations: vec![rpc::FieldViolation {
+            path: "/private".into(),
+            reason: "opaque provider violation".into(),
+        }],
+        resource_id: untrusted_id.to_string(),
+    };
+    let mut failure = tonic::Status::failed_precondition("opaque transport message");
+    failure.metadata_mut().insert_bin(
+        "xelab-error-bin",
+        tonic::metadata::MetadataValue::from_bytes(&detail.encode_to_vec()),
+    );
+    *plugin.unary_failure.lock().unwrap() = Some(failure);
+
+    let input = json!({"input":{"source":source}});
+    let key = "typed-unary-error";
+    let response = f
+        .call(
+            "invokeSkill",
+            &[("skill_id", skill)],
+            input.clone(),
+            None,
+            key,
+            None,
+        )
+        .await;
+    assert_eq!(response.0, 409, "{}", response.1);
+    let error = &response.1["error"];
+    assert_eq!(error["code"], "STATE_CONFLICT");
+    assert_eq!(error["retryable"], false);
+    assert!(error["retry_after_ms"].is_null());
+    assert_eq!(error["violations"], json!([]));
+    assert!(!response.1.to_string().contains("opaque"));
+    let id = contracts::id(error, "resource_id").unwrap();
+    assert_ne!(id, untrusted_id);
+    let row = c
+        .query_one(
+            "SELECT c.state,c.error,r.status FROM calls c JOIN reservations r ON r.id=c.id
+          WHERE c.id=$1 AND c.provider_instance_id=$2",
+            &[&id, &instance],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, String>("state"), "unknown");
+    assert_eq!(row.get::<_, String>("status"), "active");
+    assert_eq!(row.get::<_, Value>("error")["code"], "STATE_CONFLICT");
+
+    let replay = f
+        .call(
+            "invokeSkill",
+            &[("skill_id", skill)],
+            input,
+            None,
+            key,
+            None,
+        )
+        .await;
+    assert_eq!(replay.0, 409);
+    assert_eq!(replay.1["error"]["code"], "OUTCOME_UNKNOWN");
+    assert_eq!(replay.1["error"]["resource_id"], id.to_string());
+    assert_eq!(plugin.calls.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test]
 async fn host_mtls_effectful_failure_exposes_admitted_call_without_redispatch() {
     let Some(f) = Fixture::new().await else {
         return;
@@ -685,7 +773,9 @@ async fn host_mtls_effectful_failure_exposes_admitted_call_without_redispatch() 
     let source = f.source(b"effectful failure input".to_vec()).await;
     let (parent, context) = f.delegation(consumer, consumer_instance, source).await;
     let (plugin, downstream) = echo(&f, provider_instance).await;
-    plugin.fail_after_dispatch.store(true, Ordering::SeqCst);
+    *plugin.unary_failure.lock().unwrap() = Some(tonic::Status::unavailable(
+        "Simulated transport failure after dispatch",
+    ));
     let host = tokio::spawn(crate::host::serve(f.app.clone()));
     let mut client = f
         .client(f.client_identity(&format!(
