@@ -1,0 +1,136 @@
+name: Plugin SDK conformance
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/plugin-sdk.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/plugin-sdk/**"
+      - "crates/kernel/src/artifact.rs"
+      - "crates/kernel/src/controller.rs"
+      - "crates/kernel/src/runtime.rs"
+      - "crates/kernel/src/skill_streams.rs"
+      - "crates/kernel/src/bin/xelab-echo.rs"
+      - "crates/kernel/build.rs"
+      - "crates/kernel/tests/sdk_oci.rs"
+      - "crates/kernel/tests/support/http_host.rs"
+      - "crates/kernel/tests/support/oci.rs"
+      - "docs/contracts/examples/kernel.toml"
+      - "docs/contracts/proto/**"
+      - "examples/echo/**"
+      - "examples/echo-cpp/**"
+      - "sdk/cpp/**"
+      - "tools/acceptance/sdk-conformance.py"
+  push:
+    branches: ["main"]
+    paths:
+      - ".github/workflows/plugin-sdk.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/plugin-sdk/**"
+      - "crates/kernel/src/artifact.rs"
+      - "crates/kernel/src/controller.rs"
+      - "crates/kernel/src/runtime.rs"
+      - "crates/kernel/src/skill_streams.rs"
+      - "crates/kernel/src/bin/xelab-echo.rs"
+      - "crates/kernel/build.rs"
+      - "crates/kernel/tests/sdk_oci.rs"
+      - "crates/kernel/tests/support/http_host.rs"
+      - "crates/kernel/tests/support/oci.rs"
+      - "docs/contracts/examples/kernel.toml"
+      - "docs/contracts/proto/**"
+      - "examples/echo/**"
+      - "examples/echo-cpp/**"
+      - "sdk/cpp/**"
+      - "tools/acceptance/sdk-conformance.py"
+
+permissions:
+  contents: read
+
+jobs:
+  rpc:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Install C++ dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y cmake libgrpc++-dev libprotobuf-dev protobuf-compiler-grpc \
+            libssl-dev nlohmann-json3-dev
+      - name: Build both reference plugins and the shared RPC client
+        run: |
+          cargo build -p xelab-kernel --bin xelab-echo --locked
+          cmake -S sdk/cpp -B "$RUNNER_TEMP/xelab-cpp" -DCMAKE_BUILD_TYPE=Release
+          cmake --build "$RUNNER_TEMP/xelab-cpp" --parallel 2
+      - name: Compare the contracts and run shared loopback mTLS conformance
+        run: |
+          cargo test -p xelab-kernel --lib --locked artifact::tests::generated_reference_profiles_match_manifest_and_raw_contracts -- --exact
+          docker build --target runtime -f examples/echo-cpp/Dockerfile -t xelab-sdk-test:local .
+          python3 tools/acceptance/sdk-conformance.py --rust target/debug/xelab-echo \
+            --cpp "$RUNNER_TEMP/xelab-cpp/xelab-echo-cpp" --client "$RUNNER_TEMP/xelab-cpp/xelab-sdk-conformance" \
+            --container-image xelab-sdk-test:local
+
+  signed_oci:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: xelab
+          POSTGRES_PASSWORD: test-only-password
+          POSTGRES_DB: xelab_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U xelab -d xelab_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      XELAB_TEST_DATABASE_URL: "host=127.0.0.1 port=5432 user=xelab password=test-only-password dbname=xelab_test"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Build and import the C++ Echo image
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y nftables
+          sudo systemctl start containerd
+          sudo ctr namespaces create xelab-sdk-oci
+          publisher=00000000-0000-4000-8000-000000000001
+          tag=docker.io/xelab-ci/sdk-echo-cpp:test
+          transport="$RUNNER_TEMP/xelab-sdk-echo.tar"
+          python3 examples/echo/build_artifact.py --implementation cpp \
+            --publisher-id "$publisher" --output examples/echo-cpp/generated
+          docker build --platform linux/amd64 -t "$tag" -f examples/echo-cpp/Dockerfile .
+          docker save "$tag" -o "$transport"
+          sudo ctr -n xelab-sdk-oci images import "$transport"
+          rm -- "$transport"
+          record=$(sudo ctr -n xelab-sdk-oci images list | awk -v image="$tag" '$1 == image {print $2, $3}')
+          read -r media digest <<< "$record"
+          if [[ ! "$digest" =~ ^sha256:[a-f0-9]{64}$ || ( "$media" != application/vnd.oci.image.manifest.v1+json && "$media" != application/vnd.docker.distribution.manifest.v2+json ) ]]; then
+            echo 'containerd did not report a platform-specific OCI manifest' >&2
+            exit 1
+          fi
+          image="${tag%:*}@$digest"
+          sudo ctr -n xelab-sdk-oci images tag "$tag" "$image"
+          echo "XELAB_TEST_CPP_IMAGE=$image" >> "$GITHUB_ENV"
+      - name: Exercise signed install and the C++ Echo runtime
+        env:
+          XELAB_CPP_OCI_TEST: "1"
+        run: |
+          cargo test -p xelab-kernel --test sdk_oci --no-run --locked
+          mapfile -t tests < <(find target/debug/deps -maxdepth 1 -type f -name 'sdk_oci-*' -executable)
+          [[ ${#tests[@]} == 1 ]]
+          sudo --preserve-env=XELAB_TEST_DATABASE_URL,XELAB_TEST_CPP_IMAGE,XELAB_CPP_OCI_TEST \
+            "${tests[0]}" --ignored --nocapture
