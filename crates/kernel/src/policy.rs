@@ -13,10 +13,29 @@ use std::{
     net::IpAddr,
     sync::{Arc, Mutex},
 };
-use tokio_postgres::GenericClient;
+use tokio_postgres::{GenericClient, Row};
 use uuid::Uuid;
 
 const MAX_PATHS: usize = 4096;
+
+// Fetch grant metadata and its catalog rows together. The Rust expansion still
+// evaluates every issuer, expiry and source path at the point of authorization.
+const GRANT_ROWS: &str = "
+    SELECT g.id,g.subject_id,g.issuer_id,g.issuer_credential_id,g.role_id,g.scope,g.expires_at,
+           role.definition AS role_definition,version.rules AS group_rules,
+           ARRAY(SELECT p.action FROM permission_definitions p
+                 WHERE p.resource_kinds ? (g.scope->>'kind') ORDER BY p.action) AS supported_actions,
+           COALESCE(a.independent_owner AND a.parent_id IS NULL AND g.role_id='Owner'
+                    AND g.issuer_id=a.id AND g.issuer_credential_id IS NULL
+                    AND (g.created_at=a.created_at OR EXISTS(
+                        SELECT 1 FROM recovery_owner_anchors r WHERE r.grant_id=g.id AND r.account_id=a.id
+                    )),false) AS bootstrap
+      FROM grants g JOIN accounts a ON a.id=g.subject_id
+      LEFT JOIN role_definitions role ON role.id=g.role_id
+      LEFT JOIN permission_groups grp ON grp.id=g.group_id AND grp.status='active'
+      LEFT JOIN group_versions version ON version.group_id=grp.id AND version.version=g.group_version
+     WHERE g.status='active' AND (g.expires_at IS NULL OR g.expires_at>now())";
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Path {
     pub rule: Value,
@@ -121,17 +140,21 @@ impl<'a, C: GenericClient + Sync> Policy<'a, C> {
         }
         let chain = crate::auth::account_chain(self.c, account).await?;
         let mut paths = Vec::new();
+        let direct_grants = format!(
+            "SELECT * FROM ({GRANT_ROWS}) AS live WHERE subject_id=$1
+             AND (NOT $2 OR issuer_id<>subject_id OR bootstrap) ORDER BY id"
+        );
         for (level, subject) in chain.iter().enumerate() {
             let mut direct = Vec::new();
             for row in self
                 .c
                 .query(
-                    "SELECT g.id FROM grants g JOIN accounts a ON a.id=g.subject_id WHERE g.subject_id=$1 AND g.status='active' AND (NOT $2 OR g.issuer_id<>g.subject_id OR (a.independent_owner AND a.parent_id IS NULL AND g.role_id='Owner' AND (g.created_at=a.created_at OR EXISTS(SELECT 1 FROM recovery_owner_anchors r WHERE r.grant_id=g.id AND r.account_id=a.id)) AND g.issuer_credential_id IS NULL)) ORDER BY g.id",
+                    &direct_grants,
                     &[subject, &self.proving_self_grants.contains(subject)],
                 )
                 .await?
             {
-                direct.extend(Box::pin(self.grant(row.get(0), depth + 1)).await?);
+                direct.extend(Box::pin(self.expand_grant(&row, depth + 1)).await?);
                 bounded(&direct)?;
             }
             if level == 0 {
@@ -390,6 +413,21 @@ impl<'a, C: GenericClient + Sync> Policy<'a, C> {
     }
 
     async fn grant(&mut self, grant: Uuid, depth: usize) -> Result<Vec<Path>> {
+        let Some(row) = self
+            .c
+            .query_opt(
+                &format!("SELECT * FROM ({GRANT_ROWS}) AS live WHERE id=$1"),
+                &[&grant],
+            )
+            .await?
+        else {
+            return Ok(Vec::new());
+        };
+        self.expand_grant(&row, depth).await
+    }
+
+    async fn expand_grant(&mut self, row: &Row, depth: usize) -> Result<Vec<Path>> {
+        let grant = row.get("id");
         // A grant cannot prove its own issuing authority. Other independent paths
         // remain available while evaluating a delegated grant on the same subject.
         if !self.evaluating_grants.insert(grant) {
@@ -401,59 +439,41 @@ impl<'a, C: GenericClient + Sync> Policy<'a, C> {
         // permutation of the other self-issued bindings. Keep the bootstrap
         // Owner anchor and external/inherited paths, and retain the direct
         // binding's provenance in the outer evaluation.
-        let subject = self
-            .c
-            .query_opt(
-                "SELECT subject_id FROM grants WHERE id=$1 AND issuer_id=subject_id",
-                &[&grant],
-            )
-            .await?
-            .map(|r| r.get::<_, Uuid>(0));
-        let inserted = subject.is_some_and(|id| self.proving_self_grants.insert(id));
-        let result = self.grant_inner(grant, depth).await;
+        let subject: Uuid = row.get("subject_id");
+        let issuer: Uuid = row.get("issuer_id");
+        let inserted = subject == issuer && self.proving_self_grants.insert(subject);
+        let result = self.grant_inner(row, grant, issuer, depth).await;
         if inserted {
-            self.proving_self_grants.remove(&subject.unwrap());
+            self.proving_self_grants.remove(&subject);
         }
         self.evaluating_grants.remove(&grant);
         result
     }
-    async fn grant_inner(&mut self, grant: Uuid, depth: usize) -> Result<Vec<Path>> {
-        let Some(row)=self.c.query_opt("SELECT * FROM grants WHERE id=$1 AND status='active' AND (expires_at IS NULL OR expires_at>now())", &[&grant]).await? else {return Ok(Vec::new());};
+    async fn grant_inner(
+        &mut self,
+        row: &Row,
+        grant: Uuid,
+        issuer: Uuid,
+        depth: usize,
+    ) -> Result<Vec<Path>> {
         let scope: Value = row.get("scope");
         let mut rules = Vec::new();
-        if let Some(role) = row.get::<_, Option<String>>("role_id") {
-            let def: Value = self
-                .c
-                .query_one(
-                    "SELECT definition FROM role_definitions WHERE id=$1",
-                    &[&role],
-                )
-                .await?
-                .get(0);
-            let kind = string(&scope, "kind")?;
-            let supported = self
-                .c
-                .query(
-                    "SELECT action FROM permission_definitions WHERE resource_kinds ? $1",
-                    &[&kind],
-                )
-                .await?;
-            for row in supported {
-                let action: String = row.get(0);
-                if def["actions"]
-                    .as_array()
-                    .ok_or_else(Error::denied)?
-                    .iter()
-                    .any(|a| a == &action)
-                {
+        if row.get::<_, Option<String>>("role_id").is_some() {
+            string(&scope, "kind")?;
+            let def: Value = row
+                .get::<_, Option<Value>>("role_definition")
+                .ok_or_else(Error::denied)?;
+            let actions = def["actions"].as_array().ok_or_else(Error::denied)?;
+            for action in row.get::<_, Vec<String>>("supported_actions") {
+                if actions.iter().any(|allowed| allowed == &action) {
                     rules.push(json!({"action":action,"resource":scope}));
                 }
             }
         } else {
-            let group: Uuid = row.get("group_id");
-            let version: i64 = row.get("group_version");
-            let Some(g)=self.c.query_opt("SELECT v.rules FROM group_versions v JOIN permission_groups g ON g.id=v.group_id WHERE v.group_id=$1 AND v.version=$2 AND g.status='active'", &[&group,&version]).await? else {return Ok(Vec::new());};
-            for r in g.get::<_, Value>(0).as_array().ok_or_else(Error::denied)? {
+            let Some(group) = row.get::<_, Option<Value>>("group_rules") else {
+                return Ok(Vec::new());
+            };
+            for r in group.as_array().ok_or_else(Error::denied)? {
                 if let Some(resource) = self.selector_intersection(&r["resource"], &scope).await? {
                     let mut rule = r.clone();
                     rule["resource"] = resource;
@@ -487,18 +507,13 @@ impl<'a, C: GenericClient + Sync> Policy<'a, C> {
                 }
                 Err(e) => return Err(e),
             }
-        } else {
-            let issuer: Uuid = row.get("issuer_id");
-            let subject: Uuid = row.get("subject_id");
-            let bootstrap=self.c.query_one("SELECT EXISTS(SELECT 1 FROM accounts a JOIN grants g ON g.subject_id=a.id WHERE g.id=$1 AND a.id=$2 AND a.independent_owner AND a.parent_id IS NULL AND g.role_id='Owner' AND (g.created_at=a.created_at OR EXISTS(SELECT 1 FROM recovery_owner_anchors r WHERE r.grant_id=g.id AND r.account_id=a.id)) AND g.issuer_id=a.id AND g.issuer_credential_id IS NULL)", &[&grant,&subject]).await?.get::<_,bool>(0);
-            if !bootstrap {
-                match Box::pin(self.account(issuer, depth + 1)).await {
-                    Ok(limits) => paths = self.intersection(&paths, &limits).await?,
-                    Err(e) if matches!(e.code, "INVALID_CREDENTIAL" | "PERMISSION_DENIED") => {
-                        return Ok(Vec::new())
-                    }
-                    Err(e) => return Err(e),
+        } else if !row.get::<_, bool>("bootstrap") {
+            match Box::pin(self.account(issuer, depth + 1)).await {
+                Ok(limits) => paths = self.intersection(&paths, &limits).await?,
+                Err(e) if matches!(e.code, "INVALID_CREDENTIAL" | "PERMISSION_DENIED") => {
+                    return Ok(Vec::new())
                 }
+                Err(e) => return Err(e),
             }
         }
         Ok(paths)

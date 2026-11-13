@@ -219,13 +219,24 @@ pub async fn reserve(c: &impl GenericClient, instance: Uuid) -> Result<()> {
             "Admission is disabled during reconciliation",
         ));
     }
-    let row=c.query_one("SELECT i.*,d.spec,d.archived_at FROM instances i JOIN deployments d ON d.id=i.deployment_id WHERE i.id=$1 FOR UPDATE OF i,d",&[&instance]).await?;
-    let limits: Value = row.get("limits");
+    // HostService and health publication lock the deployment before the
+    // instance. Acquire those rows separately so a join cannot reverse them.
+    let deployment = c.query_one(
+        "SELECT d.id,d.spec,d.archived_at FROM deployments d JOIN instances i ON i.deployment_id=d.id WHERE i.id=$1 FOR SHARE OF d",
+        &[&instance],
+    ).await?;
+    let limits: Value = c
+        .query_one(
+            "SELECT limits FROM instances WHERE id=$1 AND deployment_id=$2 FOR UPDATE",
+            &[&instance, &deployment.get::<_, Uuid>("id")],
+        )
+        .await?
+        .get(0);
     validate("ResourceLimits", &limits)?;
-    let spec: Value = row.get("spec");
+    let spec: Value = deployment.get("spec");
     if spec["limits"] != limits
         || spec["enabled"] != true
-        || row
+        || deployment
             .get::<_, Option<chrono::DateTime<chrono::Utc>>>("archived_at")
             .is_some()
     {
@@ -341,6 +352,95 @@ pub async fn status(c: &impl GenericClient) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn reservation_waits_for_deployment_before_locking_instance() {
+        let Some(f) = crate::backups::tests::Fixture::new().await else {
+            return;
+        };
+        let mut holder = f.app.db.connect().await.unwrap();
+        let deployment: Uuid = holder
+            .query_one("SELECT id FROM deployments LIMIT 1", &[])
+            .await
+            .unwrap()
+            .get(0);
+        let instance = Uuid::new_v4();
+        let limits =
+            json!({"cpu_millis":500,"memory_bytes":268435456,"ephemeral_bytes":16777216,"pids":64});
+        holder.execute(
+            "UPDATE deployments SET spec=jsonb_build_object('enabled',true,'limits',$2::jsonb) WHERE id=$1",
+            &[&deployment, &limits],
+        ).await.unwrap();
+        holder.execute(
+            "INSERT INTO instances(id,deployment_id,generation,ordinal,phase,health,limits,created_at,updated_at) VALUES($1,$2,1,0,'ready','alive',$3,now(),now())",
+            &[&instance, &deployment, &limits],
+        ).await.unwrap();
+        holder
+            .execute("UPDATE node_budget SET admission_enabled=true", &[])
+            .await
+            .unwrap();
+
+        let held = holder.transaction().await.unwrap();
+        let holder_pid: i32 = held
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .unwrap()
+            .get(0);
+        held.query_one(
+            "SELECT id FROM deployments WHERE id=$1 FOR UPDATE",
+            &[&deployment],
+        )
+        .await
+        .unwrap();
+        let mut reserver = f.app.db.connect().await.unwrap();
+        let reserver_pid: i32 = reserver
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .unwrap()
+            .get(0);
+        let pending = tokio::spawn(async move {
+            let tx = reserver.transaction().await.unwrap();
+            reserve(&tx, instance).await?;
+            tx.commit().await?;
+            Ok::<_, Error>(())
+        });
+        let observer = f.app.db.connect().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !observer
+                .query_one(
+                    "SELECT $2::int=ANY(pg_blocking_pids($1))",
+                    &[&reserver_pid, &holder_pid],
+                )
+                .await
+                .unwrap()
+                .get::<_, bool>(0)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("reservation should wait for the deployment");
+        // A transaction that already owns the deployment must still be able
+        // to lock its instance while a reservation waits behind it.
+        let instance_lock = held
+            .query_one(
+                "SELECT id FROM instances WHERE id=$1 FOR SHARE NOWAIT",
+                &[&instance],
+            )
+            .await;
+        held.rollback().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), pending)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            instance_lock.is_ok(),
+            "reservation locked the instance first"
+        );
+    }
+
     #[test]
     fn compact_whole_node_budget_never_borrows_boot_or_system_memory() {
         let mut config = json!({"profile":"compact", "kernel_cpu_millis":500,
