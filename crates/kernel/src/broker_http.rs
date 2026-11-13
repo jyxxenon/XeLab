@@ -824,7 +824,10 @@ async fn execute_inner(
     if let Err(error) = authority {
         result = Err(error);
     }
-    let saved = result.as_ref().map(|v| v.0.clone()).map_err(Clone::clone);
+    let settlement = match &result {
+        Ok((value, _)) => super::CallSettlement::Completed(value),
+        Err(error) => super::CallSettlement::Unknown(error),
+    };
     settle_business(
         &tx,
         &ctx,
@@ -835,7 +838,7 @@ async fn execute_inner(
         } else {
             &op.route.action
         },
-        &saved,
+        settlement,
     )
     .await?;
     if let Ok((value, Some(response))) = &result {

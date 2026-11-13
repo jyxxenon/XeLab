@@ -33,6 +33,7 @@
 | 1 | `call_id` | `string` | 按业务校验必填/默认值 |
 | 2 | `output_json` | `bytes` | 按业务校验必填/默认值 |
 | 3 | `output_digest` | `string` | 按业务校验必填/默认值 |
+| 4 | `terminal_failure` | `InvokeFailure` | 留空，失败通过 gRPC 状态返回 |
 
 嵌套消息、enum、oneof 及字段注释见 [Proto](../contracts/proto/xelab/v1/host.proto)。公共上下文见 [common.proto](../contracts/proto/xelab/v1/common.proto)。所有字符串标识、期限、摘要和 JSON 大小均执行通用校验；仅在 method 说明允许时可为空。
 

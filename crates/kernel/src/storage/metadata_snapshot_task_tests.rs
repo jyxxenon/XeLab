@@ -206,9 +206,16 @@ async fn record_dispatch(
             "skill_id":skill.id,"skill_definition_digest":skill.definition_digest,
             "output":output,"completed_at":chrono::Utc::now()});
         contracts::validate("CallResult", &result).unwrap();
-        broker::settle_business(&tx, &ctx, call, &accounts, "skill.invoke", &Ok(result))
-            .await
-            .unwrap();
+        broker::settle_business(
+            &tx,
+            &ctx,
+            call,
+            &accounts,
+            "skill.invoke",
+            broker::CallSettlement::Completed(&result),
+        )
+        .await
+        .unwrap();
         task_engine::complete(
             &tx,
             &app.auth,
