@@ -34,7 +34,9 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - name: Host acceptance tooling tests
-        run: python3 -m unittest discover -s tools/acceptance -p 'test_*.py' -v
+        run: |
+          python3 -m unittest discover -s tools/acceptance -p 'test_*.py' -v
+          python3 -m unittest discover -s tools/dev -p 'test_*.py' -v
       - name: Toolchain
         run: rustc --version && cargo --version
       - name: Format
