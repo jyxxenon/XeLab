@@ -227,7 +227,9 @@ async fn postgres_task_idle_authority_preserves_active_leases_and_unknown_calls(
     let lease = f.claim().await;
     let second = submit(&f, "idle-authority-unknown-fixture").await;
     let (plugin, server) = echo(&f.host, f.instance).await;
-    plugin.fail_after_dispatch.store(true, Ordering::SeqCst);
+    *plugin.unary_failure.lock().unwrap() = Some(tonic::Status::unavailable(
+        "Simulated transport failure after dispatch",
+    ));
     assert!(crate::task_worker::run_once(&f.host.app).await.unwrap());
 
     let c = f.host.app.db.connect().await.unwrap();
