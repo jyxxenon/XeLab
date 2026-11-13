@@ -329,7 +329,7 @@ async fn actual_volume_operations_recover_enforce_capacity_and_fence_writers() {
         .api("createVolume", None, spec(), "create", None, None)
         .await;
     assert_eq!(replay.1, created.1);
-    // Power loss after the quota/directory side effect but before publication.
+    // A busy root leaves the accepted allocation pending for the next sweep.
     let a = c
         .query_one(
             "SELECT project_id,inode_limit FROM volume_allocations WHERE volume_id=$1",
@@ -340,6 +340,21 @@ async fn actual_volume_operations_recover_enforce_capacity_and_fence_writers() {
     let project = a.get::<_, i32>(0) as u32;
     let path = f.app.config.root().join("volumes");
     let mut store = ProjectStore::open(&path).unwrap();
+    volumes::tick(&f.app).await.unwrap();
+    let pending =
+        xelab_kernel::db::operation_value(&c, created.1["id"].as_str().unwrap().parse().unwrap())
+            .await
+            .unwrap();
+    assert_eq!(pending["state"], "pending");
+    let allocation = c
+        .query_one(
+            "SELECT state FROM volume_allocations WHERE volume_id=$1",
+            &[&id],
+        )
+        .await
+        .unwrap();
+    assert_eq!(allocation.get::<_, &str>("state"), "creating");
+    // Power loss after the quota/directory side effect but before publication.
     store
         .recover_create(
             id,

@@ -756,9 +756,11 @@ async fn process(app: &App, bound: Binding, volume: Uuid) -> Result<()> {
     let path = app.config.root().join("volumes");
     let action = state.clone();
     let result = blocking(move || {
-        let mut store = ProjectStore::open(&path)?;
+        let Some(mut store) = ProjectStore::try_open(&path)? else {
+            return Ok(None);
+        };
         store.namespace_identity(bound.filesystem, bound.id, false)?;
-        match action.as_str() {
+        let outcome = match action.as_str() {
             "creating" => {
                 store.recover_create(volume, project, limits)?;
                 store.prepare_data(volume, project)?;
@@ -788,9 +790,15 @@ async fn process(app: &App, bound: Binding, volume: Uuid) -> Result<()> {
                 removed: store.discard_create(volume, project)?,
             }),
             _ => Err(Error::conflict("Unknown volume intent")),
-        }
+        }?;
+        Ok(Some(outcome))
     })
     .await;
+    let result = match result {
+        Ok(None) => return Ok(()),
+        Ok(Some(outcome)) => Ok(outcome),
+        Err(error) => Err(error),
+    };
     let tx = c.transaction().await?;
     db::auth_lock(&tx, false).await?;
     tx.query_one(
@@ -906,7 +914,11 @@ pub async fn tick(app: &App) -> Result<()> {
     let c = app.db.connect().await?;
     let rows=c.query("SELECT a.volume_id FROM volume_allocations a WHERE state IN ('creating','resizing','deleting') OR (state='quarantined' AND NOT EXISTS(SELECT 1 FROM volumes v WHERE v.id=a.volume_id)) ORDER BY updated_at,volume_id LIMIT 4",&[]).await?;
     if !rows.is_empty() {
-        let bound = binding(app).await?;
+        let bound = match binding(app).await {
+            Ok(bound) => bound,
+            Err(error) if root_lock_busy(&error) => return Ok(()),
+            Err(error) => return Err(error),
+        };
         for row in rows {
             let id: Uuid = row.get(0);
             if let Err(error) = process(app, bound, id).await {
@@ -918,11 +930,20 @@ pub async fn tick(app: &App) -> Result<()> {
     if !ids.is_empty() {
         let mut dbc = app.db.connect().await?;
         let tx = dbc.transaction().await?;
-        observe(&tx, app, &ids).await?;
+        match observe(&tx, app, &ids).await {
+            Ok(()) => (),
+            Err(error) if root_lock_busy(&error) => return Ok(()),
+            Err(error) => return Err(error),
+        }
         tx.commit().await?;
     }
     Ok(())
 }
+
+fn root_lock_busy(error: &Error) -> bool {
+    error.code == "STATE_CONFLICT" && error.message == ROOT_LOCK_BUSY
+}
+
 pub async fn run(app: Arc<App>) {
     while !app.shutdown.load(Ordering::SeqCst) && !app.leader.is_closed() {
         if let Err(error) = tick(&app).await {

@@ -562,6 +562,21 @@ pub async fn exercise(f: &Fixture, publisher: Uuid) {
         .await
         .unwrap()
         .get(0);
+    {
+        let _fence = lock_deployment_runtime(f, deployment).await;
+        let _held_root = ProjectStore::open(&f.app.config.root().join("volumes")).unwrap();
+        volumes::tick(&f.app).await.unwrap();
+        let current = c
+            .query_one(
+                "SELECT state,reserved_bytes FROM volume_allocations a
+                 JOIN volume_storage_root r ON r.id=a.root_id WHERE a.volume_id=$1",
+                &[&scratch],
+            )
+            .await
+            .unwrap();
+        assert_eq!(current.get::<_, &str>(0), "quarantined");
+        assert_eq!(current.get::<_, i64>(1), before);
+    }
     reap(f, scratch).await;
     let after: i64 = c
         .query_one("SELECT reserved_bytes FROM volume_storage_root", &[])
