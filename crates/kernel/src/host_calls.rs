@@ -104,11 +104,21 @@ fn authority_digest<'a>(
         // instance, then delegation records. A reverse order can deadlock against
         // completion (call -> delegation) or health publication (deployment -> instance).
         let target=c.query_opt("SELECT r.call_id,i.deployment_id FROM rpc_delegations r JOIN instances i ON i.id=r.instance_id WHERE r.hmac_key_id=$1 AND r.verification_digest=$2 AND r.instance_id=$3",&[&app.auth.key_id.as_str(),&hash,&workload.instance]).await?.ok_or_else(Error::denied)?;
-        c.query_one(
-            "SELECT id FROM calls WHERE id=$1 FOR SHARE",
-            &[&target.get::<_, Uuid>("call_id")],
-        )
-        .await?;
+        let call: Uuid = target.get("call_id");
+        // Task admission currently freezes only business and Skill targets.
+        // Its ordinary Broker delegation cannot authorize further HostService actions.
+        let task_call: bool = c
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM attempts WHERE broker_call_id=$1)",
+                &[&call],
+            )
+            .await?
+            .get(0);
+        if task_call {
+            return Err(Error::denied());
+        }
+        c.query_one("SELECT id FROM calls WHERE id=$1 FOR SHARE", &[&call])
+            .await?;
         c.query_one(
             "SELECT id FROM deployments WHERE id=$1 FOR SHARE",
             &[&target.get::<_, Uuid>("deployment_id")],

@@ -16,6 +16,7 @@ use std::{
     sync::{atomic::Ordering, Arc},
     time::Duration,
 };
+use tokio_postgres::{Client, IsolationLevel, Row};
 use uuid::Uuid;
 
 pub fn context(subject: Option<Uuid>) -> rpc::RpcContext {
@@ -30,6 +31,7 @@ pub fn context(subject: Option<Uuid>) -> rpc::RpcContext {
 }
 
 pub async fn run(app: Arc<App>) {
+    let mut workers = tokio::task::JoinSet::new();
     let mut state = ControllerState::default();
     let mut rotate = tokio::time::Instant::now();
     loop {
@@ -62,9 +64,26 @@ pub async fn run(app: Arc<App>) {
                 );
             }
         }
+        while let Some(result) = workers.try_join_next() {
+            if let Err(error) = result {
+                tracing::error!(
+                    reason_code = "TASK_WORKER_EXIT",
+                    panicked = error.is_panic(),
+                    "Task worker stopped unexpectedly"
+                );
+            }
+        }
+        if app.ready.load(Ordering::SeqCst)
+            && workers.is_empty()
+            && !app.shutdown.load(Ordering::SeqCst)
+            && !app.leader.is_closed()
+        {
+            workers.spawn(crate::task_worker::run(app.clone()));
+        }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
     app.ready.store(false, Ordering::SeqCst);
+    workers.shutdown().await;
 }
 
 #[derive(Default)]
@@ -190,6 +209,62 @@ async fn reconcile_tick(app: &App, state: &mut ControllerState) -> Result<()> {
     result
 }
 
+pub(crate) async fn startup_runtime_ids(c: &tokio_postgres::Client) -> Result<Vec<Uuid>> {
+    // A missing container record is not a stop proof for a durable instance ID.
+    // Call reservations do not have an instance_id of their own.
+    Ok(c.query(
+        "WITH unsettled_calls(id) AS (
+             SELECT id FROM calls WHERE state IN ('accepted','running')
+             UNION SELECT id FROM reservations WHERE kind='call' AND status<>'released'
+             UNION SELECT broker_call_id FROM attempts
+                 WHERE state IN ('leased','running') AND broker_call_id IS NOT NULL
+         )
+         SELECT provider_instance_id FROM calls JOIN unsettled_calls USING (id)
+             WHERE provider_instance_id IS NOT NULL
+         UNION SELECT instance_id FROM volume_attachments
+         UNION SELECT instance_id FROM plugin_http_requests",
+        &[],
+    )
+    .await?
+    .into_iter()
+    .map(|row| row.get(0))
+    .collect())
+}
+
+/// The startup leader calls this only after stopping every known old runtime.
+pub(crate) async fn settle_startup_metadata(tx: &tokio_postgres::Transaction<'_>) -> Result<()> {
+    db::call_lock(tx).await?;
+    crate::volumes::release_stopped(tx, None).await?;
+    tx.execute("DELETE FROM plugin_http_requests", &[]).await?;
+    tx.execute(
+        "UPDATE calls SET state='unknown',error=$1 WHERE state IN ('accepted','running')",
+        &[&Error::new(
+            "OUTCOME_UNKNOWN",
+            "Kernel restarted before the result was committed",
+            axum::http::StatusCode::CONFLICT,
+        )
+        .detail()],
+    )
+    .await?;
+    tx.execute(
+        "UPDATE rpc_delegations SET status='revoked' WHERE status='active'",
+        &[],
+    )
+    .await?;
+    crate::tasks::revoke_transient_delegations(tx).await?;
+    tx.execute(
+        "UPDATE reservations SET status='released' WHERE kind='call' AND status<>'released'",
+        &[],
+    )
+    .await?;
+    crate::task_engine::reconcile_stopped(tx).await?;
+    crate::task_engine::finish_stopped_cancellations(tx).await?;
+    tx.execute("UPDATE quotas SET concurrent_calls_used=0", &[])
+        .await?;
+    tx.execute("UPDATE instances SET phase='pending',health='unknown',restart_count=0,revision=revision+1,updated_at=now() WHERE phase<>'stopped'", &[]).await?;
+    Ok(())
+}
+
 async fn tick(app: &App, first: bool, state: &mut ControllerState) -> Result<()> {
     let mut c = app.db.connect().await?;
     if first {
@@ -204,51 +279,12 @@ async fn tick(app: &App, first: bool, state: &mut ControllerState) -> Result<()>
         // Stable instance IDs and their resource reservations survive this restart.
         let mut old: std::collections::BTreeSet<Uuid> =
             app.runtime.inventory().await?.into_iter().collect();
-        // A lost container record does not prove that its old cgroup is empty.
-        // Every durable attachment also needs an explicit stop proof.
-        old.extend(
-            c.query("SELECT DISTINCT instance_id FROM volume_attachments", &[])
-                .await?
-                .into_iter()
-                .map(|r| r.get::<_, Uuid>(0)),
-        );
-        old.extend(
-            c.query("SELECT DISTINCT instance_id FROM plugin_http_requests", &[])
-                .await?
-                .into_iter()
-                .map(|row| row.get::<_, Uuid>(0)),
-        );
+        old.extend(startup_runtime_ids(&c).await?);
         for id in old {
             app.runtime.stop(id).await?;
         }
         let tx = c.transaction().await?;
-        db::call_lock(&tx).await?;
-        crate::volumes::release_stopped(&tx, None).await?;
-        tx.execute("DELETE FROM plugin_http_requests", &[]).await?;
-        tx.execute(
-            "UPDATE calls SET state='unknown',error=$1 WHERE state IN ('accepted','running')",
-            &[&Error::new(
-                "OUTCOME_UNKNOWN",
-                "Kernel restarted before the result was committed",
-                axum::http::StatusCode::CONFLICT,
-            )
-            .detail()],
-        )
-        .await?;
-        tx.execute(
-            "UPDATE rpc_delegations SET status='revoked' WHERE status='active'",
-            &[],
-        )
-        .await?;
-        crate::tasks::revoke_transient_delegations(&tx).await?;
-        tx.execute(
-            "UPDATE reservations SET status='released' WHERE kind='call' AND status<>'released'",
-            &[],
-        )
-        .await?;
-        tx.execute("UPDATE quotas SET concurrent_calls_used=0", &[])
-            .await?;
-        tx.execute("UPDATE instances SET phase='pending',health='unknown',restart_count=0,revision=revision+1,updated_at=now() WHERE phase<>'stopped'", &[]).await?;
+        settle_startup_metadata(&tx).await?;
         tx.commit().await?;
         c.execute(
             "UPDATE node_budget SET admission_enabled=true,revision=revision+1,updated_at=now()",
@@ -548,24 +584,53 @@ async fn install(app: &App, request: &Value, operation: Uuid, payload: &Value) -
     Ok(json!({"installation_id":id}))
 }
 
+async fn reconciliation_snapshot(
+    c: &mut Client,
+    deployment: Uuid,
+) -> Result<Option<(Row, Vec<Row>)>> {
+    // Upgrade admission commits the storage hold and pending candidate
+    // together. Read both from the same snapshot so ordinary reconciliation
+    // cannot start that candidate using the source installation.
+    let tx = c
+        .build_transaction()
+        .isolation_level(IsolationLevel::RepeatableRead)
+        .read_only(true)
+        .start()
+        .await?;
+    let d = tx
+        .query_opt(
+            "SELECT d.*,i.manifest,i.manifest_digest,i.image_digest
+             FROM deployments d JOIN installations i ON i.id=d.installation_id
+             WHERE d.id=$1 AND NOT EXISTS (
+                 SELECT 1 FROM deployment_storage_holds h WHERE h.deployment_id=d.id
+             )",
+            &[&deployment],
+        )
+        .await?;
+    let snapshot = if let Some(d) = d {
+        let instances = tx
+            .query(
+                "SELECT * FROM instances WHERE deployment_id=$1 AND phase<>'stopped'
+                 ORDER BY generation",
+                &[&deployment],
+            )
+            .await?;
+        Some((d, instances))
+    } else {
+        None
+    };
+    tx.commit().await?;
+    Ok(snapshot)
+}
+
 async fn reconcile(app: &App, deployment: Uuid, probes: &mut BTreeMap<Uuid, Probe>) -> Result<()> {
     // Check holds after taking the runtime fence. A previous reconciliation
     // cannot create a writer after a backup worker has proved it stopped.
     let Some(runtime_fence) = db::deployment_fence(&app.db, deployment).await? else {
         return Ok(());
     };
-    let c = app.db.connect().await?;
-    if c.query_opt(
-        "SELECT deployment_id FROM deployment_storage_holds WHERE deployment_id=$1",
-        &[&deployment],
-    )
-    .await?
-    .is_some()
-    {
-        probes.remove(&deployment);
-        return Ok(());
-    }
-    let Some(d)=c.query_opt("SELECT d.*,i.manifest,i.manifest_digest,i.image_digest FROM deployments d JOIN installations i ON i.id=d.installation_id WHERE d.id=$1",&[&deployment]).await? else {
+    let mut c = app.db.connect().await?;
+    let Some((d, instances)) = reconciliation_snapshot(&mut c, deployment).await? else {
         probes.remove(&deployment);
         return Ok(());
     };
@@ -649,7 +714,6 @@ async fn reconcile(app: &App, deployment: Uuid, probes: &mut BTreeMap<Uuid, Prob
         }
         return Ok(());
     }
-    let instances=c.query("SELECT * FROM instances WHERE deployment_id=$1 AND phase<>'stopped' ORDER BY generation",&[&deployment]).await?;
     let dependency_state = {
         let mut connection = app.db.connect().await?;
         let tx = connection.transaction().await?;
@@ -977,6 +1041,121 @@ async fn finish_deployment_operations(
 #[cfg(test)]
 mod recovery_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn actual_postgres_reconciliation_does_not_adopt_new_upgrade_candidate() {
+        let Some(f) = crate::backups::tests::Fixture::new().await else {
+            return;
+        };
+        let db = &f.app.db;
+        let mut writer = db.connect().await.unwrap();
+        let row = writer
+            .query_one("SELECT id,owner_id,installation_id FROM deployments", &[])
+            .await
+            .unwrap();
+        let deployment: Uuid = row.get("id");
+        let installation: Uuid = row.get("installation_id");
+        writer
+            .execute(
+                "DELETE FROM deployment_storage_holds WHERE deployment_id=$1",
+                &[&deployment],
+            )
+            .await
+            .unwrap();
+        let source = Uuid::new_v4();
+        writer
+            .execute(
+                "INSERT INTO instances(id,deployment_id,generation,ordinal,phase,health,limits,created_at,updated_at)
+                 VALUES($1,$2,1,0,'ready','alive','{}',now(),now())",
+                &[&source, &deployment],
+            )
+            .await
+            .unwrap();
+        let operation = db::operation(
+            &writer,
+            row.get("owner_id"),
+            "rollbackDeployment",
+            Some(deployment.to_string()),
+        )
+        .await
+        .unwrap();
+        let _runtime_fence = db::deployment_fence(db, deployment).await.unwrap().unwrap();
+        let writer_pid: i32 = writer
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .unwrap()
+            .get(0);
+        let mut reader = db.connect().await.unwrap();
+        let reader_pid: i32 = reader
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .unwrap()
+            .get(0);
+        let observer = db.connect().await.unwrap();
+
+        let admission = writer.transaction().await.unwrap();
+        admission
+            .batch_execute("LOCK TABLE instances IN ACCESS EXCLUSIVE MODE")
+            .await
+            .unwrap();
+        let read =
+            tokio::spawn(async move { reconciliation_snapshot(&mut reader, deployment).await });
+        // The first query has already seen the source deployment without a
+        // hold when the reader reaches this lock on its second query.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let blocked: bool = observer
+                    .query_one(
+                        "SELECT $1=ANY(pg_blocking_pids($2))",
+                        &[&writer_pid, &reader_pid],
+                    )
+                    .await
+                    .unwrap()
+                    .get(0);
+                if blocked {
+                    break;
+                }
+                assert!(
+                    !read.is_finished(),
+                    "reconciliation exited before reading instances"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("reconciliation did not reach its instance read");
+        let candidate = Uuid::new_v4();
+        admission
+            .execute(
+                "INSERT INTO instances(id,deployment_id,generation,ordinal,phase,health,limits,created_at,updated_at)
+                 VALUES($1,$2,2,0,'pending','unknown','{}',now(),now())",
+                &[&candidate, &deployment],
+            )
+            .await
+            .unwrap();
+        admission
+            .execute(
+                "INSERT INTO deployment_storage_holds(deployment_id,operation_id) VALUES($1,$2)",
+                &[&deployment, &operation],
+            )
+            .await
+            .unwrap();
+        admission.commit().await.unwrap();
+
+        let (intent, instances) = tokio::time::timeout(Duration::from_secs(5), read)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(intent.get::<_, Uuid>("installation_id"), installation);
+        assert_eq!(instances.len(), 1);
+        assert_eq!(instances[0].get::<_, Uuid>("id"), source);
+        assert!(reconciliation_snapshot(&mut writer, deployment)
+            .await
+            .unwrap()
+            .is_none());
+    }
 
     #[tokio::test]
     async fn fenced_call_journal_preserves_cancel_intent_and_only_changes_unsettled_instance_work()

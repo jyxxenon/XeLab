@@ -42,13 +42,24 @@ class Lifecycle(lifecycle.PluginLifecycleServicer):
 
     def Initialize(self, request, context):
         require_kernel(context)
+        config = json.loads(request.config_json)
+        hold_receipt = (isinstance(config, dict) and config.keys() == {"test_hold_receipt"}
+                        and config["test_hold_receipt"] is True
+                        and self.manifest["config_schema"].get("properties", {}).get("test_hold_receipt")
+                        == {"const": True})
         if (request.instance_id != os.environ["XELAB_INSTANCE_ID"]
                 or request.deployment_id != os.environ["XELAB_DEPLOYMENT_ID"]
                 or request.generation != self.generation
                 or digest(request.config_json) != request.config_digest
-                or json.loads(request.config_json) != {}):
+                or (config != {} and not hold_receipt)):
             context.abort(grpc.StatusCode.FAILED_PRECONDITION, "Identity or config differs")
-        self.state.initialize()
+        if hold_receipt:
+            from http_server import HOLD_RECEIPT
+
+            self.state.initialize(HOLD_RECEIPT)
+        else:
+            # The reference UI image supplies its own State with this interface.
+            self.state.initialize()
         return life.InitializeResponse(observed_generation=self.generation, initialized=True)
 
     def GetHealth(self, request, context):

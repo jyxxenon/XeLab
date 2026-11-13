@@ -1,6 +1,9 @@
 //! Exercised by the real signed OCI HTTP test, never a standalone metadata mock.
 use super::*;
 
+mod task_cancel;
+pub(super) use task_cancel::cancel_and_restart_hold_tasks;
+
 async fn register(
     router: &Router,
     token: &str,
@@ -80,7 +83,7 @@ async fn completed(
 }
 pub(super) async fn fixed_methods_and_stream(
     router: &Router,
-    db: &Db,
+    app: &App,
     token: &str,
     manifest: &Value,
     installed: &Value,
@@ -105,7 +108,7 @@ pub(super) async fn fixed_methods_and_stream(
         let called = api(
             router,
             "invokeSkill",
-            &[("skill_id", skill)],
+            &[("skill_id", skill.clone())],
             Some(token),
             json!({"input":input,"provider_deployment_id":deployment}),
             &format!("http-profile-call-{index}"),
@@ -114,11 +117,74 @@ pub(super) async fn fixed_methods_and_stream(
         .await;
         assert_eq!(called.0, 200, "{}", called.1);
         assert_eq!(called.1["call"]["output"], output);
+        let (mapping, task_input, task_output, suffix, method, path) = match index {
+            3 => {
+                let message = json!({"message":"OCI Task PUT201"});
+                (
+                    json!({"message":{"task_input":"/message"}}),
+                    message.clone(),
+                    message,
+                    "http-put",
+                    "PUT",
+                    "/plugins/org.xelab.http-echo/created",
+                )
+            }
+            5 => (
+                json!({}),
+                json!({}),
+                Value::Null,
+                "http-delete",
+                "DELETE",
+                "/plugins/org.xelab.http-echo/discard",
+            ),
+            _ => continue,
+        };
+        let instance = contracts::id(&called.1["call"], "provider_instance_id").unwrap();
+        let input_digest = if method == "DELETE" {
+            contracts::digest(b"")
+        } else {
+            contracts::digest(&serde_json::to_vec(&task_input).unwrap())
+        };
+        let call = super::oci_task::run(
+            app,
+            router,
+            token,
+            super::oci_task::TaskCase {
+                skill: skill.parse().unwrap(),
+                expected_instance: instance,
+                reference_call: contracts::id(&called.1["call"], "call_id").unwrap(),
+                input_mapping: mapping,
+                input: task_input,
+                expected_output: task_output,
+                suffix,
+            },
+        )
+        .await;
+        let c = app.db.connect().await.unwrap();
+        let row = c
+            .query_one(
+                "SELECT c.http_binding,c.input_digest,i.generation FROM calls c
+                 JOIN instances i ON i.id=c.provider_instance_id WHERE c.id=$1",
+                &[&call],
+            )
+            .await
+            .unwrap();
+        let target = &manifest["skills"][index]["target"];
+        assert_eq!(
+            row.get::<_, Value>("http_binding"),
+            json!({
+                "installation_id":installed["installation_id"], "deployment_id":deployment,
+                "generation":row.get::<_,i64>("generation"), "required_action":"plugin.http.invoke",
+                "http_contract_digest":target["http_contract_digest"], "operation_id":target["http_operation_id"],
+                "method":method, "path":path,
+            })
+        );
+        assert_eq!(row.get::<_, String>("input_digest"), input_digest);
     }
     let skill = register(router, token, manifest, installed, 1).await;
     let result = completed(router, token, &skill, deployment, "http-oci-stream-skill").await;
     assert_eq!(result["contract"]["name"], manifest["skills"][1]["name"]);
-    let c = db.connect().await.unwrap();
+    let c = app.db.connect().await.unwrap();
     let call = contracts::id(&result, "call_id").unwrap();
     let row = c
         .query_one(
@@ -159,7 +225,7 @@ pub(super) async fn fixed_methods_and_stream(
             .get::<_, i64>(0),
         before
     );
-    wait_active(db, 0).await;
+    wait_active(&app.db, 0).await;
     skill
 }
 pub(super) async fn after_restart_and_live_revoke(
