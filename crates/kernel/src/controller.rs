@@ -720,7 +720,6 @@ async fn reconcile(app: &App, deployment: Uuid, probes: &mut BTreeMap<Uuid, Prob
         }
         return Ok(());
     }
-    let instances=c.query("SELECT * FROM instances WHERE deployment_id=$1 AND phase<>'stopped' ORDER BY generation",&[&deployment]).await?;
     let dependency_state = {
         let mut connection = app.db.connect().await?;
         let tx = connection.transaction().await?;
