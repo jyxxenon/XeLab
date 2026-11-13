@@ -1,5 +1,5 @@
 import {runtimeConfig} from './runtime-config.js';
-import {ApiClient} from './api.js';
+import {ApiClient,ApiError} from './api.js';
 import {OAuthSession} from './oauth.js';
 import {BridgeHost,validateContribution,sameContribution} from './bridge.js';
 
@@ -602,18 +602,25 @@ async function mountContribution(container,fixed,owner){
   await bridge.mount();
   bridge.setVisible(document.visibilityState==='visible'&&!owner.minimized&&!owner.element.hidden);
 }
-async function preferenceMutation(intentId,mutate,sourceCurrent=()=>true){
-  if(!sourceCurrent())return;
+async function preferenceMutation(intentId,mutate,sourceCurrent){
+  const epoch=sessionEpoch;
+  const current=()=>epoch===sessionEpoch&&(sourceCurrent?.()??true);
+  if(!current())return;
   let intent=widgetIntents.get(intentId);
   if(!intent){
-    const current=await request('getMyUiPreferences');
-    if(!sourceCurrent())return;
-    const body=structuredClone(current.data.spec);
-    mutate(body);
-    intent={body,etag:current.etag||revision(current.data),key:crypto.randomUUID()};
-    widgetIntents.set(intentId,intent);
+    const loaded=await request('getMyUiPreferences');
+    if(!current())return;
+    const body=structuredClone(loaded.data.spec);
+    const onDispatch=mutate(body);
+    intent={body,etag:loaded.etag||revision(loaded.data),key:crypto.randomUUID(),onDispatch};
   }
-  const saved=await request('setMyUiPreferences',{body:intent.body,etag:intent.etag,idempotencyKey:intent.key});
+  const beforeFetch=()=>{
+    if(!current())throw new ApiError('CANCELED','偏好操作的来源已关闭。');
+    // Preserve the exact write intent from the first dispatch through retries.
+    intent.onDispatch?.();
+    widgetIntents.set(intentId,intent);
+  };
+  const saved=await request('setMyUiPreferences',{body:intent.body,etag:intent.etag,idempotencyKey:intent.key,beforeFetch});
   widgetIntents.delete(intentId);preferences=saved.data;preferenceEtag=saved.etag||revision(saved.data);preview=structuredClone(saved.data.spec);applyTheme();await renderWidgets();await resolveDockPins();renderLauncher();
 }
 async function widgetMutation(intentId,mutate,sourceCurrent){return preferenceMutation(intentId,body=>mutate(body.widgets),sourceCurrent);}
@@ -680,7 +687,8 @@ async function addWidget(value,sourceCurrent){
     const id=crypto.randomUUID(),placement={instance_id:id,contribution:contributionKey(fixed),column:0,row:0,columns:fixed.spec.widget.columns,rows:fixed.spec.widget.rows};
     while(items.some(other=>overlaps(placement,other))&&placement.row<255)placement.row++;
     if(items.some(other=>overlaps(placement,other)))throw new Error('当前网格没有可用位置，请先调整组件布局。');
-    widgetPinned.set(id,fixed);items.push(placement);
+    items.push(placement);
+    return()=>widgetPinned.set(id,fixed);
   },sourceCurrent);
 }
 function overlaps(left,right){return left.column<right.column+right.columns&&left.column+left.columns>right.column&&left.row<right.row+right.rows&&left.row+left.rows>right.row;}
