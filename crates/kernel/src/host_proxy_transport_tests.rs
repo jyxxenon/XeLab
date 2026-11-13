@@ -110,6 +110,7 @@ fn invocation(
         input_digest: contracts::digest(&input_json),
         input_json,
         binding_id: binding.into(),
+        terminal_failure_version: 0,
     }
 }
 

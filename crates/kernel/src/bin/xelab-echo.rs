@@ -1,21 +1,18 @@
 #![allow(clippy::result_large_err)] // Tonic service trait signatures.
-use std::{
-    path::PathBuf,
-    sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc,
-    },
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc,
 };
 use tokio::sync::{watch, RwLock};
 use tonic::{Request, Response, Status};
-use xelab_kernel::{
-    contracts::{digest, strict_json, validate_business},
+use xelab_kernel::contracts::{digest, strict_json, validate_business};
+use xelab_plugin_sdk::{
     rpc::{
         self,
         capability_service_server::{CapabilityService, CapabilityServiceServer},
         plugin_lifecycle_server::{PluginLifecycle, PluginLifecycleServer},
     },
-    tls::require_kernel,
+    transport::{WorkloadIdentity, PLUGIN_RPC_LISTEN},
 };
 
 #[derive(Clone)]
@@ -115,8 +112,8 @@ impl PluginLifecycle for Echo {
     ) -> Result<Response<rpc::HealthResponse>, Status> {
         let m = strict_json(&self.manifest, 1048576)
             .map_err(|_| Status::internal("Invalid manifest"))?;
-        // This service is exposed only through the existing require_kernel
-        // interceptor. Signal genuine ready probes, never synthetic freshness.
+        // The SDK admits authenticated kernel connections. Signal readiness
+        // only after a real probe reaches this service.
         let ready =
             self.initialized.load(Ordering::SeqCst) && !self.draining.load(Ordering::SeqCst);
         if ready {
@@ -236,6 +233,7 @@ impl CapabilityService for Echo {
             call_id: r.call_id.clone(),
             output_digest: digest(&output),
             output_json: output,
+            terminal_failure: None,
         };
         if results.len() >= 1024 {
             results.clear();
@@ -394,6 +392,7 @@ impl CapabilityService for Echo {
                         digest(&output)
                     },
                     output_json: output,
+                    terminal_failure: None,
                 };
                 if matches!(
                     fault.as_str(),
@@ -523,28 +522,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         active_streams: Default::default(),
         health_observed: watch::channel(0).0,
     };
-    loop {
-        let cert = std::fs::read(PathBuf::from(std::env::var("XELAB_TLS_CERT_PATH")?))?;
-        let key = std::fs::read(std::env::var("XELAB_TLS_KEY_PATH")?)?;
-        let ca = std::fs::read(std::env::var("XELAB_TLS_CA_PATH")?)?;
-        let tls = tonic::transport::ServerTlsConfig::new()
-            .identity(tonic::transport::Identity::from_pem(cert, key))
-            .client_ca_root(tonic::transport::Certificate::from_pem(ca));
-        tonic::transport::Server::builder()
-            .tls_config(tls)?
-            .add_service(PluginLifecycleServer::with_interceptor(
-                echo.clone(),
-                require_kernel,
-            ))
-            .add_service(CapabilityServiceServer::with_interceptor(
-                echo.clone(),
-                require_kernel,
-            ))
-            .serve_with_shutdown("0.0.0.0:7000".parse()?, async {
-                tokio::time::sleep(std::time::Duration::from_secs(300)).await;
-            })
-            .await?;
-    }
+    let identity = WorkloadIdentity::from_env()?;
+    let listener = tokio::net::TcpListener::bind(PLUGIN_RPC_LISTEN).await?;
+    tonic::transport::Server::builder()
+        .add_service(PluginLifecycleServer::new(echo.clone()))
+        .add_service(CapabilityServiceServer::new(echo))
+        .serve_with_incoming(identity.plugin_incoming(listener)?)
+        .await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -583,6 +568,7 @@ mod tests {
             input_digest: digest(&input_json),
             input_json,
             binding_id: String::new(),
+            terminal_failure_version: 0,
         };
         (echo, request)
     }

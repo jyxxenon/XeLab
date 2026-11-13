@@ -26,6 +26,7 @@
 | 4 | `input_json` | `bytes` | 按业务校验必填/默认值 |
 | 5 | `input_digest` | `string` | 按业务校验必填/默认值 |
 | 6 | `binding_id` | `string` | 按业务校验必填/默认值 |
+| 7 | `terminal_failure_version` | `uint32` | 固定为 0，流式失败使用 `failed` 帧 |
 
 ## 响应字段
 

@@ -344,7 +344,7 @@ pub(crate) async fn authorize_broker_call(
 }
 
 /// Inspect durable settlement even if the dispatch future lost its response.
-pub(crate) async fn broker_call(tx: &Transaction<'_>, lease: &Lease) -> Result<WorkerCall> {
+pub(crate) async fn broker_outcome(tx: &Transaction<'_>, lease: &Lease) -> Result<WorkerCall> {
     let row = lock_step(tx, lease).await?;
     if matches!(row.get::<_, &str>("state"), "cancel_requested" | "canceled") {
         return Ok(WorkerCall::Canceled);
@@ -353,20 +353,58 @@ pub(crate) async fn broker_call(tx: &Transaction<'_>, lease: &Lease) -> Result<W
     let Some(call) = active.broker_call_id else {
         return Ok(WorkerCall::Unlinked);
     };
+    linked_outcome(tx, lease, call)
+        .await
+        .map(WorkerCall::Linked)
+}
+
+async fn linked_outcome(tx: &Transaction<'_>, lease: &Lease, call: Uuid) -> Result<Outcome> {
+    let path = crate::broker::task_call_path(lease);
+    let key = lease.execution_id.to_string();
     let row = tx
-        .query_one("SELECT state,result FROM calls WHERE id=$1", &[&call])
+        .query_one(
+            "SELECT c.state,c.result,c.error,(
+                SELECT r.response_status FROM idempotency_records r
+                WHERE r.subject_id=c.owner_id AND r.credential_id=c.credential_id
+                  AND r.method='POST' AND r.path=$2 AND r.key=$3 AND r.resource_id=c.id::text
+                  AND c.http_binding IS NULL
+             ) AS terminal_status FROM calls c WHERE c.id=$1",
+            &[&call, &path, &key],
+        )
         .await?;
-    Ok(WorkerCall::Linked(
-        call,
-        row.get("state"),
-        row.get("result"),
+    match row.get::<_, &str>("state") {
+        "succeeded" => {
+            let result: Option<Value> = row.get("result");
+            let output = result
+                .filter(|value| {
+                    value["call_id"].as_str().and_then(|id| id.parse().ok()) == Some(call)
+                })
+                .and_then(|mut value| value.as_object_mut()?.remove("output"))
+                .ok_or_else(|| Error::conflict("Saved Task Call result is unavailable"))?;
+            return Ok(Outcome::Succeeded(output));
+        }
+        "failed" => {
+            if let Some(status) = row.get("terminal_status") {
+                let error = crate::broker::replay_terminal_failure(call, row.get("error"), status)?;
+                return Ok(Outcome::Failed(error));
+            }
+        }
+        _ => {}
+    }
+    Ok(Outcome::Unknown(
+        Error::new(
+            "OUTCOME_UNKNOWN",
+            "Task Call has no confirmed result",
+            axum::http::StatusCode::CONFLICT,
+        )
+        .with_resource(call),
     ))
 }
 
 pub(crate) enum WorkerCall {
     Canceled,
     Unlinked,
-    Linked(Uuid, String, Option<Value>),
+    Linked(Outcome),
 }
 
 /// A revoked or expired credential can close a lease that never admitted a Call.
@@ -604,28 +642,25 @@ pub async fn complete(
     outcome: Outcome,
 ) -> Result<Value> {
     let active = load(tx, lease).await?;
-    let (state, output, error) = match outcome {
-        Outcome::Succeeded(value) => ("succeeded", Some(value), None),
-        Outcome::Failed(error) => ("failed", None, Some(error.detail())),
-        Outcome::Unknown(error) => ("unknown", None, Some(error.detail())),
-    };
     let prepared = active.prepare(tx, auth, lease).await?;
     if let Some(call) = active.broker_call_id {
-        let row = tx
-            .query_one("SELECT state,result FROM calls WHERE id=$1", &[&call])
-            .await?;
-        let call_state: String = row.get("state");
-        let saved: Option<Value> = row.get("result");
-        if state == "failed"
-            || (call_state == "succeeded") != (state == "succeeded")
-            || (state == "succeeded"
-                && saved.as_ref().and_then(|v| v.get("output")) != output.as_ref())
-        {
+        let matches = match (&outcome, linked_outcome(tx, lease, call).await?) {
+            (Outcome::Succeeded(value), Outcome::Succeeded(saved)) => value == &saved,
+            (Outcome::Failed(error), Outcome::Failed(saved)) => error.detail() == saved.detail(),
+            (Outcome::Unknown(_), Outcome::Unknown(_)) => true,
+            _ => false,
+        };
+        if !matches {
             return Err(Error::conflict(
                 "Task outcome does not match the linked Broker Call",
             ));
         }
     }
+    let (state, output, error) = match outcome {
+        Outcome::Succeeded(value) => ("succeeded", Some(value), None),
+        Outcome::Failed(error) => ("failed", None, Some(error.detail())),
+        Outcome::Unknown(error) => ("unknown", None, Some(error.detail())),
+    };
     if active.state == state && active.row.get::<_, String>("step_state") == state {
         let matches = if let Some(output) = &output {
             let saved: Option<Value> = tx

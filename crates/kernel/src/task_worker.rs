@@ -5,7 +5,6 @@ use crate::{
     error::{Error, Result},
     task_engine::{self, Lease, Outcome, WorkerCall},
 };
-use axum::http::StatusCode;
 use serde_json::Value;
 use std::{
     future::Future,
@@ -13,7 +12,6 @@ use std::{
     time::Duration,
 };
 use tokio::time::{self, Instant, MissedTickBehavior};
-use uuid::Uuid;
 
 const IDLE_DELAY: Duration = Duration::from_secs(1);
 const HEARTBEAT: Duration = Duration::from_secs(10);
@@ -176,21 +174,9 @@ async fn finish(app: &App, lease: &Lease, invocation: Result<Value>) -> Result<(
     if stopping(app) {
         return Ok(());
     }
-    let outcome = match task_engine::broker_call(&tx, lease).await? {
+    let outcome = match task_engine::broker_outcome(&tx, lease).await? {
         WorkerCall::Canceled => return Ok(()),
-        WorkerCall::Linked(call, state, result) => {
-            Some(match durable_output(call, &state, result) {
-                Some(output) => Outcome::Succeeded(output),
-                None => Outcome::Unknown(
-                    Error::new(
-                        "OUTCOME_UNKNOWN",
-                        "Task Call has no confirmed result",
-                        StatusCode::CONFLICT,
-                    )
-                    .with_resource(call),
-                ),
-            })
-        }
+        WorkerCall::Linked(outcome) => Some(outcome),
         WorkerCall::Unlinked => match invocation {
             // Transient admission failures leave an undispatched lease for
             // expiry to reconcile under the Task's existing attempt budget.
@@ -221,14 +207,4 @@ async fn finish(app: &App, lease: &Lease, invocation: Result<Value>) -> Result<(
     }
     tx.commit().await?;
     Ok(())
-}
-
-fn durable_output(call: Uuid, state: &str, result: Option<Value>) -> Option<Value> {
-    let mut result = result?;
-    if state != "succeeded"
-        || result.get("call_id").and_then(Value::as_str)?.parse().ok() != Some(call)
-    {
-        return None;
-    }
-    result.as_object_mut()?.remove("output")
 }
