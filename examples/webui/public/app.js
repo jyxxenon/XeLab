@@ -392,6 +392,16 @@ async function loadApp(win) {
   win.content.replaceChildren(state('loading','正在读取核心…'));
   try { await win.app.render(win); } catch (error) { if (windows.has(win.id)) win.content.replaceChildren(toolbar(win,win.app.title),failure(error)); }
 }
+// The editor sends timeout_ms to core as the business deadline. Core may
+// finish authorization reads and settle the Call just after that deadline
+// (#82), so wait for a bounded settlement margin before aborting and hiding a
+// real result. This mirrors the bridge host; ApiClient's default stays exact.
+function skillWaitBudget(body) {
+  const business = Number.isInteger(body?.timeout_ms) && body.timeout_ms >= 100 && body.timeout_ms <= 300000
+    ? body.timeout_ms
+    : 120000;
+  return Math.min(business + 3 * 10000 + 2000, 600000);
+}
 function editor(title, operation, {params={}, initial={}, etag, body=true, note='操作将以当前用户和本客户端授权提交；服务端会重新鉴权。'} = {}) {
   return openWindow({id:`editor-${operation}`,title,render:async win => {
     const key = crypto.randomUUID();
@@ -404,7 +414,9 @@ function editor(title, operation, {params={}, initial={}, etag, body=true, note=
       submit.disabled = true;
       outcome.replaceChildren(state('loading','请求中…','请保留原请求键，网络失败不等于操作回滚。'));
       try {
-        const result = await request(operation,{params,body:value,etag,idempotencyKey:key,signal:win.controller.signal});
+        const options={params,body:value,etag,idempotencyKey:key,signal:win.controller.signal};
+        if(operation==='invokeSkill')options.waitBudgetMs=skillWaitBudget(value);
+        const result = await request(operation,options);
         outcome.replaceChildren(node('p',{},'核心已返回以下实际结果；异步 Operation 尚需检查其终态。'),raw(result.data));
       } catch (error) { outcome.replaceChildren(failure(error)); }
       finally { submit.disabled = Boolean(win.credentialChanged); }
