@@ -190,11 +190,15 @@ impl CapabilityService for Probe {
     ) -> Result<Response<rpc::InvokeResponse>, Status> {
         self.record(&request)?;
         let request = request.into_inner();
-        Ok(Response::new(rpc::InvokeResponse {
+        // The same success fixture also builds with additive protocol fields.
+        #[allow(clippy::needless_update)]
+        let response = rpc::InvokeResponse {
             call_id: request.call_id,
             output_json: request.input_json,
             output_digest: request.input_digest,
-        }))
+            ..Default::default()
+        };
+        Ok(Response::new(response))
     }
 
     async fn invoke_stream(
