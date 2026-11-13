@@ -164,7 +164,7 @@ pub(super) async fn record(
     Ok(())
 }
 
-pub(super) fn replay(call: Uuid, detail: Option<Value>, status: i32) -> Result<Error> {
+pub(crate) fn replay(call: Uuid, detail: Option<Value>, status: i32) -> Result<Error> {
     let invalid = || Error::conflict("Saved terminal failure is unavailable").with_resource(call);
     let detail = detail.ok_or_else(invalid)?;
     let code = detail["code"].as_str().ok_or_else(invalid)?;

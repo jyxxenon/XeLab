@@ -48,6 +48,8 @@ mod platform_versioned;
 
 #[path = "support/m4.rs"]
 mod m4;
+#[path = "support/oci_task.rs"]
+mod oci_task;
 #[path = "support/ordinary_effects.rs"]
 mod ordinary_effects;
 #[path = "support/upgrades.rs"]
@@ -788,6 +790,28 @@ async fn signed_oci_plugin_runs_through_the_management_api_and_recovers() {
         fixed_skill.1["call"]["provider_instance_id"],
         python_instance.to_string()
     );
+    let task_message = json!({"message":"fixed Capability Skill from an OCI Task"});
+    let task_call = oci_task::run(
+        &app,
+        &router,
+        token,
+        oci_task::TaskCase {
+            skill: skill.parse().unwrap(),
+            expected_instance: instance,
+            reference_call: contracts::id(&fixed_skill.1["call"], "call_id").unwrap(),
+            input_mapping: json!({"message":{"task_input":"/message"}}),
+            input: task_message.clone(),
+            expected_output: task_message,
+            suffix: "capability",
+        },
+    )
+    .await;
+    let task_contract: Value = c
+        .query_one("SELECT contract FROM calls WHERE id=$1", &[&task_call])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(task_contract, fixed_skill.1["call"]["contract"]);
     let python_input = json!({"contract":manifest["capabilities"][0]["contract"],"input":{"message":"hello OCI"},"provider_deployment_id":python_deployment,"timeout_ms":10000});
     let python_result = api(
         &router,
@@ -1346,6 +1370,24 @@ async fn signed_oci_plugin_runs_through_the_management_api_and_recovers() {
     let summary = frozen.export_metadata(&mut metadata).await.unwrap();
     assert_eq!(summary.bytes, metadata.len() as u64);
     assert!(summary.rows > 0);
+    let history = c
+        .query_one(
+            "SELECT t.state AS task_state,t.output,s.state AS step_state,a.state AS attempt_state,
+                    c.state AS call_state
+             FROM attempts a JOIN task_steps s ON s.id=a.step_id
+             JOIN tasks t ON t.id=s.task_id JOIN calls c ON c.id=a.broker_call_id
+             WHERE c.id=$1",
+            &[&task_call],
+        )
+        .await
+        .unwrap();
+    for state in ["task_state", "step_state", "attempt_state", "call_state"] {
+        assert_eq!(history.get::<_, String>(state), "succeeded", "{state}");
+    }
+    assert_eq!(
+        history.get::<_, Value>("output"),
+        json!({"probe":{"message":"fixed Capability Skill from an OCI Task"}})
+    );
     println!("Offline source: real signed OCI Drain/stop, exclusive leases, image-index verification and consistent metadata export passed (not off-host acceptance)");
     drop(frozen);
     // Exercise the complete capture driver against the CI's real local S3

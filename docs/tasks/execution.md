@@ -20,6 +20,8 @@ fence 保护平台元数据提交，不自动阻止外部系统副作用。外�
 
 验证当前授权与租约 → 校验输出契约 → 写 Attempt/Step 终态及输出引用 → 使依赖满足的下游步骤 ready → 写 outbox → 提交。大结果先写不可变 Blob，再提交引用，失败时未引用对象由 GC 处理。
 
+同步 Capability 步骤使用关联 Call 的持久结算。经过协商和校验的一元业务拒绝使 Attempt、TaskStep 和 Task 进入 failed。传输中断或缺少该次调用的终态证据时，保留 unknown。
+
 ## 取消
 
 Task 先进入 cancel_requested，停止领取新步骤，通知活动插件，处理可取消子调用。全部活动步骤终止后 task=canceled；若外部结果仍不明，保留 unknown 步骤，不能假装全部副作用已撤销。

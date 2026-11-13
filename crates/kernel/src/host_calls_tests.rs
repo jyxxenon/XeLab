@@ -120,10 +120,27 @@ async fn skill(f: &Fixture, deployment: Uuid) -> (Uuid, Value) {
     skill_with_timeout(f, deployment, 30000).await
 }
 
+async fn skill_with_health_updates(
+    f: &Fixture,
+    deployment: Uuid,
+    refresh_health: bool,
+) -> (Uuid, Value) {
+    register_test_skill(f, deployment, 30000, refresh_health).await
+}
+
 async fn skill_with_timeout(
     f: &Fixture,
     deployment: Uuid,
     maximum_timeout_ms: u64,
+) -> (Uuid, Value) {
+    register_test_skill(f, deployment, maximum_timeout_ms, true).await
+}
+
+async fn register_test_skill(
+    f: &Fixture,
+    deployment: Uuid,
+    maximum_timeout_ms: u64,
+    refresh_health: bool,
 ) -> (Uuid, Value) {
     let c = f.app.db.connect().await.unwrap();
     let row = c
@@ -174,7 +191,9 @@ async fn skill_with_timeout(
     .await
     .unwrap();
     c.execute("INSERT INTO provider_records(instance_id,name,version,availability,features,observed_generation,observed_at) VALUES($1,$2,$3,'ready','[]',7,now())",&[&instance,&target["name"].as_str().unwrap(),&target["version"].as_str().unwrap()]).await.unwrap();
-    fixture_health(f, instance);
+    if refresh_health {
+        fixture_health(f, instance);
+    }
     (id, definition)
 }
 
@@ -731,6 +750,9 @@ mod capability_transport;
 
 #[path = "host_candidates_expiry_tests.rs"]
 mod candidates_expiry;
+
+#[path = "host_task_broker_tests.rs"]
+mod task_broker;
 
 #[tokio::test]
 async fn required_host_proxy_rules_need_complete_signed_current_approval() {
