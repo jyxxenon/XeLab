@@ -45,6 +45,28 @@ fn invalid_task() -> Error {
 }
 
 pub(crate) async fn validate(c: &(impl GenericClient + Sync)) -> Result<()> {
+    let live_on_terminal: bool = c
+        .query_one(
+            "SELECT EXISTS (
+                 SELECT 1 FROM attempts a JOIN task_steps s ON s.id=a.step_id
+                 JOIN tasks t ON t.id=s.task_id
+                 WHERE a.state IN ('leased','running') AND
+                       (s.state IN ('succeeded','failed','canceled') OR
+                        t.state IN ('succeeded','failed','canceled'))
+             ) OR EXISTS (
+                 SELECT 1 FROM skill_batch_items i JOIN skill_batches b ON b.id=i.batch_id
+                 WHERE i.state='running' AND b.state IN ('succeeded','partially_succeeded','failed','canceled')
+             )",
+            &[],
+        )
+        .await?
+        .get(0);
+    if live_on_terminal {
+        return Err(Error::conflict(
+            "Task admission ledger has a live attempt on a terminal step or a live batch item on a terminal batch",
+        ));
+    }
+
     let mut after: Option<Uuid> = None;
     loop {
         let rows = c.query(

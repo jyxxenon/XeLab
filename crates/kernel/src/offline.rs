@@ -466,21 +466,6 @@ async fn source_preflight(c: &(impl GenericClient + Sync)) -> Result<()> {
     crate::webui::validate_snapshot(c).await?;
     crate::events::snapshot::validate_snapshot(c).await?;
     crate::tasks::snapshot::validate(c).await?;
-    for name in [
-        "schedules",
-        "micro_plugins",
-        "extension_plugins",
-        "skill_batches",
-    ] {
-        if c.query_one(&format!("SELECT EXISTS(SELECT 1 FROM {name})"), &[])
-            .await?
-            .get::<_, bool>(0)
-        {
-            return Err(Error::conflict(
-                "Offline snapshot does not yet support this platform profile",
-            ));
-        }
-    }
     Ok(())
 }
 fn sync(file: &File) -> Result<()> {
@@ -556,6 +541,7 @@ fn cgroup_ids() -> Result<Vec<Uuid>> {
 mod tests {
     use super::*;
     use crate::backups::tests::Fixture;
+    use serde_json::json;
     #[tokio::test]
     async fn actual_postgres_source_rejects_a_ready_allocation_for_a_deleted_volume() {
         // Metadata-only orphan regression, never a physical source proof.
@@ -592,7 +578,7 @@ mod tests {
         let Some(f) = Fixture::new().await else {
             return;
         };
-        let c = f.app.db.connect().await.unwrap();
+        let mut c = f.app.db.connect().await.unwrap();
         assert!(source_preflight(&c).await.is_err());
         c.batch_execute("UPDATE storage_recovery_jobs SET state='failed'; UPDATE backups SET state='failed'; DELETE FROM deployment_storage_holds; DELETE FROM volume_holds").await.unwrap();
         assert!(
@@ -608,15 +594,130 @@ mod tests {
             .await
             .unwrap()
             .get(0);
-        let workflow = Uuid::new_v4();
-        c.execute("INSERT INTO workflows(id,owner_id,name,version,spec,status,created_at,updated_at) VALUES($1,$2,'invalid source workflow',1,'{}','active',now(),now())",&[&workflow,&owner]).await.unwrap();
+        let invalid_workflow = Uuid::new_v4();
+        c.execute("INSERT INTO workflows(id,owner_id,name,version,spec,status,created_at,updated_at) VALUES($1,$2,'invalid source workflow',1,'{}','active',now(),now())", &[&invalid_workflow,&owner]).await.unwrap();
         assert_eq!(
             source_preflight(&c).await.unwrap_err().code,
             "STATE_CONFLICT"
         );
-        c.execute("DELETE FROM workflows WHERE id=$1", &[&workflow])
+        c.execute("DELETE FROM workflows WHERE id=$1", &[&invalid_workflow])
             .await
             .unwrap();
+
+        // Workflow/task/schedule/plugin metadata is ordinary snapshot data:
+        // rows must not block the export; a corrupt admission ledger must.
+        let delegation = Uuid::new_v4();
+        let batch = Uuid::new_v4();
+        let installation = Uuid::new_v4();
+        let skill = Uuid::new_v4();
+        c.execute("INSERT INTO execution_delegations(id,subject_id,maximum_rules,run_as,expires_at,status,created_at) VALUES($1,$2,'[]','user',now()+interval '1 hour','active',now())",&[&delegation,&owner]).await.unwrap();
+        let schedule = Uuid::new_v4();
+        c.execute("INSERT INTO schedules(id,owner_id,spec,delegation_id,next_fire_at,created_at,updated_at) VALUES($1,$2,'{}',$3,now()+interval '1 day',now(),now())",&[&schedule,&owner,&delegation]).await.unwrap();
+        c.execute("INSERT INTO micro_plugins(id,owner_id,name,display_name,status,created_at,updated_at) VALUES($1,$2,'snapshot-micro','snapshot micro','active',now(),now())",&[&Uuid::new_v4(),&owner]).await.unwrap();
+        c.execute("INSERT INTO extension_plugins(id,owner_id,name,display_name,status,created_at,updated_at) VALUES($1,$2,'snapshot-extension','snapshot extension','active',now(),now())",&[&Uuid::new_v4(),&owner]).await.unwrap();
+        let mut manifest: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/secret-manifest.json")).unwrap();
+        let publisher: Uuid = c
+            .query_one("SELECT id FROM publishers ORDER BY id LIMIT 1", &[])
+            .await
+            .unwrap()
+            .get(0);
+        manifest["publisher_id"] = json!(publisher);
+        let cap = manifest["capabilities"][0].clone();
+        let definition = json!({"name":"org.xelab.echo-python.echo","version":"1.0.0","description":"Echo a bounded message","input_schema":cap["input_schema"],"output_schema":cap["output_schema"],"stream_item_schema":cap["stream_item_schema"],"target":{"kind":"capability","plugin_id":manifest["plugin_id"],"contract":cap["contract"]},"mapping":"identity","maximum_timeout_ms":30000,"input_blobs":false,"tags":[]});
+        manifest["skills"] = json!([definition]);
+        let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        let hash = digest(&manifest_bytes);
+        let plugin_id = manifest["plugin_id"].as_str().unwrap().to_owned();
+        let plugin_version = manifest["version"].as_str().unwrap().to_owned();
+        c.execute("INSERT INTO installations(id,plugin_id,version,publisher_id,image_digest,manifest_digest,manifest,state,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$5,$6,'installed',now(),now())", &[&installation,&plugin_id,&plugin_version,&publisher,&hash,&manifest]).await.unwrap();
+        let contract = &cap["contract"];
+        let contract_name = contract["name"].as_str().unwrap().to_owned();
+        let contract_version = contract["version"].as_str().unwrap().to_owned();
+        let contract_digest = contract["schema_digest"].as_str().unwrap().to_owned();
+        c.execute(
+            "INSERT INTO capability_contracts(name,version,schema_digest,spec) VALUES($1,$2,$3,$4)",
+            &[&contract_name, &contract_version, &contract_digest, &cap],
+        )
+        .await
+        .unwrap();
+        let definition_hash = crate::skills::definition_digest(&definition).unwrap();
+        let definition_name = definition["name"].as_str().unwrap().to_owned();
+        c.execute("INSERT INTO skills(id,name,version,installation_id,created_by,definition,definition_digest,enabled,created_at,updated_at) VALUES($1,$2,'1.0.0',$3,$4,$5,$6,true,now(),now())", &[&skill,&definition_name,&installation,&owner,&definition,&definition_hash]).await.unwrap();
+        c.execute("INSERT INTO skill_batches(id,owner_id,subject_id,delegation_id,skill_id,installation_id,definition_digest,state,request_spec,counts,total_items,max_parallel,failure_policy,run_as,deadline_at,created_at,updated_at) VALUES($1,$2,$2,$3,$4,$5,$6,'queued','{}','{\"queued\":1}'::jsonb,1,1,'stop','user',now()+interval '1 hour',now(),now())",&[&batch,&owner,&delegation,&skill,&installation,&definition_hash]).await.unwrap();
+        c.execute("INSERT INTO skill_batch_items(batch_id,item_id,item_index,input,input_digest,input_bytes,idempotency_key,state) VALUES($1,'1',0,'{}','sha256:'||repeat('5',64),2,'snapshot-item-key','queued')",&[&batch]).await.unwrap();
+
+        let tx = c.transaction().await.unwrap();
+        let ctx = f
+            .app
+            .auth
+            .authenticate(&tx, &f.token, "127.0.0.1".parse().unwrap(), Uuid::new_v4())
+            .await
+            .unwrap();
+        let params = std::collections::HashMap::new();
+        let workflow_spec = json!({"name":"snapshot source", "input_schema":{"type":"object"},
+            "steps":[{"id":"root","contract":contract,"depends_on":[],"input_mapping":{},"timeout_ms":1000}]});
+        let (workflow, status) = crate::workflows::execute(
+            &tx,
+            &f.app.auth,
+            &ctx,
+            "createWorkflow",
+            &params,
+            &workflow_spec,
+            &axum::http::HeaderMap::new(),
+            "",
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, 201);
+        let submission = json!({"workflow_id":workflow["id"],"input":{}});
+        let (task, status) = crate::tasks::execute(
+            &tx,
+            &f.app.auth,
+            &ctx,
+            "createTask",
+            &params,
+            &submission,
+            "",
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, 201);
+        let task = crate::contracts::id(&task, "id").unwrap();
+        tx.execute("INSERT INTO schedule_fires(schedule_id,scheduled_at,task_id,outcome) VALUES($1,now(),$2,'created')",&[&schedule,&task]).await.unwrap();
+        tx.commit().await.unwrap();
+
+        source_preflight(&c).await.unwrap();
+        // An active attempt on a terminal step is a corrupt admission ledger,
+        // not a restorable source; the export must refuse it.
+        let tx = c.transaction().await.unwrap();
+        let step: Uuid = tx.query_one("UPDATE task_steps SET state='succeeded',attempt_count=1,fence=1,updated_at=now() WHERE task_id=$1 RETURNING id", &[&task]).await.unwrap().get(0);
+        tx.execute("INSERT INTO attempts(id,step_id,number,execution_id,idempotency_key,fence,lease_expires_at,state,created_at,updated_at) VALUES($1,$2,1,$3,$4,1,now()+interval '30 seconds','running',now(),now())",&[&Uuid::new_v4(),&step,&Uuid::new_v4(),&format!("task-step:{step}")]).await.unwrap();
+        assert_eq!(
+            source_preflight(&tx).await.unwrap_err().code,
+            "STATE_CONFLICT"
+        );
+        tx.rollback().await.unwrap();
+
+        let tx = c.transaction().await.unwrap();
+        tx.execute(
+            "UPDATE skill_batches SET state='succeeded' WHERE id=$1",
+            &[&batch],
+        )
+        .await
+        .unwrap();
+        tx.execute(
+            "UPDATE skill_batch_items SET state='running' WHERE batch_id=$1",
+            &[&batch],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            source_preflight(&tx).await.unwrap_err().code,
+            "STATE_CONFLICT"
+        );
+        tx.rollback().await.unwrap();
+
         source_preflight(&c).await.unwrap();
         c.execute("INSERT INTO platform_recovery_state(recovery_id,backup_id,phase) VALUES($1,$2,'rebuilding')",&[&Uuid::new_v4(),&f.backup]).await.unwrap();
         assert!(source_preflight(&c).await.is_err());
