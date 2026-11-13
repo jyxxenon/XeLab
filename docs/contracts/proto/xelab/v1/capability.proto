@@ -17,11 +17,20 @@ message InvokeRequest {
   bytes input_json = 4;
   string input_digest = 5;
   string binding_id = 6;
+  // Unary CapabilityService.Invoke only. Zero requests the legacy response.
+  uint32 terminal_failure_version = 7;
 }
 message InvokeResponse {
   string call_id = 1;
   bytes output_json = 2; // 最大 16 MiB，并满足 output_schema。
   string output_digest = 3;
+  // Unary Invoke with a matching negotiated version. Output fields must be empty.
+  InvokeFailure terminal_failure = 4;
+}
+message InvokeFailure {
+  uint32 version = 1;
+  ContractRef contract = 2;
+  string code = 3; // Stable business error code. The kernel supplies the public detail.
 }
 message InvokeChunk {
   string call_id = 1;

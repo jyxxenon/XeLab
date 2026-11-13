@@ -297,6 +297,152 @@ class ShellBrowser(unittest.TestCase):
         self.assertEqual(self.custom_calls[1]["headers"]["if-match"], '"rev-2"')
         self.assertNotEqual(self.custom_calls[0]["headers"]["idempotency-key"], self.custom_calls[1]["headers"]["idempotency-key"])
 
+    def test_closed_launcher_cannot_open_window_after_reopening(self):
+        value = self.window_contribution()
+        self.fixture.open()
+        self.open_launcher()
+        launcher = self.page.locator("#launcher")
+        launch = launcher.get_by_role("button", name="启动贡献 " + value["spec"]["title"], exact=True)
+        original_button = launch.element_handle()
+        self.hold_widget_lookup = True
+        original_button.click()
+        for _ in range(250):
+            if self.held_widget_routes:
+                break
+            self.page.wait_for_timeout(20)
+        self.assertEqual(len(self.held_widget_routes), 1)
+        self.assertTrue(original_button.is_disabled())
+
+        self.page.keyboard.press("Escape")
+        launcher.wait_for(state="hidden")
+        active = self.fixture.app("系统状态")
+        active.get_by_text('"component-only"', exact=False).wait_for()
+        self.open_launcher()
+        search = launcher.locator("#app-search")
+        search.fill("settings")
+        self.hold_widget_lookup = False
+        self.held_widget_routes.pop().fallback()
+        # The detached button is re-enabled when its old handler has returned.
+        self.page.wait_for_function("button => !button.disabled", arg=original_button)
+        self.assertEqual(self.page.locator('.window[data-app^="plugin:"]').count(), 0)
+        self.assertTrue(launcher.is_visible())
+        self.assertEqual(search.input_value(), "settings")
+        self.assertTrue(search.evaluate("element => element === document.activeElement"))
+        self.assertEqual(self.page.locator("#toast").inner_text(), "")
+
+        search.fill(value["spec"]["title"])
+        launch.click()
+        launcher.wait_for(state="hidden")
+        window = self.page.locator('.window[data-app^="plugin:"]')
+        window.locator("iframe[src]").wait_for()
+        self.assertEqual(window.count(), 1)
+        self.assertTrue(window.locator(".window-title").evaluate("element => element === document.activeElement"))
+
+    def test_closed_launcher_cannot_submit_widget_after_preference_read(self):
+        value = contribution("late_widget", "widget")
+        self.fixture.contributions["late_widget"] = value
+        self.fixture.open()
+        self.open_launcher()
+        launcher = self.page.locator("#launcher")
+        launch = launcher.get_by_role("button", name="启动贡献 " + value["spec"]["title"], exact=True)
+        original_button = launch.element_handle()
+        self.fixture.hold_preferences = True
+        original_button.click()
+        for _ in range(250):
+            if self.fixture.pending_preferences:
+                break
+            self.page.wait_for_timeout(20)
+        self.assertEqual(len(self.fixture.pending_preferences), 1)
+        self.assertTrue(original_button.is_disabled())
+
+        self.page.get_by_role("button", name="关闭启动器", exact=True).click()
+        launcher.wait_for(state="hidden")
+        self.open_launcher()
+        self.fixture.hold_preferences = False
+        self.fixture.route(self.fixture.pending_preferences.pop())
+        self.page.wait_for_function("button => !button.disabled", arg=original_button)
+        self.assertEqual(self.fixture.saved["spec"]["widgets"], [])
+        self.assertEqual(self.custom_calls, [])
+        self.assertTrue(launcher.is_visible())
+        self.assertEqual(self.page.locator("#widgets iframe").count(), 0)
+        self.assertEqual(self.page.locator("#toast").inner_text(), "")
+
+        # An explicit new launch can submit once. Let its already-sent write
+        # finish after closing the dialog, without dismissing the next opening.
+        pending_writes = []
+
+        def hold_write(route):
+            if route.request.method == "PUT":
+                pending_writes.append(route)
+            else:
+                route.fallback()
+
+        self.page.route(desktop.CORE + "/api/platform/v1/me/ui-preferences", hold_write)
+        retry_button = launch.element_handle()
+        retry_button.click()
+        for _ in range(250):
+            if pending_writes:
+                break
+            self.page.wait_for_timeout(20)
+        self.assertEqual(len(pending_writes), 1)
+        self.assertTrue(retry_button.is_disabled())
+        self.page.get_by_role("button", name="关闭启动器", exact=True).click()
+        launcher.wait_for(state="hidden")
+        self.open_launcher()
+        pending_writes.pop().fallback()
+        self.page.wait_for_function("button => !button.disabled", arg=retry_button)
+        self.assertTrue(launcher.is_visible())
+        self.assertEqual(len(self.custom_calls), 1)
+        widgets = self.fixture.saved["spec"]["widgets"]
+        self.assertEqual([widget["contribution"]["contribution_id"] for widget in widgets], ["late_widget"])
+        self.page.locator("#widgets iframe[src]").wait_for()
+
+    def test_closed_launcher_cannot_send_widget_after_credential_refresh(self):
+        value = contribution("late_refresh", "widget")
+        self.fixture.contributions["late_refresh"] = value
+        self.page.clock.set_fixed_time("2026-11-01T12:00:00Z")
+        self.fixture.refresh_enabled = True
+        self.fixture.open(expires_ms=45000, refresh_token="component-refresh")
+        self.open_launcher()
+        launcher = self.page.locator("#launcher")
+        launch = launcher.get_by_role("button", name="启动贡献 " + value["spec"]["title"], exact=True)
+        original_button = launch.element_handle()
+        self.fixture.hold_preferences = True
+        original_button.click()
+        for _ in range(250):
+            if self.fixture.pending_preferences:
+                break
+            self.page.wait_for_timeout(20)
+        self.assertEqual(len(self.fixture.pending_preferences), 1)
+        self.assertTrue(original_button.is_disabled())
+
+        # The preflight already holds a response, but the PUT now needs a
+        # credential refresh before ApiClient can start the request.
+        self.page.clock.set_fixed_time("2026-11-01T12:00:16Z")
+        self.fixture.hold_preferences = False
+        self.fixture.hold_refresh = True
+        self.fixture.route(self.fixture.pending_preferences.pop())
+        for _ in range(250):
+            if self.fixture.pending_refresh:
+                break
+            self.page.wait_for_timeout(20)
+        self.assertEqual(len(self.fixture.pending_refresh), 1)
+        self.page.keyboard.press("Escape")
+        launcher.wait_for(state="hidden")
+        self.open_launcher()
+        self.fixture.hold_refresh = False
+        self.fixture.route(self.fixture.pending_refresh.pop())
+        self.page.wait_for_function("button => !button.disabled", arg=original_button)
+        self.assertEqual(len(self.custom_calls), 0)
+        self.assertEqual(self.fixture.saved["spec"]["widgets"], [])
+        self.assertTrue(launcher.is_visible())
+        self.assertTrue(self.page.get_by_role("button", name="退出", exact=True).is_visible())
+        launch.click()
+        launcher.wait_for(state="hidden")
+        self.assertEqual(len(self.custom_calls), 1)
+        widgets = self.fixture.saved["spec"]["widgets"]
+        self.assertEqual([widget["contribution"]["contribution_id"] for widget in widgets], ["late_refresh"])
+
     def test_pinned_digest_change_cannot_silently_open_new_version(self):
         value = self.window_contribution()
         self.fixture.open()

@@ -408,16 +408,7 @@ pub(crate) async fn bind_child(
         return Err(Error::denied());
     }
     let parent: Uuid = row.get("parent_call_id");
-    let ancestors=c.query("WITH RECURSIVE chain(id,depth) AS (SELECT $1::uuid,0 UNION ALL SELECT l.parent_call_id,c.depth+1 FROM chain c JOIN host_child_calls l ON l.child_call_id=c.id WHERE c.depth<16) SELECT c.provider_instance_id,chain.depth FROM chain JOIN calls c ON c.id=chain.id",&[&parent]).await?;
-    if ancestors.len() >= 16
-        || ancestors
-            .iter()
-            .any(|r| r.get::<_, Option<Uuid>>("provider_instance_id") == Some(instance))
-    {
-        return Err(Error::conflict(
-            "HostService child call cycle or depth limit",
-        ));
-    }
+    check_child_ancestry(c, parent, instance).await?;
     if let Some(provider) = row.get::<_, Option<Uuid>>("provider_deployment_id") {
         let actual: Uuid = c
             .query_one(
@@ -435,6 +426,40 @@ pub(crate) async fn bind_child(
         &[&call, &parent, &row.get::<_, Uuid>("id")],
     )
     .await?;
+    Ok(())
+}
+
+pub(crate) async fn check_queued_child(
+    c: &(impl GenericClient + Sync),
+    app: &App,
+    token: &str,
+    instance: Uuid,
+) -> Result<()> {
+    if !token.starts_with("host:") {
+        return Ok(());
+    }
+    let parent = c.query_opt(
+        "SELECT parent_call_id FROM host_call_tickets WHERE verification_digest=$1 AND expires_at>clock_timestamp()",
+        &[&app.auth.token_digest(token)],
+    ).await?.ok_or_else(Error::denied)?.get(0);
+    check_child_ancestry(c, parent, instance).await
+}
+
+async fn check_child_ancestry(
+    c: &(impl GenericClient + Sync),
+    parent: Uuid,
+    instance: Uuid,
+) -> Result<()> {
+    let ancestors=c.query("WITH RECURSIVE chain(id,depth) AS (SELECT $1::uuid,0 UNION ALL SELECT l.parent_call_id,c.depth+1 FROM chain c JOIN host_child_calls l ON l.child_call_id=c.id WHERE c.depth<16) SELECT c.provider_instance_id FROM chain JOIN calls c ON c.id=chain.id",&[&parent]).await?;
+    if ancestors.len() >= 16
+        || ancestors
+            .iter()
+            .any(|r| r.get::<_, Option<Uuid>>(0) == Some(instance))
+    {
+        return Err(Error::conflict(
+            "HostService child call cycle or depth limit",
+        ));
+    }
     Ok(())
 }
 
@@ -953,6 +978,9 @@ async fn prepare_capability(
     request: &rpc::InvokeRequest,
     streaming: bool,
 ) -> Result<Prepared> {
+    if request.terminal_failure_version != 0 {
+        return Err(Error::invalid("HostService uses the standard error status"));
+    }
     let context = context(request.context.as_ref())?;
     let call = uuid(&request.call_id)?;
     let contract = contract(
@@ -1136,6 +1164,7 @@ fn response(value: Value) -> Result<rpc::InvokeResponse> {
         call_id: contracts::string(value, "call_id")?.into(),
         output_digest: contracts::digest(&output),
         output_json: output,
+        terminal_failure: None,
     })
 }
 pub(crate) async fn invoke(

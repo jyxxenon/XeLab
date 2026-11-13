@@ -186,10 +186,13 @@ export class ApiClient {
   }
 
   async invoke(name, options = {}) {
-    if (!plain(options) || Object.keys(options).some(key => !['params', 'query', 'body', 'etag', 'idempotencyKey', 'signal', 'waitBudgetMs'].includes(key))) {
+    if (!plain(options) || Object.keys(options).some(key => !['params', 'query', 'body', 'etag', 'idempotencyKey', 'signal', 'waitBudgetMs', 'beforeFetch'].includes(key))) {
       throw new ApiError('INVALID_ARGUMENT', '未声明的管理请求选项。');
     }
-    const { params = {}, query = {}, body, etag, idempotencyKey, signal, waitBudgetMs } = options;
+    const { params = {}, query = {}, body, etag, idempotencyKey, signal, waitBudgetMs, beforeFetch } = options;
+    if (beforeFetch !== undefined && typeof beforeFetch !== 'function') {
+      throw new ApiError('INVALID_ARGUMENT', '发送前检查必须是函数。');
+    }
     if (!Object.hasOwn(OPERATIONS, name)) throw new ApiError('METHOD_NOT_ALLOWED', '没有此公开管理操作。');
     const op = OPERATIONS[name];
     if (!plain(params) || !plain(query)) throw new ApiError('INVALID_ARGUMENT', '参数须为普通对象。');
@@ -235,6 +238,9 @@ export class ApiClient {
         : 10000;
     const deadline = AbortSignal.timeout(budget);
     const effectiveSignal = signal ? AbortSignal.any([signal, deadline]) : deadline;
+    // The caller can check its UI lifecycle after token refresh, immediately
+    // before dispatch. The hook has no access to the request or credentials.
+    beforeFetch?.();
     let response;
     try {
       response = await this.#fetch(url.href, {

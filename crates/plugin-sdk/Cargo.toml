@@ -1,0 +1,29 @@
+[package]
+name = "xelab-plugin-sdk"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+futures-util = "0.3"
+hyper-util = { version = "0.1", features = ["tokio"] }
+prost = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+tokio = { version = "1", features = ["net", "time"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = { version = "0.12", features = ["tls"] }
+tower = { version = "0.5", features = ["util"] }
+x509-parser = "0.16"
+zeroize = "1"
+
+[build-dependencies]
+tonic-build = "0.12"
+protoc-bin-vendored = "3"
+
+[dev-dependencies]
+rcgen = "0.13"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt", "sync"] }

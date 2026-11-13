@@ -1,5 +1,5 @@
 import {runtimeConfig} from './runtime-config.js';
-import {ApiClient} from './api.js';
+import {ApiClient,ApiError} from './api.js';
 import {OAuthSession} from './oauth.js';
 import {BridgeHost,validateContribution,sameContribution} from './bridge.js';
 
@@ -55,6 +55,8 @@ let launcherCursor = null;
 let launcherLoading = false;
 let launcherError = null;
 let launcherEpoch = 0;
+const launcher = $('#launcher');
+let launcherOpening = null;
 let layer = 10;
 let accountId = null;
 let preferences = null;
@@ -392,6 +394,16 @@ async function loadApp(win) {
   win.content.replaceChildren(state('loading','正在读取核心…'));
   try { await win.app.render(win); } catch (error) { if (windows.has(win.id)) win.content.replaceChildren(toolbar(win,win.app.title),failure(error)); }
 }
+// The editor sends timeout_ms to core as the business deadline. Core may
+// finish authorization reads and settle the Call just after that deadline
+// (#82), so wait for a bounded settlement margin before aborting and hiding a
+// real result. This mirrors the bridge host; ApiClient's default stays exact.
+function skillWaitBudget(body) {
+  const business = Number.isInteger(body?.timeout_ms) && body.timeout_ms >= 100 && body.timeout_ms <= 300000
+    ? body.timeout_ms
+    : 120000;
+  return Math.min(business + 3 * 10000 + 2000, 600000);
+}
 function editor(title, operation, {params={}, initial={}, etag, body=true, note='操作将以当前用户和本客户端授权提交；服务端会重新鉴权。'} = {}) {
   return openWindow({id:`editor-${operation}`,title,render:async win => {
     const key = crypto.randomUUID();
@@ -404,7 +416,9 @@ function editor(title, operation, {params={}, initial={}, etag, body=true, note=
       submit.disabled = true;
       outcome.replaceChildren(state('loading','请求中…','请保留原请求键，网络失败不等于操作回滚。'));
       try {
-        const result = await request(operation,{params,body:value,etag,idempotencyKey:key,signal:win.controller.signal});
+        const options={params,body:value,etag,idempotencyKey:key,signal:win.controller.signal};
+        if(operation==='invokeSkill')options.waitBudgetMs=skillWaitBudget(value);
+        const result = await request(operation,options);
         outcome.replaceChildren(node('p',{},'核心已返回以下实际结果；异步 Operation 尚需检查其终态。'),raw(result.data));
       } catch (error) { outcome.replaceChildren(failure(error)); }
       finally { submit.disabled = Boolean(win.credentialChanged); }
@@ -510,12 +524,12 @@ async function clients(win) {
   const signal = win.controller.signal;
   await listSection(win,{title:'UI 客户端',operation:'listClients',actions:[button('注册公共客户端',()=>editor('注册 UI Client','createClient',{initial:{name:'',plugin_id:'',redirect_uris:[],allowed_origins:[],maximum_rules:[]}})),button('默认界面',async()=> { try { const result=await request('getDefaultUi',{signal});if(signal.aborted||!windows.has(win.id))return;editor('设置默认界面','setDefaultUi',{initial:{deployment_id:result.data.deployment_id??null},etag:result.etag||revision(result.data),note:'设为 null 关闭根路径跳转。修改前请保留部署说明中的内核 CLI 恢复命令。'}); }catch(error){if(!signal.aborted&&windows.has(win.id))toastError(error);} })],renderItem:item=>node('article',{class:'card'},node('h3',{},item.spec.name),node('p',{},item.status),node('p',{class:'code'},item.client_id),node('p',{},item.spec.allowed_origins.join(', ')),node('div',{class:'toolbar'},button('详情',()=>details('Client 信任范围',item)),button('修改',()=>editor('修改 Client','updateClient',{params:{client_id:item.id},initial:item.spec,etag:revision(item),note:'修改将作废旧授权请求与本Client现有凭证族。禁用Client不能通过修改复活。'})),button('禁用',()=>editor('禁用 Client','disableClient',{params:{client_id:item.id},body:false,etag:revision(item),note:'禁用会撤销本Client凭证族；保留核心 API/CLI 恢复路径。'}))))});
 }
-async function openContribution(value){
+async function openContribution(value,sourceCurrent){
   if(!accountId||!oauth.loggedIn){toast('打开页面需要当前账户的 session.read 权限以固定桥接主体。');return null;}
   const current=await request('getUiContribution',{params:{deployment_id:value.deployment_id,contribution_id:value.spec.id}});
   const fixed=validateContribution(current.data,{parentOrigin:location.origin,coreOrigin:runtimeConfig.core_origin});
   if(!sameContribution(value,fixed))throw new Error('贡献或权限已改变，请刷新后明确打开当前版本。');
-  return openCheckedContribution(fixed);
+  return openCheckedContribution(fixed,sourceCurrent);
 }
 // Internal bridge targets have already passed a fresh core read and all pinned
 // identity checks. Actual iframe mounting still revalidates the target below.
@@ -588,13 +602,28 @@ async function mountContribution(container,fixed,owner){
   await bridge.mount();
   bridge.setVisible(document.visibilityState==='visible'&&!owner.minimized&&!owner.element.hidden);
 }
-async function preferenceMutation(intentId,mutate){
+async function preferenceMutation(intentId,mutate,sourceCurrent){
+  const epoch=sessionEpoch;
+  const current=()=>epoch===sessionEpoch&&(sourceCurrent?.()??true);
+  if(!current())return;
   let intent=widgetIntents.get(intentId);
-  if(!intent){const current=await request('getMyUiPreferences');const body=structuredClone(current.data.spec);mutate(body);intent={body,etag:current.etag||revision(current.data),key:crypto.randomUUID()};widgetIntents.set(intentId,intent);}
-  const saved=await request('setMyUiPreferences',{body:intent.body,etag:intent.etag,idempotencyKey:intent.key});
+  if(!intent){
+    const loaded=await request('getMyUiPreferences');
+    if(!current())return;
+    const body=structuredClone(loaded.data.spec);
+    const onDispatch=mutate(body);
+    intent={body,etag:loaded.etag||revision(loaded.data),key:crypto.randomUUID(),onDispatch};
+  }
+  const beforeFetch=()=>{
+    if(!current())throw new ApiError('CANCELED','偏好操作的来源已关闭。');
+    // Preserve the exact write intent from the first dispatch through retries.
+    intent.onDispatch?.();
+    widgetIntents.set(intentId,intent);
+  };
+  const saved=await request('setMyUiPreferences',{body:intent.body,etag:intent.etag,idempotencyKey:intent.key,beforeFetch});
   widgetIntents.delete(intentId);preferences=saved.data;preferenceEtag=saved.etag||revision(saved.data);preview=structuredClone(saved.data.spec);applyTheme();await renderWidgets();await resolveDockPins();renderLauncher();
 }
-async function widgetMutation(intentId,mutate){return preferenceMutation(intentId,body=>mutate(body.widgets));}
+async function widgetMutation(intentId,mutate,sourceCurrent){return preferenceMutation(intentId,body=>mutate(body.widgets),sourceCurrent);}
 const contributionKey=value=>({deployment_id:value.deployment_id,contribution_id:value.spec.id});
 const pinId=key=>`${key.deployment_id}:${key.contribution_id}`;
 const isPinned=value=>preview.dock.pinned.some(key=>pinId(key)===pinId(contributionKey(value)));
@@ -647,7 +676,7 @@ async function resolveDockPins() {
     }
   }));
 }
-async function addWidget(value){
+async function addWidget(value,sourceCurrent){
   if(!accountId||!oauth.loggedIn){toast('组件需要读取当前账户身份与核心偏好。');return;}
   const current=await request('getUiContribution',{params:{deployment_id:value.deployment_id,contribution_id:value.spec.id}});
   const fixed=validateContribution(current.data,{parentOrigin:location.origin,coreOrigin:runtimeConfig.core_origin});
@@ -658,8 +687,9 @@ async function addWidget(value){
     const id=crypto.randomUUID(),placement={instance_id:id,contribution:contributionKey(fixed),column:0,row:0,columns:fixed.spec.widget.columns,rows:fixed.spec.widget.rows};
     while(items.some(other=>overlaps(placement,other))&&placement.row<255)placement.row++;
     if(items.some(other=>overlaps(placement,other)))throw new Error('当前网格没有可用位置，请先调整组件布局。');
-    widgetPinned.set(id,fixed);items.push(placement);
-  });
+    items.push(placement);
+    return()=>widgetPinned.set(id,fixed);
+  },sourceCurrent);
 }
 function overlaps(left,right){return left.column<right.column+right.columns&&left.column+left.columns>right.column&&left.row<right.row+right.rows&&left.row+left.rows>right.row;}
 function editWidget(placement,fixed) {
@@ -1017,19 +1047,30 @@ function renderDock() {
 }
 function renderLauncher() {
   const search=$('#app-search').value.trim().toLowerCase();
-  $('#app-grid').replaceChildren(...apps.filter(app=>app.title.toLowerCase().includes(search)||app.id.includes(search)).map(app=>button('',()=>{$('#launcher').close();openWindow(app);},{'aria-label':`启动${app.title}`})));
+  $('#app-grid').replaceChildren(...apps.filter(app=>app.title.toLowerCase().includes(search)||app.id.includes(search)).map(app=>button('',()=>{launcher.close();openWindow(app);},{'aria-label':`启动${app.title}`})));
   for (const [index,entry] of [...$('#app-grid').children].entries()) {
     const matching=apps.filter(app=>app.title.toLowerCase().includes(search)||app.id.includes(search))[index];
     entry.append(appIcon(matching.icon),node('span',{},matching.title));
   }
-  for(const[ index,win]of[...windows.values()].entries())if(win.app.title.toLowerCase().includes(search))$('#app-grid').append(button(`↥ ${win.app.title}`,()=>{$('#launcher').close();focus(win);win.element.querySelector('.window-title')?.focus();},{'aria-label':`聚焦窗口${index+1} ${win.app.title}`}));
+  for(const[ index,win]of[...windows.values()].entries())if(win.app.title.toLowerCase().includes(search))$('#app-grid').append(button(`↥ ${win.app.title}`,()=>{launcher.close();focus(win);win.element.querySelector('.window-title')?.focus();},{'aria-label':`聚焦窗口${index+1} ${win.app.title}`}));
   if(!oauth.loggedIn)return;
   const found=launcherItems.filter(item=>`${item.spec.title} ${item.spec.id} ${item.plugin_id}`.toLowerCase().includes(search));
   for(const item of found){
     const launch=button(item.spec.kind==='widget'?'添加桌面组件':'打开隔离窗口',async()=>{
+      const opening=launcherOpening,epoch=sessionEpoch;
+      // A delayed response belongs to the opening that started the action.
+      const current=()=>launcher.open&&launcherOpening===opening&&sessionEpoch===epoch;
       launch.disabled=true;
-      try{if(item.spec.kind==='widget')await addWidget(item);else await openContribution(item);$('#launcher').close();}
-      catch(error){toastError(error);}finally{launch.disabled=item.availability!=='ready';}
+      try{
+        let win;
+        if(item.spec.kind==='widget')await addWidget(item,current);
+        else win=await openContribution(item,current);
+        if(current()){
+          launcher.close();
+          win?.element.querySelector('.window-title')?.focus();
+        }
+      }catch(error){if(current())toastError(error);}
+      finally{launch.disabled=item.availability!=='ready';}
     },{disabled:item.availability!=='ready','aria-label':`启动贡献 ${item.spec.title}`});
     $('#app-grid').append(node('article',{class:'launcher-contribution card'},node('h3',{},item.spec.title),node('p',{},`${item.spec.kind} · ${item.availability}`),node('p',{class:'code'},`${item.plugin_id} · ${item.deployment_id}`),node('p',{},item.reason_codes.join(' · ')),launch,item.spec.kind==='window'?pinControl(item):null));
   }
@@ -1054,31 +1095,34 @@ async function loadLauncher(reset) {
   }catch(error){if(epoch===launcherEpoch)launcherError=error;}
   finally{if(epoch===launcherEpoch){launcherLoading=false;renderLauncher();}}
 }
-let launcherReturnFocus=null;
 function openLauncher(){
+  if(launcher.open)return;
   renderLauncher();
-  launcherReturnFocus=document.activeElement instanceof HTMLElement?document.activeElement:null;
-  $('#launcher').showModal();
+  launcherOpening={returnFocus:document.activeElement instanceof HTMLElement?document.activeElement:null};
+  launcher.showModal();
   $('#app-search').focus();
   loadLauncher(true);
 }
-$('#launcher').addEventListener('close',()=>{
+launcher.addEventListener('close',()=>{
+  const opening=launcherOpening;
   // Restore after the UA finishes moving focus out of the closed dialog; a launch action
   // has already focused the new window, which must not be stolen back.
   setTimeout(()=>{
+    if(launcher.open||launcherOpening!==opening)return;
     const active=document.activeElement;
-    if(active&&active!==document.body&&!$('#launcher').contains(active))return;
-    const target=launcherReturnFocus&&document.contains(launcherReturnFocus)?launcherReturnFocus:$('#launcher-toggle');
+    if(active&&active!==document.body&&!launcher.contains(active))return;
+    const previous=opening?.returnFocus;
+    const target=previous&&document.contains(previous)?previous:$('#launcher-toggle');
     target.focus();
   },0);
 });
 $('#launcher-toggle').addEventListener('click',openLauncher);
-$('#launcher-close').addEventListener('click',()=>$('#launcher').close());
+$('#launcher-close').addEventListener('click',()=>launcher.close());
 $('#app-search').addEventListener('input',renderLauncher);
 $('#theme-toggle').addEventListener('click',()=>openWindow(apps.find(app=>app.id==='settings')));
 $('#welcome-login').addEventListener('click',login);
 $('#login').addEventListener('click',()=> { if(oauth.loggedIn){oauth.logout();clearPrivateViews();toast('已退出本WebUI客户端；内核可信登录会话由内核独立管理。');}else login(); });
-document.addEventListener('keydown',event=> {if(event.key==='Escape'&&$('#launcher').open)$('#launcher').close();});
+document.addEventListener('keydown',event=> {if(event.key==='Escape'&&launcher.open)launcher.close();});
 function tick() {$('#clock').textContent=new Intl.DateTimeFormat('zh-CN',{hour:'2-digit',minute:'2-digit'}).format(new Date());}
 tick();setInterval(tick,30000);
 renderDock();renderLauncher();applyTheme();
