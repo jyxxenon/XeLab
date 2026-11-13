@@ -37,6 +37,8 @@ use xelab_kernel::{
     tls,
 };
 
+#[path = "support/oci_task.rs"]
+mod oci_task;
 #[path = "http_skill_profiles/mod.rs"]
 mod skill_profiles;
 
@@ -745,7 +747,7 @@ async fn signed_http_and_static_gateway_use_real_oci_and_shared_broker() {
     let skill = registered.1["id"].as_str().unwrap().to_owned();
     let streamed_skill = skill_profiles::fixed_methods_and_stream(
         &router,
-        &db,
+        &app,
         &token,
         &manifest,
         &installed,

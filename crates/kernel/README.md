@@ -1,22 +1,23 @@
-# XeLab Kernel：M1–M4 与 M5 工作流定义和任务提交
+# XeLab Kernel：M1–M4 与 M5 工作流和同步任务
 
-这是基于现有 **2.8.0 契约**的 Rust 实现，crate 版本为 0.1.0。已实现 M1 普通插件、身份与管理闭环，以及 M2 卷、Blob、Secret、部署备份/恢复、整体离线恢复和内部格式监督器。M3 源码提供普通 OCI Skill 的七项公开操作、声明式 HTTP、OAuth/Client/UI 控制面及独立 WebUI/消息桥；内部 Schema 为 **20**，历史 SQL 及校验和不变。源码功能范围与实际验收状态分别记录：逐项测试、精确提交、PR 集成和 main CI 以有时间戳的[持续进度](../../docs/implementation/m3-progress.md)及[目标 #38](https://github.com/jyxxe/XeLab/issues/38)最新证据为准，不能仅凭实现代码宣布完整 M3 完成。正式生产、AWS/独立宿主和完整格式迁移验收仍独立待完成；公开版本化制品安装入口仍关闭。
+这是基于现有 **2.8.0 契约**的 Rust 实现，crate 版本为 0.1.0。已实现 M1 普通插件、身份与管理闭环，以及 M2 卷、Blob、Secret、部署备份/恢复、整体离线恢复和内部格式监督器。M3 源码提供普通 OCI Skill 的七项公开操作、声明式 HTTP、OAuth/Client/UI 控制面及独立 WebUI/消息桥；内部 Schema 为 **21**，历史 SQL 及校验和不变。源码功能范围与实际验收状态分别记录：逐项测试、精确提交、PR 集成和 main CI 以有时间戳的[持续进度](../../docs/implementation/m3-progress.md)及[目标 #38](https://github.com/jyxxe/XeLab/issues/38)最新证据为准，不能仅凭实现代码宣布完整 M3 完成。正式生产、AWS/独立宿主和完整格式迁移验收仍独立待完成；公开版本化制品安装入口仍关闭。
 
 ## 已实现与边界
 
 | 模块 | 当前实现 | 后续能力与验收边界 |
 |---|---|---|
 | 元数据 | PostgreSQL 显式追加迁移及校验和、单控制器锁、事务内操作/审计/outbox、原生离线快照及门禁 | 在线升级迁移、多个控制器、自动备份调度；原生快照要求精确版本/布局 |
-| 身份与授权 | Owner 引导、五种角色、Guest 自助、固定父级子账户与激活、三种继承模式、不可变权限组/授权、API Key 与会话/密码管理、实时源链撤销、树配额、审计、Cookie CSRF 与可信 Host；恢复后历史用户显式重新激活 | 任务执行时复核委托来源链与缓存式授权优化；恢复不复活旧权限 |
+| 身份与授权 | Owner 引导、五种角色、Guest 自助、固定父级子账户与激活、三种继承模式、不可变权限组/授权、API Key 与会话/密码管理、实时源链撤销、树配额、审计、Cookie CSRF 与可信 Host；恢复后历史用户显式重新激活 | 任务执行复核委托来源链；缓存式授权优化待实现，恢复不复活旧权限 |
 | OAuth/UI 控制面 | 精确 Client origin/redirect/规则上限、code + PKCE S256、可信登录/原生同意、短期单次码、刷新轮换/重用撤族、来源绑定 CORS、默认 UI、签名贡献发现及本人偏好；已随 #44 合并 | 独立 OCI WebUI 已通过 #45 精确完整/专项门禁；不代理插件密码或核心 Cookie |
 | 制品 | 预导入固定 OCI manifest digest、Ed25519 信封、原始清单/契约摘要及实际内容校验、严格 JSON/Schema 校验、OCI 归档及冷内容库导入 | 在线拉取、image index 自动选平台、仓库登录、依赖安装、卸载；公开非 none 格式安装关闭 |
 | 依赖 | `resolveDependencies`、普通插件/能力完整解析、精确契约/安装/配置/代次与特性固定、并发强环/16层图检查、可选降级和升级计划日志 | HostService 已提供固定能力和 Skill 的发现/解析/调用；task 执行依赖 TaskEngine，微/扩展宿主仍未交付 |
 | 控制器 | 安装/批准/启用/健康/排空停止、有界对账与重启、完全停用排空后的配置更新、部署重建与同格式卷切换、内部初始化/格式迁移监督器 | 多副本、滚动升级、运行中动态配置；完整格式升级/不兼容回退仍待正式备份验收 |
 | 执行 | containerd/runc 真容器、cgroups v2 CPU/内存/PID、只读根目录、受限 tmpfs、无 Linux capabilities、隔离网络、工作负载 mTLS | 外网/代理、尚未实现的 HostService 方法、GPU、微插件/MPR、Extension Plugin；组件预算不代替生产 RUN-03 |
-| 调用 | 固定契约/安装/部署、双层授权、共享实例并发、树配额/源链计费、幂等/unknown 账本、有界 SSE 缓冲与取消围栏；普通无版本数据格式 capability 四类副作用的单次/声明流和原实例 QueryResult | #46 精确真实 OCI 副作用/QueryResult 门禁已通过；符合签名范围的一元 Capability Skill 可按实例排队；Task 执行、Batch、Schedule 待实现 |
+| 调用 | 固定契约/安装/部署、双层授权、共享实例并发、树配额/源链计费、幂等/unknown 账本、有界 SSE 缓冲与取消围栏；普通无版本数据格式 capability 四类副作用的单次/声明流和原实例 QueryResult | #46 精确真实 OCI 副作用/QueryResult 门禁已通过。符合签名范围的一元 Capability Skill 可按实例排队，Batch 和 Schedule 待实现 |
 | 事件 | 持久化发布/outbox、24h 去重、独立游标、30s 租约、旧租约 fencing、退避重投/死信、保留和容量上限、SSE/HostService、原生快照及恢复授权重置 | 当前源代码与专项证据见 [M4 事件](../../docs/implementation/m4-events.md)和[#54](https://github.com/jyxxe/XeLab/issues/54)；正式 daemon/独立宿主及 AWS 仍由 #50 跟踪 |
 | 工作流定义 | `createWorkflow/getWorkflow/listWorkflows/archiveWorkflow`；同一所有者和名称下递增不可变版本，校验 DAG、输入映射和签名目标，按当前权限分页，使用 ETag 归档 | 归档阻止同一版本的新任务，历史任务继续可读 |
-| 任务提交与查询 | `createTask/getTask/listTasks/listTaskSteps`；在一个事务中固定 Workflow 版本、deadline、执行权限上限、授权来源和需要固定的提供者，初始化步骤状态 | TaskEngine 领取与执行待实现。服务身份执行需单独审批。HTTP 与真实 PostgreSQL 回归见 `crates/kernel/tests/workflows.rs` |
+| 任务提交与查询 | `createTask/getTask/listTasks/listTaskSteps`；在一个事务中固定 Workflow 版本、deadline、执行权限上限、授权来源和需要固定的提供者，初始化步骤状态 | 服务身份执行需单独审批。HTTP 与真实 PostgreSQL 回归见 `crates/kernel/tests/workflows.rs` |
+| 同步 TaskEngine | 控制器以 PostgreSQL 租约领取能力契约型或固定 HTTP 同步 Skill，经 Broker 准入、计费及调用，原子记录 Attempt 与 Call；结果提交检查 fence 并推进下游与 outbox | Task 步骤采用单次调用；任务级 HostService 附属授权、Blob 大结果、长任务 TaskWorker 与 UNKNOWN 核实待实现 |
 | HTTP | #43 已合并签名原始 OpenAPI、精确操作/动作/Schema、共享 Broker 账本、直接 HTTP SSE、隔离来源静态 GET/HEAD 与物理槽；#47 扩展固定 HTTP Skill 的六方法、成功状态和 SSE | #47 精确 HTTP Skill 六方法/流真实 OCI 门禁已通过；不是任意 URL/路径模板/查询参数代理，未声明协议拒绝 |
 | 独立 WebUI/消息桥 | #45 实现 UID 65532 OCI 桌面、公开管理 API/OAuth 客户端、window/widget、固定 alias 的 skill.call、同部署 window.open、通道撤权/登出/升级失效及独立 UI 参考插件 | 组件与打包探针通过不能替代真实核心 OCI/Owner OAuth/iframe 全链；#45 精确完整/专项门禁均通过，未来 batch 方法明确不可用 |
 | 持久卷 | 独立 XFS 硬配额、预留/扩容/回收、实际计数、单写者 fence、OCI 挂载、新私有卷恢复、同格式克隆/回退、内部格式证明 | 多副本应用行为、公开格式安装/迁移、正式独立宿主恢复验收 |
@@ -66,14 +67,14 @@ cargo fmt --all -- --check
 
 ```bash
 xelabctl validate-config --config /etc/xelab/kernel.toml
-xelabctl migrate --config /etc/xelab/kernel.toml --target 20
+xelabctl migrate --config /etc/xelab/kernel.toml --target 21
 xelabctl bootstrap --config /etc/xelab/kernel.toml --owner-name admin
 xelabd --config /etc/xelab/kernel.toml
 ```
 
-`validate-config` 只验证结构和本地约束；不宣称宿主检查已经通过。当前迁移目标为 20：
+`validate-config` 只验证结构和本地约束；不宣称宿主检查已经通过。当前迁移目标为 21：
 空库先建立原始基线，已有库先检查已应用的版本和校验和，再顺序执行追加迁移；
-重复执行仍核对布局与校验和。v20 新增任务准入证明。v19 库可原地迁移；离线快照导入要求精确 Schema 与迁移校验和，v19 快照须先在对应版本恢复并迁移，再重新导出。bootstrap 只允许空账户库，须在启动守护进程前执行。
+重复执行仍核对布局与校验和。v20 新增任务准入证明，v21 新增 Attempt 与 Broker Call 的关联。已有数据库可按顺序迁移；旧版本离线快照须先在对应版本恢复并迁移，再重新导出。bootstrap 只允许空账户库，须在启动守护进程前执行。
 守护进程不会隐式迁移数据库。
 
 ## 管理与插件示例
@@ -175,7 +176,7 @@ CI 另在一次性 Linux 主机运行 `tests/oci.rs`：真实 containerd + Rust/
 - 自授 Grant 证明签发权限时，忽略同账户其他非引导自授绑定，只使用独立来源（外部 Grant、父级继承或初始 Owner）。这些自授绑定仍在最外层保留权限/来源记录；撤销独立来源后不能互相维持权限。此优化针对同账户自授，其他来源图仍受现有深度/路径边界限制。
 - 控制器启用与停用清理分别保存 `(created_at,id)` 游标与上界，每轮各最多 16 项，并在项间检查 250 ms 时间片。Probe 按实例代次复用、分批回收；已清理禁用记录不反复协调。完整行为、回归与单项延迟限制见 [Controller 稳定化](../../docs/implementation/m1-acceptance.md#controller-稳定化pr-4-遗留项)。
 
-升级前备份并停机，确认没有未完成任务，执行上面的 `--target 20` 后再启动。
+升级前备份并停机，确认没有未完成任务，执行上面的 `--target 21` 后再启动。
 旧二进制拒绝不匹配的元数据版本，不能直接回退；原生快照恢复同样要求精确布局。
 v1 已有的凭证/账户派生调用继续计入预算；旧版本未记录的实际 Grant 来源无法事后精确重建，因此已有受此漏洞影响的限次来源 Key 应在升级时撤销后重新签发，不把旧账本当成完整历史计费证据。v7 持久备份任务见 [备份任务记录](../../docs/implementation/m2-backup-jobs.md)，v8 新卷恢复和切换见 [恢复实现](../../docs/implementation/m2-restores.md)，v9 元数据快照、启动门禁与权限重置见 [离线恢复组件](../../docs/implementation/m2-platform-recovery.md)。
 v10–11 部署重建与卷克隆见[部署重建实现](../../docs/implementation/m2-deployment-upgrades.md)，

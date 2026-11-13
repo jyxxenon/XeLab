@@ -182,7 +182,7 @@ async fn actual_postgres_oauth_copy_round_trip_resets_families_clients_and_brows
     assert!(export_inner(&mut source, &mut Vec::new()).await.is_err());
 }
 
-async fn target(backup: Uuid) -> (Db, Client, Uuid) {
+pub(super) async fn target(backup: Uuid) -> (Db, Client, Uuid) {
     let base = std::env::var("XELAB_TEST_DATABASE_URL").unwrap();
     let admin = Db::new(base.clone()).unwrap().connect().await.unwrap();
     let name = format!("metadata_restore_{}", Uuid::new_v4().simple());
@@ -777,24 +777,29 @@ async fn actual_postgres_raw_effect_proof_and_query_lease_copy_preserves_history
 }
 
 #[tokio::test]
-async fn actual_postgres_m5_admission_snapshot_round_trip_resets_execution_authority() {
-    // Workflow/task/schedule/micro/extension/batch admission metadata created
-    // through the public APIs are ordinary snapshot data. They must survive
-    // export and restore; executing authority must not.
+async fn actual_postgres_schedule_plugin_and_batch_history_copy_resets_execution_authority() {
+    use serde_json::{json, Value};
+    use std::collections::HashMap;
+
+    // A created schedule fire points to a Task admitted through the normal
+    // Workflow and Task handlers. The Task journal has its own round-trip test.
     let Some(f) = Fixture::new().await else {
         return;
     };
     let mut source = f.app.db.connect().await.unwrap();
-    let owner: Uuid = source
-        .query_one("SELECT created_by FROM backups WHERE id=$1", &[&f.backup])
+    let ctx = f
+        .app
+        .auth
+        .authenticate(
+            &source,
+            &f.token,
+            "127.0.0.1".parse().unwrap(),
+            Uuid::new_v4(),
+        )
         .await
-        .unwrap()
-        .get(0);
+        .unwrap();
+    let owner = ctx.subject;
     let delegation = Uuid::new_v4();
-    let workflow = Uuid::new_v4();
-    let task = Uuid::new_v4();
-    let step = Uuid::new_v4();
-    let attempt = Uuid::new_v4();
     let schedule = Uuid::new_v4();
     let micro = Uuid::new_v4();
     let extension = Uuid::new_v4();
@@ -802,31 +807,11 @@ async fn actual_postgres_m5_admission_snapshot_round_trip_resets_execution_autho
     let skill = Uuid::new_v4();
     let batch = Uuid::new_v4();
     source
-        .execute("INSERT INTO execution_delegations(id,subject_id,maximum_rules,run_as,expires_at,status,created_at) VALUES($1,$2,'[]','user',now()+interval '1 hour','active',now())",&[&delegation,&owner])
-        .await
-        .unwrap();
-    source
-        .execute("INSERT INTO workflows(id,owner_id,name,version,spec,status,created_at,updated_at) VALUES($1,$2,'snapshot source',1,'{}','active',now(),now())",&[&workflow,&owner])
-        .await
-        .unwrap();
-    source
-        .execute("INSERT INTO tasks(id,owner_id,workflow_id,delegation_id,input,deadline_at,state,admission,created_at,updated_at) VALUES($1,$2,$3,$4,'{}',now()+interval '1 hour','running','{\"version\":1}'::jsonb,now(),now())",&[&task,&owner,&workflow,&delegation])
-        .await
-        .unwrap();
-    source
-        .execute("INSERT INTO task_steps(id,task_id,step_key,state,attempt_count,fence,created_at,updated_at) VALUES($1,$2,'root','running',1,1,now(),now())",&[&step,&task])
-        .await
-        .unwrap();
-    source
-        .execute("INSERT INTO attempts(id,step_id,number,execution_id,idempotency_key,fence,lease_expires_at,state,created_at,updated_at) VALUES($1,$2,1,$3,'snapshot-attempt-key',1,now()+interval '30 seconds','running',now(),now())",&[&attempt,&step,&Uuid::new_v4()])
-        .await
-        .unwrap();
-    source
-        .execute("INSERT INTO schedules(id,owner_id,spec,delegation_id,next_fire_at,created_at,updated_at) VALUES($1,$2,'{}',$3,now()+interval '1 day',now(),now())",&[&schedule,&owner,&delegation])
-        .await
-        .unwrap();
-    source
-        .execute("INSERT INTO schedule_fires(schedule_id,scheduled_at,task_id,outcome) VALUES($1,now(),$2,'created')",&[&schedule,&task])
+        .execute(
+            "INSERT INTO execution_delegations(id,subject_id,issuer_credential_id,maximum_rules,run_as,expires_at,status,created_at)
+             VALUES($1,$2,$3,'[]','user',now()+interval '1 hour','active',now())",
+            &[&delegation, &owner, &ctx.credential],
+        )
         .await
         .unwrap();
     source
@@ -873,12 +858,74 @@ async fn actual_postgres_m5_admission_snapshot_round_trip_resets_execution_autho
         .execute("INSERT INTO skills(id,name,version,installation_id,created_by,definition,definition_digest,enabled,created_at,updated_at) VALUES($1,$2,'1.0.0',$3,$4,$5,$6,true,now(),now())", &[&skill,&definition_name,&installation,&owner,&definition,&definition_hash])
         .await
         .unwrap();
+
+    let tx = source.transaction().await.unwrap();
+    db::auth_lock(&tx, false).await.unwrap();
+    let params = HashMap::new();
+    let (workflow, status) = crate::workflows::execute(
+        &tx,
+        &f.app.auth,
+        &ctx,
+        "createWorkflow",
+        &params,
+        &json!({"name":"snapshot-scheduled-workflow","input_schema":{"type":"object"},"steps":[{
+            "id":"echo","contract":contract,"depends_on":[],"timeout_ms":30000,
+            "input_mapping":{"message":{"task_input":"/message"}}
+        }]}),
+        &axum::http::HeaderMap::new(),
+        "",
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, 201);
+    let workflow = crate::contracts::id(&workflow, "id").unwrap();
+    let input = json!({"message":"scheduled snapshot input"});
+    let (task, status) = crate::tasks::execute(
+        &tx,
+        &f.app.auth,
+        &ctx,
+        "createTask",
+        &params,
+        &json!({"workflow_id":workflow,"input":input}),
+        "",
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, 201);
+    let task = crate::contracts::id(&task, "id").unwrap();
+    tx.commit().await.unwrap();
+
+    let schedule_spec = json!({"name":"snapshot schedule","workflow_id":workflow,
+        "cron":"0 0 * * *","timezone":"Etc/UTC","input":input});
+    crate::contracts::validate("ScheduleSpec", &schedule_spec).unwrap();
     source
-        .execute("INSERT INTO skill_batches(id,owner_id,subject_id,delegation_id,skill_id,installation_id,definition_digest,state,request_spec,counts,total_items,max_parallel,failure_policy,run_as,deadline_at,created_at,updated_at) VALUES($1,$2,$2,$3,$4,$5,'sha256:'||repeat('4',64),'queued','{}','{\"queued\":1}'::jsonb,1,1,'stop','user',now()+interval '1 hour',now(),now())",&[&batch,&owner,&delegation,&skill,&installation])
+        .execute(
+            "INSERT INTO schedules(id,owner_id,spec,delegation_id,next_fire_at,created_at,updated_at)
+             VALUES($1,$2,$3,$4,date_trunc('day',now(),'UTC')+interval '24 hours',now(),now())",
+            &[&schedule, &owner, &schedule_spec, &delegation],
+        )
         .await
         .unwrap();
     source
-        .execute("INSERT INTO skill_batch_items(batch_id,item_id,item_index,input,input_digest,input_bytes,idempotency_key,state) VALUES($1,'1',0,'{}','sha256:'||repeat('5',64),2,'snapshot-item-key','queued')",&[&batch])
+        .execute(
+            "INSERT INTO schedule_fires(schedule_id,scheduled_at,task_id,outcome)
+             SELECT id,next_fire_at-interval '24 hours',$2,'created' FROM schedules WHERE id=$1",
+            &[&schedule, &task],
+        )
+        .await
+        .unwrap();
+    source
+        .execute("INSERT INTO skill_batches(id,owner_id,subject_id,delegation_id,skill_id,installation_id,definition_digest,state,request_spec,counts,total_items,max_parallel,failure_policy,run_as,deadline_at,created_at,updated_at) VALUES($1,$2,$2,$3,$4,$5,$6,'queued','{}','{\"queued\":1}'::jsonb,1,1,'stop','user',now()+interval '1 hour',now(),now())",&[&batch,&owner,&delegation,&skill,&installation,&definition_hash])
+        .await
+        .unwrap();
+    let input_bytes = serde_json::to_vec(&input).unwrap();
+    let input_digest = crate::contracts::digest(&input_bytes);
+    source
+        .execute(
+            "INSERT INTO skill_batch_items(batch_id,item_id,item_index,input,input_digest,input_bytes,idempotency_key,state)
+             VALUES($1,'1',0,$2,$3,$4,'snapshot-item-key','queued')",
+            &[&batch, &input, &input_digest, &(input_bytes.len() as i64)],
+        )
         .await
         .unwrap();
     let mut bytes = Vec::new();
@@ -896,65 +943,48 @@ async fn actual_postgres_m5_admission_snapshot_round_trip_resets_execution_autho
     .await
     .unwrap();
     assert_eq!(restored, summary);
-    let row = destination
+    let saved_schedule = destination
         .query_one(
-            "SELECT name,status FROM workflows WHERE id=$1",
-            &[&workflow],
+            "SELECT s.spec,f.task_id,f.outcome,e.status
+             FROM schedules s JOIN schedule_fires f ON f.schedule_id=s.id
+             JOIN execution_delegations e ON e.id=s.delegation_id WHERE s.id=$1",
+            &[&schedule],
         )
         .await
         .unwrap();
-    assert_eq!(row.get::<_, String>(0), "snapshot source");
-    assert_eq!(row.get::<_, String>(1), "active");
-    let row = destination
-        .query_one(
-            "SELECT t.state,t.admission->>'version',s.state,a.state FROM tasks t JOIN task_steps s ON s.task_id=t.id JOIN attempts a ON a.step_id=s.id WHERE t.id=$1",
-            &[&task],
-        )
-        .await
-        .unwrap();
-    assert_eq!(row.get::<_, String>(0), "running");
-    assert_eq!(row.get::<_, String>(1), "1");
-    assert_eq!(row.get::<_, String>(2), "running");
-    assert_eq!(row.get::<_, String>(3), "running");
-    // Admission authority is revoked by the restore; the rows survive as data.
-    assert_eq!(
-        destination
+    assert_eq!(saved_schedule.get::<_, Value>(0), schedule_spec);
+    assert_eq!(saved_schedule.get::<_, Uuid>(1), task);
+    assert_eq!(saved_schedule.get::<_, &str>(2), "created");
+    assert_eq!(saved_schedule.get::<_, &str>(3), "revoked");
+    for (table, id, name) in [
+        ("micro_plugins", micro, "snapshot-micro"),
+        ("extension_plugins", extension, "snapshot-extension"),
+    ] {
+        let row = destination
             .query_one(
-                "SELECT status FROM execution_delegations WHERE id=$1",
-                &[&delegation]
+                &format!("SELECT name,status FROM {table} WHERE id=$1"),
+                &[&id],
             )
             .await
-            .unwrap()
-            .get::<_, String>(0),
-        "revoked"
-    );
-    assert_eq!(
-        destination
-            .query_one(
-                "SELECT outcome FROM schedule_fires WHERE schedule_id=$1",
-                &[&schedule]
-            )
-            .await
-            .unwrap()
-            .get::<_, String>(0),
-        "created"
-    );
-    for table in ["micro_plugins", "extension_plugins", "skill_batches"] {
-        assert!(destination
-            .query_one(&format!("SELECT EXISTS(SELECT 1 FROM {table})"), &[])
-            .await
-            .unwrap()
-            .get::<_, bool>(0));
+            .unwrap();
+        assert_eq!(row.get::<_, &str>(0), name);
+        assert_eq!(row.get::<_, &str>(1), "active");
     }
-    assert_eq!(
-        destination
-            .query_one(
-                "SELECT count(*) FROM skill_batch_items WHERE batch_id=$1 AND state='queued'",
-                &[&batch]
-            )
-            .await
-            .unwrap()
-            .get::<_, i64>(0),
-        1
-    );
+    let saved_batch = destination
+        .query_one(
+            "SELECT b.state,b.skill_id,b.definition_digest,i.state,i.input,i.input_digest,e.status
+             FROM skill_batches b JOIN skill_batch_items i ON i.batch_id=b.id
+             JOIN execution_delegations e ON e.id=b.delegation_id
+             WHERE b.id=$1 AND i.item_id='1'",
+            &[&batch],
+        )
+        .await
+        .unwrap();
+    assert_eq!(saved_batch.get::<_, &str>(0), "queued");
+    assert_eq!(saved_batch.get::<_, Uuid>(1), skill);
+    assert_eq!(saved_batch.get::<_, String>(2), definition_hash);
+    assert_eq!(saved_batch.get::<_, &str>(3), "queued");
+    assert_eq!(saved_batch.get::<_, Value>(4), input);
+    assert_eq!(saved_batch.get::<_, String>(5), input_digest);
+    assert_eq!(saved_batch.get::<_, &str>(6), "revoked");
 }
