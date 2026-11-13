@@ -1,4 +1,5 @@
 use serde_json::json;
+use std::time::Duration;
 use uuid::Uuid;
 use xelab_kernel::{
     admission,
@@ -136,9 +137,7 @@ async fn real_postgres_enforces_authentication_and_atomic_admission() {
         1,
         "concurrent reservations must not oversell"
     );
-    let tx = c.transaction().await.unwrap();
-    admission::reserve(&tx, winners[0]).await.unwrap();
-    tx.commit().await.unwrap();
+    reserve_waits_for_deployment_before_locking_instance(&db, deployment, winners[0]).await;
     let r = c
         .query_one("SELECT reserved_cpu_millis FROM node_budget", &[])
         .await
@@ -164,6 +163,66 @@ async fn real_postgres_enforces_authentication_and_atomic_admission() {
             .get::<_, i64>(0),
         0
     );
+}
+
+async fn reserve_waits_for_deployment_before_locking_instance(
+    db: &Db,
+    deployment: Uuid,
+    instance: Uuid,
+) {
+    let mut holder = db.connect().await.unwrap();
+    let mut reserver = db.connect().await.unwrap();
+    let holder_pid: i32 = holder
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let reserver_pid: i32 = reserver
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let hold = holder.transaction().await.unwrap();
+    hold.query_one(
+        "SELECT id FROM deployments WHERE id=$1 FOR UPDATE",
+        &[&deployment],
+    )
+    .await
+    .unwrap();
+    let reserve = tokio::spawn(async move {
+        let tx = reserver.transaction().await.unwrap();
+        admission::reserve(&tx, instance).await.unwrap();
+        tx.commit().await.unwrap();
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let blocked: bool = hold
+                .query_one(
+                    "SELECT $1 = ANY(pg_blocking_pids($2))",
+                    &[&holder_pid, &reserver_pid],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            if blocked {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("Reservation did not wait for the deployment lock");
+    hold.query_one(
+        "SELECT id FROM instances WHERE id=$1 FOR UPDATE NOWAIT",
+        &[&instance],
+    )
+    .await
+    .expect("Reservation locked the instance before acquiring the deployment lock");
+    hold.commit().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), reserve)
+        .await
+        .expect("Reservation did not finish after the deployment lock was released")
+        .unwrap();
 }
 
 #[tokio::test]

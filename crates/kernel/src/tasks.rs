@@ -1,15 +1,17 @@
 //! Task submission persists metadata and an authorization ceiling. Execution
 //! must revalidate the original grants and provider binding before each step.
 use crate::{
+    api::path_id,
     auth::{self, Auth, Context, Resource},
     contracts::{id, reject_jsonb_nul, string, unsigned, validate, validate_business},
     error::{Error, Result},
     policy::Path,
 };
+use axum::http::HeaderMap;
 use chrono::{DateTime, Duration, Utc};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use tokio_postgres::GenericClient;
+use tokio_postgres::{GenericClient, Transaction};
 use uuid::Uuid;
 
 mod authority;
@@ -22,12 +24,22 @@ mod targets;
 pub(crate) fn handles(name: &str) -> bool {
     matches!(
         name,
-        "createTask" | "getTask" | "listTasks" | "listTaskSteps"
+        "createTask"
+            | "getTask"
+            | "listTasks"
+            | "listTaskSteps"
+            | "resolveUnknownStep"
+            | "cancelTask"
+            | "retryTask"
     )
 }
 
 pub(crate) fn validate_query(name: &str, query: &str) -> Result<()> {
-    if matches!(name, "createTask" | "getTask") && !query.is_empty() {
+    if matches!(
+        name,
+        "createTask" | "getTask" | "resolveUnknownStep" | "cancelTask" | "retryTask"
+    ) && !query.is_empty()
+    {
         return Err(Error::invalid("Unexpected task query parameter"));
     }
     Ok(())
@@ -40,6 +52,25 @@ pub(crate) async fn authorize(
     params: &HashMap<String, String>,
     body: &Value,
 ) -> Result<()> {
+    if matches!(name, "cancelTask" | "retryTask") {
+        let task = path_id(params, "task_id")?;
+        let row = c
+            .query_opt("SELECT owner_id FROM tasks WHERE id=$1", &[&task])
+            .await?
+            .ok_or_else(Error::not_found)?;
+        let resource = Resource::new("task", task, Some(row.get(0)));
+        return if name == "cancelTask" {
+            authorize_cancellation(c, ctx, &resource).await
+        } else {
+            authorize_retry(c, ctx, &resource).await
+        };
+    }
+    if name == "resolveUnknownStep" {
+        let resource = step_task_resource(c, path_id(params, "step_id")?)
+            .await?
+            .ok_or_else(Error::not_found)?;
+        return authorize_resolution(c, ctx, &resource).await;
+    }
     if name != "createTask" {
         return reads::authorize(c, ctx, name, params).await;
     }
@@ -56,6 +87,55 @@ pub(crate) async fn authorize(
     Ok(())
 }
 
+pub(crate) async fn step_task_resource(
+    c: &(impl GenericClient + Sync),
+    step: Uuid,
+) -> Result<Option<Resource>> {
+    let row = c
+        .query_opt(
+            "SELECT t.id,t.owner_id FROM task_steps s JOIN tasks t ON t.id=s.task_id WHERE s.id=$1",
+            &[&step],
+        )
+        .await?;
+    Ok(row.map(|row| Resource::new("task", row.get::<_, Uuid>(0), Some(row.get(1)))))
+}
+
+pub(crate) async fn authorize_resolution(
+    c: &(impl GenericClient + Sync),
+    ctx: &Context,
+    task: &Resource,
+) -> Result<()> {
+    authorize_visible_action(c, ctx, task, "task.resolve").await
+}
+
+pub(crate) async fn authorize_cancellation(
+    c: &(impl GenericClient + Sync),
+    ctx: &Context,
+    task: &Resource,
+) -> Result<()> {
+    authorize_visible_action(c, ctx, task, "task.cancel").await
+}
+
+pub(crate) async fn authorize_retry(
+    c: &(impl GenericClient + Sync),
+    ctx: &Context,
+    task: &Resource,
+) -> Result<()> {
+    authorize_visible_action(c, ctx, task, "task.retry").await
+}
+
+async fn authorize_visible_action(
+    c: &(impl GenericClient + Sync),
+    ctx: &Context,
+    task: &Resource,
+    action: &str,
+) -> Result<()> {
+    if !crate::policy::allows(c, ctx, "task.read", task).await? {
+        return Err(Error::not_found());
+    }
+    auth::authorize(c, ctx, action, task).await
+}
+
 async fn authorize_create(c: &(impl GenericClient + Sync), ctx: &Context) -> Result<()> {
     auth::authorize(
         c,
@@ -66,19 +146,36 @@ async fn authorize_create(c: &(impl GenericClient + Sync), ctx: &Context) -> Res
     .await
 }
 
+#[allow(clippy::too_many_arguments)] // Shared HTTP dispatch inputs.
 pub(crate) async fn execute(
-    c: &(impl GenericClient + Sync),
+    c: &Transaction<'_>,
     auth: &Auth,
     ctx: &Context,
     name: &str,
     params: &HashMap<String, String>,
     body: &Value,
+    headers: &HeaderMap,
     query: &str,
 ) -> Result<(Value, u16)> {
-    if name == "createTask" {
-        return Ok((create(c, ctx, body).await?, 201));
+    match name {
+        "createTask" => Ok((create(c, ctx, body).await?, 201)),
+        "retryTask" => Ok((
+            crate::task_engine::retry_task(c, auth, ctx, path_id(params, "task_id")?, headers)
+                .await?,
+            200,
+        )),
+        "cancelTask" => Ok((
+            crate::task_engine::cancel_task(c, ctx, path_id(params, "task_id")?, body, headers)
+                .await?,
+            200,
+        )),
+        "resolveUnknownStep" => Ok((
+            crate::task_engine::resolve_unknown(c, ctx, path_id(params, "step_id")?, body, headers)
+                .await?,
+            200,
+        )),
+        _ => reads::execute(c, auth, ctx, name, params, query).await,
     }
-    reads::execute(c, auth, ctx, name, params, query).await
 }
 
 async fn create(c: &(impl GenericClient + Sync), ctx: &Context, body: &Value) -> Result<Value> {

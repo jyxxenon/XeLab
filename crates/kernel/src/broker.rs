@@ -5,6 +5,7 @@ use crate::{
     controller, db,
     error::{Error, Result},
     rpc::{self, capability_service_client::CapabilityServiceClient},
+    task_engine::{self, Lease},
     tls,
 };
 use futures_util::future::BoxFuture;
@@ -18,6 +19,141 @@ mod http;
 pub(crate) use http::check_route_approval as check_http_approval;
 pub use http::invoke as invoke_http;
 pub(crate) use http::target_resource as business_target;
+
+#[derive(Clone, Copy)]
+enum CallRequest<'a> {
+    Token {
+        token: &'a str,
+        peer: IpAddr,
+        browser_origin: Option<&'a str>,
+        input: &'a Value,
+        skill: Option<Uuid>,
+    },
+    Task(&'a Lease),
+}
+
+impl<'a> CallRequest<'a> {
+    fn source(self) -> CallSource<'a> {
+        match self {
+            Self::Token {
+                token,
+                peer,
+                browser_origin,
+                ..
+            } => CallSource::Token {
+                token,
+                peer,
+                browser_origin,
+            },
+            Self::Task(lease) => CallSource::Task(lease),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CallSource<'a> {
+    Token {
+        token: &'a str,
+        peer: IpAddr,
+        browser_origin: Option<&'a str>,
+    },
+    Task(&'a Lease),
+}
+
+enum CallCheck<'a> {
+    BeforeDispatch(CallSource<'a>),
+    Observe(CallSource<'a>),
+}
+
+impl<'a> CallSource<'a> {
+    fn token(self) -> Option<&'a str> {
+        match self {
+            Self::Token { token, .. } => Some(token),
+            Self::Task(_) => None,
+        }
+    }
+
+    async fn authenticate(
+        self,
+        tx: &tokio_postgres::Transaction<'_>,
+        app: &App,
+        request: Uuid,
+        call: Option<Uuid>,
+    ) -> Result<crate::auth::Context> {
+        match self {
+            Self::Token {
+                token,
+                peer,
+                browser_origin,
+                ..
+            } => {
+                let mut ctx =
+                    crate::host_calls::authenticate(tx, app, token, peer, request).await?;
+                ctx.browser_origin = browser_origin.map(str::to_owned);
+                Ok(ctx)
+            }
+            Self::Task(lease) => {
+                task_engine::authorize_broker_call(
+                    tx,
+                    &app.auth,
+                    lease,
+                    call.ok_or_else(Error::denied)?,
+                )
+                .await
+            }
+        }
+    }
+}
+
+pub(crate) async fn invoke_task(app: &App, lease: &Lease) -> Result<Value> {
+    crate::skill_streams::ensure_active(app)?;
+    if lease.is_http() {
+        return http::execute_task(app, lease).await;
+    }
+    let until = tokio::time::Instant::now() + Duration::from_secs(300);
+    let key = lease.execution_id.to_string();
+    tokio::time::timeout_at(
+        until,
+        invoke_inner(
+            app,
+            CallRequest::Task(lease),
+            lease.execution_id,
+            &key,
+            None,
+            chrono::Utc::now(),
+            until,
+        ),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Err(Error::new(
+            "DEADLINE_EXCEEDED",
+            "Task call deadline elapsed; inspect its attempt journal",
+            axum::http::StatusCode::GATEWAY_TIMEOUT,
+        ))
+    })
+}
+
+fn task_call_path(lease: &Lease) -> String {
+    format!("/internal/task-attempts/{}/skill", lease.attempt_id)
+}
+
+fn check_task_manifest(manifest: &Value) -> Result<()> {
+    if manifest["requested_rules"].as_array().is_some_and(|rules| {
+        rules.iter().any(|rule| {
+            rule["required"] == true
+                && crate::host_blobs::proxy_action(
+                    rule["rule"]["action"].as_str().unwrap_or(""),
+                    rule["rule"]["resource"]["kind"].as_str().unwrap_or(""),
+                )
+        })
+    }) {
+        return Err(Error::invalid(
+            "Task Skill requires HostService authority beyond its frozen targets",
+        ));
+    }
+    Ok(())
+}
 
 pub async fn invoke(
     app: &App,
@@ -188,16 +324,18 @@ fn invoke_bounded<'a>(
                 started + Duration::from_millis(effective),
                 invoke_inner(
                     app,
-                    token,
-                    peer,
+                    CallRequest::Token {
+                        token,
+                        peer,
+                        browser_origin,
+                        input,
+                        skill,
+                    },
                     request_id,
-                    input,
                     key,
-                    skill,
                     stream,
                     wall_started,
                     started + Duration::from_millis(effective),
-                    browser_origin,
                 ),
             )
             .await
@@ -221,34 +359,25 @@ fn invoke_bounded<'a>(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn invoke_inner<'a>(
     app: &'a App,
-    token: &'a str,
-    peer: IpAddr,
+    request: CallRequest<'a>,
     request_id: Uuid,
-    input: &'a Value,
     key: &'a str,
-    skill_id: Option<Uuid>,
     stream: Option<&'a crate::skill_streams::Output>,
     started: chrono::DateTime<chrono::Utc>,
     deadline_bound: tokio::time::Instant,
-    browser_origin: Option<&'a str>,
 ) -> BoxFuture<'a, Result<Value>> {
     Box::pin(async move {
-        let business_key = input["idempotency_key"].as_str().unwrap_or(key);
+        let origin = request.source();
         let admission = admission::Request {
             app,
-            token,
-            peer,
+            request,
             request_id,
-            input,
             key,
-            skill_id,
             stream,
             started,
             deadline_bound,
-            browser_origin,
         }
         .admit()
         .await?;
@@ -269,6 +398,7 @@ fn invoke_inner<'a>(
             id: call,
             delegation,
             accounts,
+            business_key,
         } = *admitted;
         let instance = provider.id;
         let generation = provider.generation;
@@ -311,7 +441,7 @@ fn invoke_inner<'a>(
             context.request_id = ctx.request.to_string();
             context.delegation_token = delegation;
             context.deadline_unix_ms = deadline.timestamp_millis();
-            context.idempotency_key = business_key.to_owned();
+            context.idempotency_key = business_key;
             let mut request = tonic::Request::new(rpc::InvokeRequest {
                 context: Some(context),
                 call_id: call.to_string(),
@@ -324,17 +454,15 @@ fn invoke_inner<'a>(
                 input_json: bytes,
                 binding_id: String::new(),
             });
-            if protected {
-                check_live_call(
+            if protected || matches!(origin, CallSource::Task(_)) {
+                check_live_call_for_source(
                     app,
-                    token,
-                    peer,
+                    CallCheck::BeforeDispatch(origin),
                     request_id,
                     call,
                     instance,
                     generation,
                     deadline,
-                    browser_origin,
                 )
                 .await?;
             }
@@ -363,16 +491,14 @@ fn invoke_inner<'a>(
                             if let Some(skill) = skill.as_ref() {
                                 validate_business(&skill.definition["stream_item_schema"], &item)?;
                             }
-                            check_live_call(
+                            check_live_call_for_source(
                                 app,
-                                token,
-                                peer,
+                                CallCheck::Observe(origin),
                                 request_id,
                                 call,
                                 instance,
                                 generation,
                                 deadline,
-                                browser_origin,
                             )
                             .await?;
                             output.emit("item", item).await?;
@@ -442,16 +568,14 @@ fn invoke_inner<'a>(
                 // for RPC timeouts. This guard must be polled alongside execution:
                 // execution may own a short shared authorization transaction when
                 // a revocation writer queues ahead of this next reader.
-                check_live_call(
+                check_live_call_for_source(
                     app,
-                    token,
-                    peer,
+                    CallCheck::Observe(origin),
                     request_id,
                     call,
                     instance,
                     generation,
                     deadline,
-                    browser_origin,
                 )
                 .await?;
             }
@@ -483,9 +607,9 @@ fn invoke_inner<'a>(
         let tx = c.transaction().await?;
         db::call_lock(&tx).await?;
         let check = async {
-            let mut current =
-                crate::host_calls::authenticate(&tx, app, token, peer, request_id).await?;
-            current.browser_origin = browser_origin.map(str::to_owned);
+            let current = origin
+                .authenticate(&tx, app, request_id, Some(call))
+                .await?;
             crate::dependencies::check_call(&tx, call).await?;
             crate::dependencies::check_ready(&tx, app, deployment).await?;
             if protected {
@@ -590,19 +714,20 @@ async fn race_live_call<T>(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn check_live_call(
+async fn check_live_call_for_source(
     app: &App,
-    token: &str,
-    peer: IpAddr,
+    phase: CallCheck<'_>,
     request_id: Uuid,
     call: Uuid,
     instance: Uuid,
     generation: i64,
     deadline: chrono::DateTime<chrono::Utc>,
-    browser_origin: Option<&str>,
 ) -> Result<()> {
     crate::skill_streams::ensure_active(app)?;
+    let (origin, dispatch_task) = match phase {
+        CallCheck::BeforeDispatch(source @ CallSource::Task(lease)) => (source, Some(lease)),
+        CallCheck::BeforeDispatch(source) | CallCheck::Observe(source) => (source, None),
+    };
     let mut connection = app
         .db
         .connect_scoped(
@@ -612,8 +737,13 @@ async fn check_live_call(
         )
         .await?;
     let check = connection.transaction().await?;
-    let mut current = crate::host_calls::authenticate(&check, app, token, peer, request_id).await?;
-    current.browser_origin = browser_origin.map(str::to_owned);
+    if matches!(origin, CallSource::Task(_)) {
+        db::call_lock(&check).await?;
+    }
+    let capability_task = matches!(origin, CallSource::Task(lease) if !lease.is_http());
+    let current = origin
+        .authenticate(&check, app, request_id, Some(call))
+        .await?;
     check_skill_authority(&check, &current, call).await?;
     http::check_route_approval(&check, app, call).await?;
     let status = check
@@ -633,7 +763,25 @@ async fn check_live_call(
     if status.get::<_, String>("state") != "running" {
         return Err(Error::conflict("Admitted call is no longer running"));
     }
-    let live: bool = check.query_one("SELECT EXISTS(SELECT 1 FROM instances i JOIN deployments d ON d.id=i.deployment_id WHERE i.id=$1 AND i.generation=$2 AND i.phase='ready' AND d.archived_at IS NULL AND d.spec->>'enabled'='true')", &[&instance,&generation]).await?.get(0);
+    let live: bool = check.query_one(
+        "SELECT EXISTS(
+             SELECT 1 FROM instances i JOIN deployments d ON d.id=i.deployment_id
+             WHERE i.id=$1 AND i.generation=$2 AND i.phase='ready'
+               AND d.archived_at IS NULL AND d.spec->>'enabled'='true'
+               AND (NOT $3::boolean OR EXISTS(
+                   SELECT 1 FROM provider_records p
+                   JOIN calls c ON c.id=$4 AND c.provider_instance_id=p.instance_id
+                   JOIN installations n ON n.id=d.installation_id
+                   WHERE p.instance_id=i.id AND p.name=c.contract->>'name' AND p.version=c.contract->>'version'
+                     AND p.availability='ready' AND p.observed_generation=i.generation
+                     AND p.observed_at>clock_timestamp()-interval '1 millisecond'*
+                         ((n.manifest->'health'->>'interval_ms')::bigint*
+                          (n.manifest->'health'->>'failure_threshold')::bigint+
+                          (n.manifest->'health'->>'timeout_ms')::bigint)
+               ))
+         )",
+        &[&instance, &generation, &capability_task, &call],
+    ).await?.get(0);
     if !live {
         return Err(Error::unavailable("Fixed Skill deployment is unavailable"));
     }
@@ -646,6 +794,12 @@ async fn check_live_call(
         .get(0);
     crate::dependencies::check_call(&check, call).await?;
     crate::dependencies::check_ready(&check, app, deployment).await?;
+    if let Some(lease) = dispatch_task {
+        // A Task may enter its transport only after this irreversible gate
+        // commits. Observation and stream delivery never advance the gate.
+        crate::skill_streams::ensure_active(app)?;
+        task_engine::mark_broker_dispatch(&check, lease, call).await?;
+    }
     check.commit().await?;
     crate::skill_streams::ensure_active(app)?;
     Ok(())
@@ -791,6 +945,38 @@ async fn reserve_call_quota(
         });
     }
     Ok((accounts, charged))
+}
+
+/// Record cancellation under the call ledger lock. Uncertain physical work
+/// retains its reservation until the Controller confirms the process stopped.
+pub(crate) async fn request_cancellation(
+    tx: &tokio_postgres::Transaction<'_>,
+    calls: &[Uuid],
+) -> Result<()> {
+    let error = Error::new(
+        "CANCELED",
+        "Call cancellation was requested; physical outcome remains unknown",
+        axum::http::StatusCode::CONFLICT,
+    )
+    .detail();
+    tx.execute(
+        "UPDATE calls SET state='unknown',error=$2 WHERE id=ANY($1) AND state IN ('accepted','running')",
+        &[&calls, &error],
+    )
+    .await?;
+    tx.execute(
+        "UPDATE rpc_delegations SET status='revoked' WHERE status='active'
+         AND call_id IN (SELECT id FROM calls WHERE id=ANY($1) AND state='unknown')",
+        &[&calls],
+    )
+    .await?;
+    tx.execute(
+        "UPDATE execution_delegations SET status='revoked' WHERE status='active'
+         AND id IN (SELECT delegation_id FROM calls WHERE id=ANY($1) AND state='unknown')",
+        &[&calls],
+    )
+    .await?;
+    Ok(())
 }
 
 /// A transport failure never proves physical completion. Only confirmed results

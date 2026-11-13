@@ -30,6 +30,7 @@ pub fn context(subject: Option<Uuid>) -> rpc::RpcContext {
 }
 
 pub async fn run(app: Arc<App>) {
+    let mut workers = tokio::task::JoinSet::new();
     let mut state = ControllerState::default();
     let mut rotate = tokio::time::Instant::now();
     loop {
@@ -62,9 +63,26 @@ pub async fn run(app: Arc<App>) {
                 );
             }
         }
+        while let Some(result) = workers.try_join_next() {
+            if let Err(error) = result {
+                tracing::error!(
+                    reason_code = "TASK_WORKER_EXIT",
+                    panicked = error.is_panic(),
+                    "Task worker stopped unexpectedly"
+                );
+            }
+        }
+        if app.ready.load(Ordering::SeqCst)
+            && workers.is_empty()
+            && !app.shutdown.load(Ordering::SeqCst)
+            && !app.leader.is_closed()
+        {
+            workers.spawn(crate::task_worker::run(app.clone()));
+        }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
     app.ready.store(false, Ordering::SeqCst);
+    workers.shutdown().await;
 }
 
 #[derive(Default)]
@@ -246,6 +264,7 @@ async fn tick(app: &App, first: bool, state: &mut ControllerState) -> Result<()>
             &[],
         )
         .await?;
+        crate::task_engine::finish_stopped_cancellations(&tx).await?;
         tx.execute("UPDATE quotas SET concurrent_calls_used=0", &[])
             .await?;
         tx.execute("UPDATE instances SET phase='pending',health='unknown',restart_count=0,revision=revision+1,updated_at=now() WHERE phase<>'stopped'", &[]).await?;
