@@ -6,6 +6,7 @@ import base64
 import hashlib
 import importlib.util
 import pathlib
+import time
 import unittest
 from urllib.parse import parse_qs, urlencode, urlparse
 
@@ -64,6 +65,8 @@ class DesktopBrowser(unittest.TestCase):
         self.expected_challenge = None
         self.hold_preferences = False
         self.pending_preferences = []
+        self.hold_call = False
+        self.pending_calls = []
         self.hold_mount_verify = False
         self.pending_mount_verify = []
         self.real_reference = False
@@ -126,6 +129,7 @@ class DesktopBrowser(unittest.TestCase):
             return
         self.calls.append({"method": request.method, "path": url.path,
                            "headers": request.all_headers(), "body": request.post_data})
+        hold = False
         status = 200
         if url.path == "/oauth/token":
             fields = parse_qs(request.post_data or "", keep_blank_values=True)
@@ -174,6 +178,7 @@ class DesktopBrowser(unittest.TestCase):
                              "output": json.loads(request.post_data)["input"], "completed_at": NOW,
                              "skill_id": SKILL, "skill_definition_digest": "sha256:" + "a" * 64}}
             self.call_result = data["call"]
+            hold = self.hold_call
         elif url.path == f"/api/platform/v1/calls/{DEPLOYMENT}":
             data = {"call_id": DEPLOYMENT, "state": "succeeded", "result": self.call_result, "error": None}
         elif url.path.endswith("/deployments"):
@@ -192,6 +197,9 @@ class DesktopBrowser(unittest.TestCase):
             data = {"fixture": "component-only", "state": "ready"}
         else:
             status, data = 503, {"error": {"code": "NOT_READY", "message": "component fixture has no implementation", "retryable": False}}
+        if hold:
+            self.pending_calls.append((route, headers, data))
+            return
         route.fulfill(status=status, headers=headers, content_type="application/json", body=json.dumps(data))
 
     def open(self, authenticated=True, expires_ms=900000, refresh_token=None):
@@ -840,6 +848,34 @@ class DesktopBrowser(unittest.TestCase):
         self.assertEqual(observed["active_response_observers"], 0)
         self.assertFalse(observed["observer_failure"], observed["error_counts"])
         print(json.dumps({"component": "desktop_reference_window_observer_not_core", "plugin_headers": counts["plugin_headers"], "skill_json": report["http"]["actual_skill_successes"], "unique_skill_call_ids": report["http"]["unique_skill_call_ids"], "active_requests": observed["active_request_observers"], "active_responses": observed["active_response_observers"], "observer_failure": observed["observer_failure"]}, sort_keys=True))
+
+    def test_editor_invoke_skill_outlives_the_business_deadline(self):
+        self.open()
+        self.hold_call = True
+        message = "editor waits for a settled Call"
+        skills = self.app("Skill")
+        skills.get_by_role("button", name="调用测试", exact=True).click()
+        editor = self.page.locator('.window[data-app="editor-invokeSkill"]')
+        editor.get_by_label("请求 JSON", exact=True).fill(json.dumps({
+            "input": {"message": message},
+            "idempotency_key": "editor-settlement-intent",
+            "timeout_ms": 10000,
+        }))
+        editor.get_by_role("button", name="提交", exact=True).click()
+        deadline = time.monotonic() + 5
+        while not self.pending_calls and time.monotonic() < deadline:
+            self.page.wait_for_timeout(10)
+        self.assertEqual(len(self.pending_calls), 1, "expected a held editor Skill Call")
+        route, headers, data = self.pending_calls[0]
+        self.assertEqual(data["call"]["output"], {"message": message})
+        self.page.wait_for_timeout(11000)
+        self.assertNotIn("请求失败", editor.locator('[aria-live="polite"]').inner_text(),
+                         "the editor must not abort a Call at its business deadline")
+        route.fulfill(status=200, headers=headers, content_type="application/json", body=json.dumps(data))
+        editor.locator("pre.result").wait_for()
+        self.assertIn(message, editor.locator("pre.result").inner_text())
+        self.assertEqual(len([call for call in self.calls
+                              if call["method"] == "POST" and call["path"].endswith("/calls")]), 1)
 
     def test_mutating_401_never_refreshes_or_retries_business_request(self):
         self.open()
