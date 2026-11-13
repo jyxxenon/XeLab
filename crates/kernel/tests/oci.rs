@@ -238,6 +238,100 @@ async fn disable_after_observation(
     panic!("observation revisions did not settle for a fenced disable request");
 }
 
+async fn configure_stopped_deployment(
+    app: &App,
+    router: &Router,
+    params: &[(&str, String)],
+    token: &str,
+    instance: Uuid,
+) {
+    let c = app.db.connect().await.unwrap();
+    let row = c
+        .query_one(
+            "SELECT phase,runtime_id FROM instances WHERE id=$1",
+            &[&instance],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, String>("phase"), "stopped");
+    assert!(
+        row.get::<_, Option<String>>("runtime_id").is_none(),
+        "the disable operation must clear the runtime identity after confirming stop"
+    );
+    assert!(!app.runtime.inventory().await.unwrap().contains(&instance));
+
+    // Restore the historical metadata left by a prior version, after the
+    // actual container has stopped. The next inactive sweep must repair it.
+    assert_eq!(
+        c.execute(
+            "UPDATE instances SET runtime_id=$2 WHERE id=$1 AND phase='stopped'",
+            &[&instance, &instance.to_string()],
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    let deployment: Uuid = params[0].1.parse().unwrap();
+    let fence = format!("xelab/deployment-runtime/{deployment}");
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let settled: bool = c
+                .query_one(
+                    "SELECT runtime_id IS NULL FROM instances WHERE id=$1",
+                    &[&instance],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            if settled {
+                // Wait for the same sweep to finish publishing the disabled
+                // deployment before issuing a configuration request.
+                let mut fence_connection = app.db.connect().await.unwrap();
+                let tx = fence_connection.transaction().await.unwrap();
+                tx.query_one(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+                    &[&fence],
+                )
+                .await
+                .unwrap();
+                tx.rollback().await.unwrap();
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("inactive reconciliation must recover the historical runtime marker");
+    let current = api(
+        router,
+        "getDeployment",
+        params,
+        Some(token),
+        Value::Null,
+        "read-stopped-config",
+        None,
+    )
+    .await;
+    assert_eq!(current.0, 200, "{}", current.1);
+    assert_eq!(current.1["phase"], "disabled");
+    let mut spec = current.1["spec"].clone();
+    spec["display_name"] = json!("Echo reconfigured after disable");
+    let updated = api(
+        router,
+        "updateDeployment",
+        params,
+        Some(token),
+        json!({"spec":spec}),
+        "configure-after-runtime-stop",
+        current.1["revision"].as_i64(),
+    )
+    .await;
+    assert_eq!(updated.0, 202, "{}", updated.1);
+    assert_eq!(updated.1["state"], "succeeded");
+    assert_eq!(updated.1["result"]["spec"], spec);
+    println!("Confirmed stopped OCI instance cleared its runtime identity, recovered an old marker and allowed disabled configuration");
+}
+
 #[tokio::test]
 #[ignore = "requires root, containerd, nftables and a disposable Linux host; see README"]
 async fn signed_oci_plugin_runs_through_the_management_api_and_recovers() {
@@ -1216,6 +1310,7 @@ async fn signed_oci_plugin_runs_through_the_management_api_and_recovers() {
             .get::<_, i64>(0),
         0
     );
+    configure_stopped_deployment(&app, &router, &params, token, instance).await;
     // Leave one real signed, initialized workload running for the host-admin
     // offline freeze after the normal controller has relinquished leadership.
     let current = api(
