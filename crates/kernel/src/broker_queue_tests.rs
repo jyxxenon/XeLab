@@ -419,6 +419,159 @@ async fn concurrent_unary_completions_release_slots_during_a_burst() {
 }
 
 #[tokio::test]
+async fn terminal_rejection_is_durable_replayable_and_wakes_the_next_call() {
+    let mut limits = object_concurrency();
+    limits["max_active_requests"] = json!(1);
+    let Some(c) = Component::new(limits).await else {
+        return;
+    };
+    *c.plugin.terminal_failure.lock().unwrap() = Some("RESOURCE_EXHAUSTED".into());
+    let first = c.owner_call("terminal-rejection", 15000);
+    c.entered(1).await;
+    let next = c.owner_call("next-after-terminal-rejection", 15000);
+    c.pending(1).await;
+    c.gate.add_permits(1);
+    let error = first.await.unwrap().unwrap_err();
+    assert_eq!(error.code, "RESOURCE_EXHAUSTED");
+    let id: Uuid = error.resource_id.as_ref().unwrap().parse().unwrap();
+    *c.plugin.terminal_failure.lock().unwrap() = None;
+    c.entered(2).await;
+    c.gate.add_permits(1);
+    next.await.unwrap().unwrap();
+    assert_eq!(c.ledger().await, (2, 0, 2));
+    let db = c.fixture.app.db.connect().await.unwrap();
+    let row = db.query_one(
+        "SELECT c.state,c.completed_at,c.error,r.status,(SELECT sum(concurrent_calls_used)::bigint FROM quotas) AS active
+           FROM calls c JOIN reservations r ON r.id=c.id WHERE c.id=$1",
+        &[&id],
+    ).await.unwrap();
+    assert_eq!(row.get::<_, String>("state"), "failed");
+    assert!(row
+        .get::<_, Option<chrono::DateTime<chrono::Utc>>>("completed_at")
+        .is_some());
+    assert_eq!(row.get::<_, Value>("error"), error.detail());
+    assert_eq!(row.get::<_, String>("status"), "released");
+    assert_eq!(row.get::<_, i64>("active"), 0);
+    let inspected = c
+        .fixture
+        .call(
+            "getCall",
+            &[("call_id", id)],
+            Value::Null,
+            None,
+            "inspect-terminal-rejection",
+            None,
+        )
+        .await;
+    assert_eq!(inspected.0, 200, "{}", inspected.1);
+    assert_eq!(inspected.1["state"], "failed");
+    assert_eq!(inspected.1["error"], error.detail());
+    let replay = c
+        .owner_call("terminal-rejection", 15000)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(replay.detail(), error.detail());
+    assert_eq!(c.plugin.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(c.ledger().await, (2, 0, 2));
+}
+
+#[tokio::test]
+async fn terminal_reply_does_not_clear_a_canceled_or_stale_call() {
+    for change in ["cancel", "generation", "skill"] {
+        let Some(c) = Component::new(object_concurrency()).await else {
+            return;
+        };
+        let db = c.fixture.app.db.connect().await.unwrap();
+        *c.plugin.terminal_failure.lock().unwrap() = Some("STATE_CONFLICT".into());
+        let request = c.owner_call("terminal-fence", 15000);
+        c.entered(1).await;
+        let call: Uuid = db
+            .query_one(
+                "SELECT id FROM calls WHERE idempotency_key='terminal-fence'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        match change {
+            "cancel" => {
+                let canceled = c
+                    .fixture
+                    .call(
+                        "cancelCall",
+                        &[("call_id", call)],
+                        Value::Null,
+                        None,
+                        "cancel-terminal",
+                        None,
+                    )
+                    .await;
+                assert_eq!(canceled.0, 204, "{}", canceled.1);
+            }
+            "generation" => {
+                db.execute(
+                    "UPDATE instances SET generation=generation+1 WHERE id=$1",
+                    &[&c.provider.id],
+                )
+                .await
+                .unwrap();
+            }
+            "skill" => {
+                db.execute("UPDATE skills SET enabled=false WHERE id=$1", &[&c.primary])
+                    .await
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        c.gate.add_permits(1);
+        let error = request.await.unwrap().unwrap_err();
+        assert_eq!(
+            error.code,
+            if change == "cancel" {
+                "CANCELED"
+            } else {
+                "NOT_READY"
+            }
+        );
+        let state: String = db
+            .query_one("SELECT state FROM calls WHERE id=$1", &[&call])
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(state, "unknown", "{change}");
+        assert_eq!(c.ledger().await, (1, 1, 1), "{change}");
+    }
+}
+
+#[tokio::test]
+async fn terminal_reply_cannot_settle_after_the_original_deadline() {
+    let Some(c) = Component::new(object_concurrency()).await else {
+        return;
+    };
+    *c.plugin.terminal_failure.lock().unwrap() = Some("STATE_CONFLICT".into());
+    let request = c.owner_call("terminal-deadline", 3000);
+    c.entered(1).await;
+    let mut db = c.fixture.app.db.connect().await.unwrap();
+    let held = db.transaction().await.unwrap();
+    crate::db::call_lock(&held).await.unwrap();
+    c.gate.add_permits(1);
+    let error = request.await.unwrap().unwrap_err();
+    assert_eq!(error.code, "DEADLINE_EXCEEDED");
+    held.rollback().await.unwrap();
+    assert_eq!(c.ledger().await, (1, 1, 1));
+    let state: String = db
+        .query_one(
+            "SELECT state FROM calls WHERE idempotency_key='terminal-deadline'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(matches!(state.as_str(), "running" | "unknown"));
+}
+
+#[tokio::test]
 async fn zero_waiting_slots_reject_overload_without_a_queue() {
     let mut concurrency = object_concurrency();
     concurrency["max_active_requests"] = json!(1);

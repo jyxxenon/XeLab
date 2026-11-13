@@ -174,7 +174,7 @@ impl TaskFixture {
             "SELECT t.state AS task_state,t.output AS task_output,t.error AS task_error,
                     t.delegation_id AS task_delegation,
                     s.state AS step_state,s.id AS step_id,a.state AS attempt_state,a.broker_call_id,
-                    c.state AS call_state,c.result AS call_result,c.credential_id,c.skill_id,c.input_digest,
+                    c.state AS call_state,c.result AS call_result,c.error AS call_error,c.credential_id,c.skill_id,c.input_digest,
                     c.provider_instance_id,c.idempotency_key,c.delegation_id AS call_delegation,
                     q.daily_calls_used,q.concurrent_calls_used,r.status AS reservation_status,
                     x.read_blob_ids,x.proxy_source_paths,
@@ -456,6 +456,76 @@ async fn wait_for_task(fixture: &Fixture, task: Uuid, expected: &str) -> Value {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+#[tokio::test]
+async fn postgres_task_broker_settles_a_verified_terminal_rejection() {
+    let Some(f) = TaskFixture::new("non_repeatable", false).await else {
+        return;
+    };
+    let (plugin, server) = echo(&f.host, f.instance).await;
+    *plugin.terminal_failure.lock().unwrap() = Some("RESOURCE_EXHAUSTED".into());
+
+    assert!(crate::task_worker::run_once(&f.host.app).await.unwrap());
+    let row = f.journal().await;
+    f.assert_admission(&row);
+    for column in ["task_state", "step_state", "attempt_state", "call_state"] {
+        assert_eq!(row.get::<_, String>(column), "failed", "{column}");
+    }
+    let call = row.get::<_, Uuid>("broker_call_id");
+    let error: Value = row.get("call_error");
+    assert_eq!(error["code"], "RESOURCE_EXHAUSTED");
+    assert_eq!(error["resource_id"], json!(call));
+    assert_eq!(row.get::<_, Value>("task_error"), error);
+    assert!(row.get::<_, Option<Value>>("call_result").is_none());
+    assert_eq!(row.get::<_, String>("reservation_status"), "released");
+    assert_eq!(row.get::<_, i64>("concurrent_calls_used"), 0);
+    assert!(!crate::task_worker::run_once(&f.host.app).await.unwrap());
+    assert_eq!(plugin.calls.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn postgres_task_broker_requires_unary_evidence_for_a_failed_call() {
+    use crate::task_engine::{self, Outcome};
+
+    let Some(f) = TaskFixture::new("non_repeatable", false).await else {
+        return;
+    };
+    let (plugin, server) = echo(&f.host, f.instance).await;
+    *plugin.terminal_failure.lock().unwrap() = Some("RESOURCE_EXHAUSTED".into());
+    let lease = f.claim().await;
+    let rejection = crate::broker::invoke_task(&f.host.app, &lease)
+        .await
+        .unwrap_err();
+    let call = f.journal().await.get::<_, Uuid>("broker_call_id");
+    let mut c = f.host.app.db.connect().await.unwrap();
+    let tx = c.transaction().await.unwrap();
+    assert!(matches!(
+        task_engine::broker_outcome(&tx, &lease).await.unwrap(),
+        Some(Outcome::Failed(_))
+    ));
+    // Historical Call resolution can store "failed" without unary evidence.
+    assert_eq!(
+        tx.execute(
+            "UPDATE idempotency_records SET response_status=NULL WHERE resource_id=$1",
+            &[&call.to_string()],
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    assert!(matches!(
+        task_engine::broker_outcome(&tx, &lease).await.unwrap(),
+        Some(Outcome::Unknown(_))
+    ));
+    let error = task_engine::complete(&tx, &f.host.app.auth, &lease, Outcome::Failed(rejection))
+        .await
+        .expect_err("unproven failure must not settle the Task");
+    assert_eq!(error.code, "STATE_CONFLICT");
+    tx.rollback().await.unwrap();
+    assert_eq!(plugin.calls.load(Ordering::SeqCst), 1);
+    server.abort();
 }
 
 #[tokio::test]

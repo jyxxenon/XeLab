@@ -3421,7 +3421,6 @@ dependencies = [
  "jsonschema",
  "libc",
  "prost",
- "protoc-bin-vendored",
  "quick-xml",
  "rand 0.8.8",
  "rcgen",
@@ -3443,12 +3442,34 @@ dependencies = [
  "tokio-util",
  "toml",
  "tonic",
- "tonic-build",
  "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
  "url",
  "uuid",
+ "x509-parser",
+ "xelab-plugin-sdk",
+ "zeroize",
+]
+
+[[package]]
+name = "xelab-plugin-sdk"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "hyper-util",
+ "prost",
+ "protoc-bin-vendored",
+ "rcgen",
+ "rustls",
+ "rustls-pemfile",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "tonic",
+ "tonic-build",
+ "tower 0.5.3",
  "x509-parser",
  "zeroize",
 ]

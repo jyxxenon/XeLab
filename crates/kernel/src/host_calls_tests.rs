@@ -355,6 +355,7 @@ struct Echo {
     output_bytes: Arc<std::sync::atomic::AtomicUsize>,
     unary_failure: Arc<std::sync::Mutex<Option<tonic::Status>>>,
     unary_gate: Option<Arc<tokio::sync::Semaphore>>,
+    terminal_failure: Arc<std::sync::Mutex<Option<String>>>,
     delay: Option<(Arc<tokio::sync::Notify>, Duration)>,
 }
 #[tonic::async_trait]
@@ -386,6 +387,17 @@ impl rpc::capability_service_server::CapabilityService for Echo {
         if let Some(failure) = self.unary_failure.lock().unwrap().clone() {
             return Err(failure);
         }
+        if let Some(code) = self.terminal_failure.lock().unwrap().clone() {
+            return Ok(tonic::Response::new(rpc::InvokeResponse {
+                call_id: r.call_id,
+                terminal_failure: Some(rpc::InvokeFailure {
+                    version: r.terminal_failure_version,
+                    contract: r.contract,
+                    code,
+                }),
+                ..Default::default()
+            }));
+        }
         let size = self.output_bytes.load(Ordering::SeqCst);
         let message = if size == 0 {
             "proxied".to_owned()
@@ -397,6 +409,7 @@ impl rpc::capability_service_server::CapabilityService for Echo {
             call_id: r.call_id,
             output_digest: contracts::digest(&bytes),
             output_json: bytes,
+            terminal_failure: None,
         }))
     }
     async fn invoke_stream(
@@ -429,6 +442,7 @@ impl rpc::capability_service_server::CapabilityService for Echo {
                     call_id: call,
                     output_digest: contracts::digest(&completed),
                     output_json: completed,
+                    terminal_failure: None,
                 })),
             }))
             .await
@@ -463,11 +477,6 @@ async fn echo_with(
     instance: Uuid,
     plugin: Echo,
 ) -> (Echo, tokio::task::JoinHandle<()>) {
-    let server = serve_echo(f, instance, plugin.clone()).await;
-    (plugin, server)
-}
-
-async fn serve_echo(f: &Fixture, instance: Uuid, plugin: Echo) -> tokio::task::JoinHandle<()> {
     let root = f.directory.path();
     let key = KeyPair::from_pem(&fs::read_to_string(root.join("ca.key")).unwrap()).unwrap();
     let ca = CertificateParams::from_ca_cert_pem(&fs::read_to_string(root.join("ca.crt")).unwrap())
@@ -510,9 +519,9 @@ async fn serve_echo(f: &Fixture, instance: Uuid, plugin: Echo) -> tokio::task::J
         .unwrap(),
     )
     .unwrap();
-    let service = rpc::capability_service_server::CapabilityServiceServer::new(plugin);
+    let service = rpc::capability_service_server::CapabilityServiceServer::new(plugin.clone());
     let identity = tonic::transport::Identity::from_pem(cert.pem(), leaf.serialize_pem());
-    tokio::spawn(async move {
+    let server = tokio::spawn(async move {
         tonic::transport::Server::builder()
             .tls_config(
                 tonic::transport::ServerTlsConfig::new()
@@ -524,7 +533,8 @@ async fn serve_echo(f: &Fixture, instance: Uuid, plugin: Echo) -> tokio::task::J
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
             .await
             .unwrap();
-    })
+    });
+    (plugin, server)
 }
 
 #[tokio::test]
@@ -536,7 +546,7 @@ async fn broker_rpc_keeps_the_admitted_deadline_past_thirty_seconds() {
     let (skill, _) = skill_with_timeout(&f, deployment, 60000).await;
     let source = f.source(b"long business call".to_vec()).await;
     let entered = Arc::new(tokio::sync::Notify::new());
-    let server = serve_echo(
+    let (_, server) = echo_with(
         &f,
         instance,
         Echo {
